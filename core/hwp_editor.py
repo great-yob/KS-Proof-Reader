@@ -5,8 +5,16 @@ core/hwp_editor.py — HWP 문서 편집기 (32비트 브리지 클라이언트)
 HWP COM 자동화를 실행합니다.
 
 아키텍처:
-  [64bit] main.py/PySide6 ─→ HwpEditor (이 파일)
-          └─→ subprocess(32bit python) ─→ hwp_bridge_worker.py ─→ HWP COM
+  [개발]   main.py/PySide6 ─→ HwpEditor ─→ subprocess(32bit python) ─→ 워커 ─→ COM
+  [배포본] KS-Proof Reader.exe ─→ HwpEditor ─→ bridge32/hwp_bridge_worker.exe ─→ COM
+
+⚠ **배포본은 32비트 파이썬을 동봉한 브리지 EXE로 실행한다**(`bridge32/`).
+  과거엔 배포본도 `_find_python32()` + `.py` 스크립트 경로를 썼는데, 두 가지가 동시에
+  깨져 있었다: ① PyInstaller가 `hwp_bridge_worker.py`를 번들에 넣지 않아 스크립트
+  자체가 없었고, ② 있었더라도 사용자 PC에 32비트 Python+pywin32가 설치돼 있어야 했다
+  (후보 경로 1순위가 개발 PC 경로였다). 그래서 배포본에서는 HWP 교정이 통째로 죽었다.
+  → `build_dist.py`가 32비트 파이썬으로 워커를 따로 빌드해 `bridge32/`에 동봉하고,
+    아래 `_bridge_command()`가 그것을 **1순위**로 쓴다. 파이썬 스크립트 경로는 개발용 폴백.
 """
 
 import atexit
@@ -29,6 +37,39 @@ _PYTHON32_CANDIDATES = [
 ]
 
 _BRIDGE_SCRIPT = os.path.join(os.path.dirname(__file__), "hwp_bridge_worker.py")
+
+# 배포본에 동봉되는 32비트 브리지 — EXE 옆 `bridge32/hwp_bridge_worker.exe`.
+#   data/ 와 같은 계열의 '옆에 두는 자산'이지만 **코드**라서 앱 패키지에 들어간다
+#   (data는 사전 갱신 주기, 이건 코드 수정 주기를 따른다 — datapaths.py 헤더 참조).
+_BRIDGE_DIR_NAME = "bridge32"
+_BRIDGE_EXE_NAME = "hwp_bridge_worker.exe"
+
+
+def _bundled_bridge_exe():
+    """동봉된 32비트 브리지 실행 파일 경로. 없으면 None."""
+    try:
+        from datapaths import app_dir      # 최상위·무의존 모듈
+        p = app_dir() / _BRIDGE_DIR_NAME / _BRIDGE_EXE_NAME
+        return str(p) if p.is_file() else None
+    except Exception:
+        return None
+
+
+def _bridge_command() -> list:
+    """브리지 실행 명령. 동봉 EXE가 있으면 그것, 없으면 32비트 파이썬 + 스크립트."""
+    exe = _bundled_bridge_exe()
+    if exe:
+        return [exe]
+
+    if not os.path.isfile(_BRIDGE_SCRIPT):
+        # 배포본인데 bridge32/ 가 없는 경우 — 앱 패키지가 불완전하다.
+        raise RuntimeError(
+            "HWP 브리지를 찾을 수 없습니다.\n"
+            f"동봉 브리지({_BRIDGE_DIR_NAME}/{_BRIDGE_EXE_NAME})도, "
+            "브리지 스크립트도 없습니다.\n"
+            "설치 파일로 다시 설치하거나 배포 패키지를 최신본으로 갱신하세요."
+        )
+    return [_find_python32(), _BRIDGE_SCRIPT]
 
 
 def _find_python32() -> str:
@@ -88,10 +129,10 @@ class HwpEditor:
 
     def open(self):
         """32비트 서브프로세스를 시작하고 HWP 파일을 엽니다."""
-        python32 = _find_python32()
+        cmd = _bridge_command()
 
         if self.logger:
-            self.logger(f"  HWP 브리지 시작: {os.path.basename(python32)}")
+            self.logger(f"  HWP 브리지 시작: {os.path.basename(cmd[0])}")
 
         # 32비트 Python의 stdio 기본 인코딩은 한국 Windows에서 CP949이므로
         # UTF-8로 강제 (워커도 startup 시 reconfigure 함)
@@ -99,7 +140,7 @@ class HwpEditor:
         child_env["PYTHONIOENCODING"] = "utf-8"
 
         self._proc = subprocess.Popen(
-            [python32, _BRIDGE_SCRIPT],
+            cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

@@ -11,8 +11,12 @@ user-invocable: true
 
 | 채널 | 태그 | 자산 | 언제 |
 |---|---|---|---|
-| 앱 | `v{APP_VERSION}` | `…-full.zip`(최초설치) + `…-app.zip`(업데이트) | 코드가 바뀌었을 때 |
+| 앱 | `v{APP_VERSION}` | `…-Setup-{ver}.exe`(최초설치) + `…-app.zip`(업데이트) | 코드가 바뀌었을 때 |
 | 데이터 | `data-{DATA_VERSION}` | `…-data-{YYYY.MM}.zip` | 사전이 갱신됐을 때 |
+
+전제 도구: **Inno Setup 6** (`winget install --id JRSoftware.InnoSetup -e`)와
+**32비트 Python 3.11 + pywin32 + pyinstaller**(HWP 브리지 빌드용). 둘 다 없으면
+설치 파일이 안 나오거나(경고) 빌드가 중단된다(브리지).
 
 ## 0. 무엇을 릴리스할지 판별
 
@@ -58,17 +62,31 @@ git ls-files -z | xargs -0 grep -lE "AIza[0-9A-Za-z_-]{30}|ghp_[0-9A-Za-z]{30}|g
 ```powershell
 .\.venv64\Scripts\python.exe build_dist.py --clean
 ```
-- 산출: `dist/release/` 에 `full` / `app` / `data` 세 zip
+- 산출: `dist/release/` 에 `Setup-{ver}.exe` / `app.zip` / `data.zip`
 - 빌드가 `core/_org_keys.py`를 만들었다 **finally에서 지운다** — 끝난 뒤 잔존 여부 확인:
   `test -f core/_org_keys.py && echo "⚠ 평문 키 잔존"`
-- 검증 단계가 `data/stdict.db`·`data/kiwipiepy_model` 존재와 `_internal/data/stdict.db`
-  **부재**(분리 배포가 깨지지 않았는지)를 확인한다. 실패하면 업로드하지 않는다.
+- 검증 단계가 확인하는 것: `data/stdict.db`·`data/kiwipiepy_model` 존재,
+  `_internal/data/stdict.db` **부재**(분리 배포가 깨지지 않았는지),
+  `_internal/assets/{icons,fonts,logo}` 존재(없으면 아이콘·폰트가 조용히 사라진다),
+  `bridge32/hwp_bridge_worker.exe` 존재 **및 32비트**(PE 헤더). 실패하면 업로드하지 않는다.
+- Inno Setup이 없으면 설치 파일만 **조용히 건너뛴다**(빌드는 성공). 로그에서
+  `✔ 최초 설치  KS-Proof-Reader-Setup-…exe` 줄을 **눈으로 확인**할 것.
 
 빌드본이 실제로 뜨는지 한 번 확인:
 ```powershell
 $p=Start-Process "dist\KS-Proof Reader\KS-Proof Reader.exe" -PassThru; Start-Sleep 15
 $a=Get-Process -Id $p.Id -EA SilentlyContinue; if($a){"OK $($a.MainWindowTitle)"; Stop-Process -Id $p.Id -Force}else{"기동 실패"}
 ```
+
+**설치 파일 검증** — 무인 설치 → 실행 → 제거까지 한 번 돌린다(사용자가 겪을 경로):
+```powershell
+$s = Get-ChildItem dist\release\*Setup*.exe | Select-Object -First 1
+Start-Process $s.FullName -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -Wait
+$app = "$env:LOCALAPPDATA\Programs\KS-Proof Reader\KS-Proof Reader.exe"
+Test-Path $app; Test-Path "$env:LOCALAPPDATA\Programs\KS-Proof Reader\bridge32\hwp_bridge_worker.exe"
+```
+⚠ 브리지가 빠지면 설치는 멀쩡히 되고 **HWP 교정만 죽는다** — 반드시 같이 확인한다.
+제거: `& "$env:LOCALAPPDATA\Programs\KS-Proof Reader\unins000.exe" /VERYSILENT`
 
 ## 4. GitHub 업로드
 
@@ -88,12 +106,17 @@ curl -s -X POST -H "Authorization: token $GH_TOKEN" -H 'Accept: application/vnd.
 ```
 `tag_name`은 `v{APP_VERSION}` 또는 `data-{DATA_VERSION}`, `target_commitish`는 `main`.
 
-**자산 업로드**:
+**자산 업로드** (setup.exe는 Content-Type이 다르다 — zip으로 올리면 브라우저가 잘못 받는다):
 ```bash
 curl -s -X POST -H "Authorization: token $GH_TOKEN" -H "Content-Type: application/zip" \
-  --data-binary @"dist/release/<파일>" \
+  --data-binary @"dist/release/<파일>.zip" \
   "https://uploads.github.com/repos/great-yob/KS-Proof-Reader/releases/<release_id>/assets?name=<파일명>"
+curl -s -X POST -H "Authorization: token $GH_TOKEN" -H "Content-Type: application/octet-stream" \
+  --data-binary @"dist/release/KS-Proof-Reader-Setup-<ver>.exe" \
+  "https://uploads.github.com/repos/great-yob/KS-Proof-Reader/releases/<release_id>/assets?name=KS-Proof-Reader-Setup-<ver>.exe"
 ```
+릴리스 본문에는 **설치 파일을 받으라고** 안내하고, 서명이 없어 SmartScreen 경고가 뜨니
+`추가 정보 → 실행`을 눌러야 한다는 문구를 넣는다.
 452MB급이라 수 분 걸린다. 업로드 후 반드시 API로 `state=uploaded` 확인(응답 파싱이 실패해도
 업로드 자체는 됐을 수 있으므로 **결과를 눈으로 재조회**할 것).
 

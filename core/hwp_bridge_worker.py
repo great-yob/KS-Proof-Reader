@@ -68,8 +68,52 @@ for _stream in (sys.stdin, sys.stdout, sys.stderr):
     except Exception:
         pass
 
+# ══════════════════════════════════════════════════════════════
+# 프로토콜 채널 격리 — ⚠ 아래 import보다 **먼저** 실행돼야 한다
+# ══════════════════════════════════════════════════════════════
+# 부모와의 JSON 라인 프로토콜은 stdout 전용인데, 라이브러리가 stdout에 찍는 일이
+# 실제로 있다: 배포본 첫 실행에서 win32com이 타입 라이브러리 캐시를 만들며
+# "Rebuilding cache of generated files for COM support..." 등을 출력한다
+# (gencache는 **import 시점에** __init__()을 돌리므로 import 뒤에 Rebuild를
+#  monkeypatch하는 식의 방어는 무력하다 — 실측으로 확인).
+#
+# → 진짜 stdout(fd 1)을 복제해 프로토콜 전용으로 숨겨 두고, fd 1 자체는 stderr로
+#   돌린다. 이제 누가 무엇을 print하든 로그 채널(stderr)로 갈 뿐 JSON 스트림은
+#   구조적으로 오염되지 않는다. 부모가 잡소리 줄을 관용적으로 무시하고는 있지만,
+#   프로토콜이 관용에 기대는 것보다 채널이 깨끗한 편이 낫다.
+try:
+    _PROTO_OUT = os.fdopen(os.dup(1), "w", encoding="utf-8",
+                           errors="replace", newline="\n")
+    os.dup2(2, 1)                 # fd1(stdout) → stderr : C 레벨 출력까지 포함
+    sys.stdout = sys.stderr       # 파이썬 레벨 print()
+except Exception:
+    _PROTO_OUT = sys.stdout       # 격리 실패 시 기존 동작으로 폴백
+
 import pythoncom
 import win32com.client as win32
+
+
+def _security_dll_path():
+    """FilePathCheckerModule.dll 경로 — 있으면 보안 팝업을 완벽히 우회할 수 있다.
+
+    ⚠ `RegisterModule`은 **경로가 아니라 등록된 COM ProgID**를 받으므로 이 함수는
+      '그 모듈이 이 PC에 깔려 있는가'를 가늠하는 신호일 뿐이다(등록 자체는 regsvr32 몫).
+
+    탐색 순서:
+      1. EXE 옆 — 배포본. build_dist.py가 32비트 파이썬의 pyhwpx에서 복사해 동봉한다.
+      2. pyhwpx 설치본 — 개발 PC.
+    """
+    base = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+            else os.path.dirname(os.path.abspath(__file__)))
+    cand = os.path.join(base, "FilePathCheckerModule.dll")
+    if os.path.exists(cand):
+        return cand
+    try:
+        import pyhwpx
+        p = os.path.join(os.path.dirname(pyhwpx.__file__), "FilePathCheckerModule.dll")
+        return p if os.path.exists(p) else None
+    except Exception:
+        return None
 
 
 # 확장자 → HWP COM Open()의 Format 인자
@@ -310,14 +354,12 @@ class HwpBridge:
             _send_log(f"[보안] SecurityModule 등록 실패: {exc}")
 
         try:
-            # 2. pyhwpx가 설치되어 있다면 해당 DLL 활용 (팝업 완벽 우회 가능)
-            import pyhwpx
-            dll_path = os.path.join(os.path.dirname(pyhwpx.__file__), "FilePathCheckerModule.dll")
-            if os.path.exists(dll_path):
+            # 2. FilePathCheckerModule DLL이 있으면 활용 (팝업 완벽 우회 가능)
+            if _security_dll_path():
                 self.hwp.RegisterModule("FilePathCheckDLL", "FilePathCheckerModule")
                 sec_status = "FilePathCheckerModule"
         except Exception as exc:
-            _send_log(f"[보안] pyhwpx 모듈 등록 실패: {exc}")
+            _send_log(f"[보안] FilePathCheckerModule 등록 실패: {exc}")
         _send_log(f"[보안] 등록된 보안 모듈: {sec_status}")
 
         if not os.path.exists(file_path):
@@ -939,9 +981,12 @@ class HwpBridge:
 
 
 def _send(data):
-    """stdout으로 JSON 한 줄 전송"""
-    sys.stdout.write(json.dumps(data, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    """프로토콜 채널(격리해 둔 원래 stdout)로 JSON 한 줄 전송.
+
+    ⚠ `sys.stdout`을 쓰면 안 된다 — 파일 상단에서 stderr로 돌려놨다(채널 격리 참조).
+    """
+    _PROTO_OUT.write(json.dumps(data, ensure_ascii=False) + "\n")
+    _PROTO_OUT.flush()
 
 
 def _send_progress(pct, msg):
