@@ -1,0 +1,131 @@
+---
+name: release
+description: KS-Proof Reader 배포 릴리스를 처음부터 끝까지 수행한다 — 사전 점검(골드셋·시크릿 감사) → 버전 올림 → build_dist.py 빌드 → GitHub Releases 업로드 → 업데이터 검증. 사용자가 "릴리스", "배포", "새 버전 올려줘", "/release" 라고 할 때 사용.
+user-invocable: true
+---
+
+# /release — 배포 릴리스 수행
+
+이 저장소(`great-yob/KS-Proof-Reader`, **public**)의 릴리스 전 과정을 수행한다.
+앱과 데이터는 **채널이 분리**돼 있으므로 먼저 무엇을 릴리스할지 판별한다.
+
+| 채널 | 태그 | 자산 | 언제 |
+|---|---|---|---|
+| 앱 | `v{APP_VERSION}` | `…-full.zip`(최초설치) + `…-app.zip`(업데이트) | 코드가 바뀌었을 때 |
+| 데이터 | `data-{DATA_VERSION}` | `…-data-{YYYY.MM}.zip` | 사전이 갱신됐을 때 |
+
+## 0. 무엇을 릴리스할지 판별
+
+```bash
+git log --oneline $(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null)..HEAD  # 앱 변경분
+.venv64/Scripts/python.exe -c "import sqlite3;print(dict(sqlite3.connect('data/stdict.db').execute('SELECT key,value FROM meta')))"
+```
+- 코드 커밋이 있으면 → **앱 채널**
+- DB의 `meta.data_version`이 최신 `data-*` 릴리스보다 크면 → **데이터 채널**
+- 둘 다면 둘 다. 애매하면 사용자에게 물어본다.
+
+## 1. 사전 점검 (실패하면 여기서 멈춘다)
+
+```bash
+.venv64/Scripts/python.exe eval/ai_goldset/run_goldset.py
+```
+**모든 Phase가 통과해야 한다.** 하나라도 실패하면 릴리스하지 말고 원인을 보고한다.
+특히 사전 DB를 갱신한 직후라면 `norm_map`이 살아 있는지가 핵심이다
+(과거 `update_opendict.py`가 12,730건을 조용히 날린 전례 — 앱은 무오류로 동작한다).
+
+```bash
+.venv64/Scripts/python.exe -c "import sqlite3;c=sqlite3.connect('data/stdict.db');print('norm_map',c.execute('SELECT COUNT(*) FROM norm_map').fetchone()[0])"
+```
+
+**시크릿·고객정보 감사** — 이 저장소는 **공개**다:
+```bash
+git status --short
+git ls-files | grep -iE "config\.ini|key\.txt|_org_keys|교정샘플|\.hwpx?$|\.db$"   # 결과가 있으면 중단
+git ls-files -z | xargs -0 grep -lE "AIza[0-9A-Za-z_-]{30}|ghp_[0-9A-Za-z]{30}|github_pat_"
+```
+새로 추가된 문서에 **고객사명·원고 제목**이 없는지 확인한다. 실측 표는 `실파일A/B/C` 관례.
+
+## 2. 버전 올림
+
+- **앱**: `version.py`의 `APP_VERSION`을 semver로 올린다(수정=PATCH, 기능=MINOR).
+- **데이터**: `version.py`의 `DATA_VERSION`을 DB의 `meta.data_version`과 **일치**시킨다.
+  ⚠ 진짜 데이터 버전은 DB `meta` 쪽이다. `build_dist.py`가 불일치 시 경고하고 DB 값을 쓴다.
+
+변경 후 커밋(공동저자 트레일러 포함).
+
+## 3. 빌드
+
+```powershell
+.\.venv64\Scripts\python.exe build_dist.py --clean
+```
+- 산출: `dist/release/` 에 `full` / `app` / `data` 세 zip
+- 빌드가 `core/_org_keys.py`를 만들었다 **finally에서 지운다** — 끝난 뒤 잔존 여부 확인:
+  `test -f core/_org_keys.py && echo "⚠ 평문 키 잔존"`
+- 검증 단계가 `data/stdict.db`·`data/kiwipiepy_model` 존재와 `_internal/data/stdict.db`
+  **부재**(분리 배포가 깨지지 않았는지)를 확인한다. 실패하면 업로드하지 않는다.
+
+빌드본이 실제로 뜨는지 한 번 확인:
+```powershell
+$p=Start-Process "dist\KS-Proof Reader\KS-Proof Reader.exe" -PassThru; Start-Sleep 15
+$a=Get-Process -Id $p.Id -EA SilentlyContinue; if($a){"OK $($a.MainWindowTitle)"; Stop-Process -Id $p.Id -Force}else{"기동 실패"}
+```
+
+## 4. GitHub 업로드
+
+**토큰은 사용자에게 요청한다** — 저장하지 않고, 그때그때 받는다.
+필요 스코프: **`repo` + `workflow`** (workflow가 없으면 `.github/workflows/` 푸시가 거부된다).
+
+⚠ **토큰을 remote URL에 등록하지 말 것**(`.git/config`에 평문으로 남는다). 푸시는 1회성 URL로:
+```bash
+git push "https://great-yob:${GH_TOKEN}@github.com/great-yob/KS-Proof-Reader.git" main
+```
+`git remote -v`는 토큰 없는 https만 있어야 한다.
+
+**릴리스 생성** — 한글 본문은 셸 이스케이프가 깨지므로 **JSON을 파일로 만들어** `--data-binary @file`로 보낸다:
+```bash
+curl -s -X POST -H "Authorization: token $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+  https://api.github.com/repos/great-yob/KS-Proof-Reader/releases --data-binary @rel.json
+```
+`tag_name`은 `v{APP_VERSION}` 또는 `data-{DATA_VERSION}`, `target_commitish`는 `main`.
+
+**자산 업로드**:
+```bash
+curl -s -X POST -H "Authorization: token $GH_TOKEN" -H "Content-Type: application/zip" \
+  --data-binary @"dist/release/<파일>" \
+  "https://uploads.github.com/repos/great-yob/KS-Proof-Reader/releases/<release_id>/assets?name=<파일명>"
+```
+452MB급이라 수 분 걸린다. 업로드 후 반드시 API로 `state=uploaded` 확인(응답 파싱이 실패해도
+업로드 자체는 됐을 수 있으므로 **결과를 눈으로 재조회**할 것).
+
+## 5. 릴리스 후 검증 (생략 금지)
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" https://api.github.com/repos/great-yob/KS-Proof-Reader/releases
+```
+비인증 200이어야 한다(비공개로 바뀌면 404 → 업데이터가 죽는다).
+
+업데이터가 새 릴리스를 실제로 보는지 구버전인 척 확인:
+```bash
+.venv64/Scripts/python.exe -c "
+import sys,os; sys.path.insert(0,os.getcwd())
+from core import updater as u
+u._current = lambda ch: '0.0.1' if ch=='app' else '2000.01'
+print(u.check('app')); print(u.check('data'))"
+```
+그리고 **현재 버전에서는** `check_all()`이 `{'app': None, 'data': None}`이어야 정상(=최신).
+
+## 6. 마무리
+
+- 사용자에게 **토큰 폐기**를 안내한다(쓰기 권한이 있고 대화에 남는다).
+- 릴리스 URL과 자산 크기를 보고한다.
+- 데이터 릴리스였다면 `version.py`의 `DATA_VERSION`과 DB `meta.data_version`이
+  일치하는지 최종 확인.
+
+## 하지 말 것
+
+- **골드셋 실패 상태로 릴리스** — 조용한 교정 품질 저하가 사용자에게 나간다.
+- **`dist/` 산출물 커밋** — `.gitignore` 대상. 릴리스 자산으로만 배포한다.
+- **`--no-zip`으로 만든 빌드를 업로드** — 자산이 없다.
+- **과금·쓰기·개인정보 접근 키를 `collect_keys()`에 추가** — 이 저장소는 공개이고
+  내장 키는 추출 가능하다. 무료·읽기전용·폐기가능 키만 허용(CLAUDE.md 참조).
+- **고객 식별 정보를 문서에 남기기** — 실측 표는 `실파일A/B/C`.
