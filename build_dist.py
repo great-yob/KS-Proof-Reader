@@ -285,6 +285,23 @@ def verify(outdir: Path) -> bool:
     if dup.exists():
         ok = False
         print("  ✗ 번들 내부에도 stdict.db가 있습니다 — 분리 배포가 깨집니다")
+    # ⚠ 동봉한 kiwi 모델이 **실제로 쓸 수 있는지**(파일 온전 + 버전 호환) 확인한다.
+    #   못 쓰는 모델을 배포하면 형태소 분석이 통째로 죽는다(가드 덕에 크래시는 면하지만
+    #   활용형 복원·띄어쓰기 백스톱·인명 가드가 전부 사라져 교정 품질이 조용히 무너진다).
+    try:
+        from datapaths import kiwi_model_ok, kiwi_model_version
+        md = outdir / "data" / "kiwipiepy_model"
+        if md.is_dir():
+            import kiwipiepy
+            good = kiwi_model_ok(md)
+            print(f"  {'✔' if good else '✗'} kiwi 모델 호환: "
+                  f"model {kiwi_model_version(md)} ↔ kiwipiepy {kiwipiepy.__version__}")
+            if not good:
+                ok = False
+                print("     → 마이너 버전이 어긋났습니다. kiwipiepy와 kiwipiepy_model을 "
+                      "같은 마이너로 맞춘 뒤 재빌드하세요.")
+    except Exception as e:
+        print(f"  ⚠ kiwi 모델 검증 생략: {e}")
     return ok
 
 

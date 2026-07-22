@@ -94,15 +94,60 @@ def find_data(name: str):
     return None
 
 
-def kiwi_model_dir():
-    """동봉된 kiwipiepy 모델 폴더. 없으면 None(= pip 기본 위치 사용).
+# kiwipiepy 모델 폴더가 '온전한가'를 판정할 필수 파일 목록(실측 0.23.x 기준).
+#   ⚠ 이 검사는 **장식이 아니다**. 모델 경로가 잘못되거나 파일이 빠진 채로
+#     `Kiwi(model_path=…)`를 호출하면 파이썬 예외가 난 뒤 **네이티브 힙 손상으로
+#     프로세스가 죽는다**(실측: exit 0xC0000374, try/except로 못 막음).
+#     그래서 네이티브 코드에 넘기기 **전에** 여기서 걸러야 한다.
+_KIWI_REQUIRED = ("extract.mdl", "cong.mdl", "sj.morph", "default.dict", "combiningRule.txt")
 
-    데이터 패키지에 `data/kiwipiepy_model/`로 들어간다. 모델은 kiwipiepy **버전**에
-    묶인 자산이라 사전과 함께 '드물게 바뀌는 큰 것'으로 묶어 배포한다.
+
+def kiwi_model_version(d):
+    """모델 폴더의 버전 문자열('0.23.0'). 못 읽으면 None."""
+    try:
+        import re
+        txt = (d / "_version.py").read_text(encoding="utf-8")
+        m = re.search(r"__version__\s*=\s*['\"]([^'\"]+)", txt)
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+def kiwi_model_ok(d) -> bool:
+    """모델 폴더가 **쓸 수 있는지** — 파일 온전성 + 설치된 kiwipiepy와의 버전 호환성.
+
+    ⚠ 파일만 검사하면 부족하다. 앱만 업데이트하고(새 kiwipiepy) 데이터 패키지는 옛것인
+      경우, 파일은 다 있는데 **모델 포맷이 안 맞아** 네이티브에서 죽을 수 있다.
+      모델은 kiwipiepy의 **마이너 버전**에 묶여 배포되므로(실측: lib 0.23.2 ↔ model 0.23.0,
+      lib 0.22.2 ↔ model 0.22.1) 마이너까지 일치할 때만 쓴다. 불일치면 안 쓰는 쪽이 안전하다
+      (형태소 분석만 비활성 = graceful, 크래시보다 훨씬 낫다).
+    """
+    try:
+        if not all((d / f).is_file() and (d / f).stat().st_size > 0
+                   for f in _KIWI_REQUIRED):
+            return False
+    except OSError:
+        return False
+    mv = kiwi_model_version(d)
+    if mv is None:
+        return True          # 버전 못 읽으면 파일 온전성만 믿는다(구 패키지 호환)
+    try:
+        import kiwipiepy
+        lib = kiwipiepy.__version__
+    except Exception:
+        return True
+    return mv.split(".")[:2] == lib.split(".")[:2]      # 마이너까지 일치
+
+
+def kiwi_model_dir():
+    """동봉된 kiwipiepy 모델 폴더. 없거나 **불완전하면** None(= pip 기본 위치 사용).
+
+    데이터 패키지에 `data/kiwipiepy_model/`로 들어간다. 모델은 kiwipiepy **버전에 묶인**
+    자산이라 사전과 함께 '드물게 바뀌는 큰 것'으로 묶어 배포한다.
     """
     for p in _candidates():
         d = p / "kiwipiepy_model"
-        if d.is_dir() and any(d.glob("*.mdl")):
+        if d.is_dir() and kiwi_model_ok(d):
             return d
     return None
 

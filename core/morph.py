@@ -38,13 +38,24 @@ def _get_kiwi():
             if _kiwi is None and not _unavailable:
                 try:
                     from kiwipiepy import Kiwi
-                    # 모델(~105MB)은 데이터 패키지로 분리 배포될 수 있다(datapaths 참조).
-                    #   동봉 모델이 있으면 그 경로를, 없으면 pip 기본 위치를 쓴다.
+                    # 모델(~105MB)은 데이터 패키지로 분리 배포된다(datapaths 참조).
+                    #
+                    # ⚠ **모델 경로를 검증한 뒤에만** Kiwi를 만든다. 경로가 틀리거나 파일이
+                    #   빠진 채로 넘기면 파이썬 예외가 난 직후 **네이티브 힙 손상으로
+                    #   프로세스가 통째로 죽는다**(실측 exit 0xC0000374). 아래 try/except는
+                    #   그 크래시를 잡지 못하므로, 방어선은 호출 '전' 검증뿐이다.
+                    #   실제 시나리오: 데이터 패키지 없이 앱만 설치/업데이트한 경우.
                     mp = None
                     try:
-                        from datapaths import kiwi_model_dir
+                        from datapaths import kiwi_model_dir, is_frozen
                         d = kiwi_model_dir()
-                        mp = str(d) if d else None
+                        if d is not None:
+                            mp = str(d)
+                        elif is_frozen():
+                            # 빌드본엔 pip 기본 모델이 없다(번들에서 제외됨). 온전한 동봉
+                            # 모델도 없으면 Kiwi를 만들면 안 된다 — 만들면 죽는다.
+                            _unavailable = True
+                            return None
                     except Exception:
                         mp = None
                     _kiwi = Kiwi(model_path=mp) if mp else Kiwi()
