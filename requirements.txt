@@ -1,0 +1,31 @@
+# KS-Proof Reader v5 — 의존성 목록
+
+# ── 코어 엔진 ─────────────────────────
+pywin32>=306
+google-genai>=1.0.0
+requests>=2.31.0
+
+# ── UI ────────────────────────────────
+PySide6>=6.6.0
+
+# ── 정오표 출력 ───────────────────────
+openpyxl>=3.1.0
+
+# ── 형태소 분석 (활용형→기본형 복원, 사전 검증 정밀화) ──
+# 순수 C++ · JVM 불필요 · Windows 휠 제공. 모델은 kiwipiepy_model로 자동 동봉(~88MB).
+# 미설치 시 앱은 동작하되 활용형 보정만 비활성(graceful).
+# 빌드(Nuitka/PyInstaller)는 kiwipiepy + kiwipiepy_model 데이터를 반드시 포함할 것.
+kiwipiepy>=0.20.0
+
+# ── API 키 암호화 (빌드 시) ──────────
+cryptography>=41.0.0
+
+# ── 어문 규범 해설 PDF 파서 (빌드/데이터 준비 전용, 런타임 불필요) ──
+# parse_haeseol_pdf.py 로 공식 해설 PDF를 data/eomun/haeseol.jsonl 로 변환할 때만 필요.
+# 런타임(앱)은 data/eomun.db 만 사용하므로 배포물엔 동봉 불필요(graceful).
+# pdfplumber>=0.11.0
+
+# ── 빌드 도구 (개발 전용 — 배포본 빌드 PC에만 필요) ──
+# build_dist.py가 쓴다. 형제 프로젝트(KS-Works-Utility)도 파이썬 워커를 PyInstaller로 빌드한다.
+# pyinstaller>=6.0
+# Pillow>=10.0        # assets/icon.ico 생성용(1회성). 런타임 불필요.

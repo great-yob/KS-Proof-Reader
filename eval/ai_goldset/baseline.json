@@ -1,0 +1,35 @@
+{
+  "phase_a_fails": 0,
+  "phase_b": [
+    {
+      "id": "caption_fig1",
+      "n_ai": 1,
+      "violations": [],
+      "caught": []
+    },
+    {
+      "id": "caption_fig2",
+      "n_ai": 1,
+      "violations": [],
+      "caught": []
+    },
+    {
+      "id": "english_gloss_jammer",
+      "n_ai": 0,
+      "violations": [],
+      "caught": []
+    },
+    {
+      "id": "recall_algorism",
+      "n_ai": 2,
+      "violations": [],
+      "caught": [
+        {
+          "orig": "algorism",
+          "corr": "algorithm",
+          "hit": true
+        }
+      ]
+    }
+  ]
+}

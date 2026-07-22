@@ -1,0 +1,12 @@
+{
+  "_comment": "사용자 용어 뇌 스냅샷 형식 예시 / 빌드 검증용. 운영 스냅샷은 서버(Supabase)가 data/userdict/snapshot.json 으로 생성한다(DO-4). 이 예시 파일은 자동 로드되지 않는다(기본 경로는 snapshot.json). 빌드 테스트: build_userdict_db.py --snapshot data/userdict/snapshot.example.json",
+  "version": 1,
+  "pairs": [
+    {"_note": "살아남는 페어 — '플랫홈'은 국어사전에 단어로 없고 '플랫폼'은 등재 → 결정론 안전. 실제 사내 페어는 보통 국가사전에 없는 고유명사/제품명 표기다.", "nonstd": "플랫홈", "norm": "플랫폼", "rule_id": "USR-0001", "category": "외래어", "scope_doc_type": "*"},
+    {"_note": "가드가 잡아야 하는 페어 — '있다'는 실표준어라 결정론 치환 시 재앙. 동형이의어 가드가 제외해야 정상.", "nonstd": "있다", "norm": "이따", "rule_id": "USR-GUARD-TEST", "category": "맞춤법", "scope_doc_type": "*"}
+  ],
+  "exceptions": [
+    {"term": "매출액", "scope": "spacing", "rule_id": "USR-EX-0001", "note": "사내 붙여쓰기 통일"},
+    {"term": "표준국어대사전", "scope": "all", "rule_id": "USR-EX-0002", "note": "고유명사 — 무교정"}
+  ]
+}

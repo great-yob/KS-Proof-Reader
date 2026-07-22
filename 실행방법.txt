@@ -1,0 +1,9 @@
+cd "C:\Users\user9\Desktop\Work Utility\KS-Proof Reader"
+
+# 활성화
+.venv64\Scripts\activate
+
+# 패키지 설치
+pip install -r requirements.txt
+
+python main.py

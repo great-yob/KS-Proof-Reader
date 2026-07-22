@@ -1,0 +1,61 @@
+# ── 시크릿 / 로컬 설정 (절대 커밋 금지) ─────────────────
+config.ini
+key.txt
+data/.ks_session
+# build_dist.py가 빌드 중에만 생성하고 끝나면 지우는 암호화 키 모듈.
+#   (빌드가 비정상 종료해 남는 경우를 대비해 등록해 둔다)
+core/_org_keys.py
+# 릴리스 헬퍼(GitHub 토큰 평문) — KS-Works-Utility 규약과 동일
+*.local.ps1
+
+# ── 로컬 데이터베이스·캐시 (setup_dict.py / build_*.py / 런타임 생성) ──
+data/*.db
+data/userdict/snapshot.json
+data/전체 내려받기_우리말샘_json_*/
+
+# ── 비상업(CC BY-NC) 평가 자산 — 절대 커밋 금지 ─────────
+#   바른 중의성 데이터셋(35,396문장, 원문은 국립국어원/세종). 개발 PC 로컬 전용이며
+#   KS_AMBIG_DATA 로 경로를 알린다(eval/ambiguity_scan/README.md).
+#   ⚠ 레포 루트 아래 두더라도 **data/·assets/ 안에는 절대 금지** — 그 둘은 PyInstaller가
+#     번들해 EXE로 배포되므로 라이선스 위반이 된다(스캐너가 그 경우 실행을 거부한다).
+#   ⚠ 빌드 스크립트에 레포 전체를 include 하는 규칙을 추가하지 말 것.
+korean-ambiguity-data/
+
+# ── 고객 원고·산출물 (개인정보/저작물) ─────────────────
+교정샘플/
+*_교정본.hwp
+*_교정본.hwpx
+*_정오표.xlsx
+*.__cvt__.hwp
+
+# ── 파이썬 ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv64/
+.venv/
+
+# ── 빌드 산출물 ─────────────────────────────────────────
+build/
+dist/
+*.build/
+*.dist/
+*.onefile-build/
+
+# ── IDE/OS ──────────────────────────────────────────────
+.vscode/
+Thumbs.db
+
+# ── CI 산출물 ───────────────────────────────────────────
+#   stdict_part.db(~39MB)는 Release 자산으로만 배포한다 — git 커밋 금지
+#   (바이너리를 커밋하면 히스토리가 영구히 부풀고 되돌릴 수 없다)
+dist/stdict_part.db
+dist/stdict_part.json
+dist/release/
+
+# ── 대용량/재생성 가능 자산 (커밋 금지) ─────────────────
+#   stdict.db.bak(153MB)은 data/*.db 패턴에 안 걸린다 — GitHub 100MB 파일 제한에도 걸림
+data/*.db.bak
+#   국립국어원 해설 PDF — 3자 저작물이고 build 입력일 뿐(parse_haeseol_pdf.py로 재생성)
+data/*.pdf
+#   원본 디자인 파일(.ai) — 빌드는 assets/ 만 쓴다 (KS-Works-Utility와 동일 관례)
+소스/

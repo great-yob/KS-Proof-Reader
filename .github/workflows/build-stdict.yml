@@ -1,0 +1,90 @@
+name: 표준국어대사전 부분 DB 빌드
+
+# 반기(1월·7월 1일) 자동 + 수동 실행.
+#   주기 근거(실측 2026-07-22): 상류 저장소 spellcheck-ko/korean-dict-nikl 의 갱신은
+#   2021-08 → 2026-01 → 2026-06 으로 **불규칙하고 대략 반기**다. 월간/분기로 돌려도
+#   대부분 헛돈다. 그래서 달력은 반기로 두되, 실제 빌드는 **상류 커밋 SHA가 바뀌었을
+#   때만** 수행한다(build_stdict_part.py --check-only).
+#
+# ⚠ 우리말샘(opendict)은 여기서 다루지 않는다 — 공식 '전체 내려받기'가 로그인 뒤에 있어
+#   무인 자동화가 불가능하다. 운영자가 받아 update_opendict.py로 반영하는 수동 경로다.
+#
+# ⚠ 산출물을 **git에 커밋하지 않는다** — 150MB급 바이너리를 커밋하면 히스토리가 영구히
+#   부풀고(되돌릴 수 없음) LFS 비용이 붙는다. GitHub Release 자산으로만 올린다.
+
+on:
+  schedule:
+    - cron: "0 3 1 1,7 *"      # 매년 1월 1일, 7월 1일 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "상류 변경이 없어도 강제로 빌드"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write               # 릴리스 생성/자산 업로드에 필요
+
+concurrency:
+  group: build-stdict
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 의존성 설치
+        run: pip install --quiet requests
+
+      # 직전 빌드의 상류 SHA를 복원해 '변경 없음'이면 조기 종료할 수 있게 한다.
+      - name: 이전 빌드 기록 복원
+        uses: actions/cache@v4
+        with:
+          path: dist/stdict_part.json
+          key: stdict-stamp-${{ github.run_id }}
+          restore-keys: stdict-stamp-
+
+      - name: 상류 변경 확인
+        id: check
+        run: |
+          if python build_stdict_part.py --check-only; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 부분 DB 빌드
+        if: steps.check.outputs.changed == 'true' || inputs.force
+        run: python build_stdict_part.py --force
+
+      - name: 데이터 버전 산출
+        if: steps.check.outputs.changed == 'true' || inputs.force
+        id: ver
+        run: echo "v=$(date -u +%Y.%m)" >> "$GITHUB_OUTPUT"
+
+      - name: 릴리스 생성 및 자산 업로드
+        if: steps.check.outputs.changed == 'true' || inputs.force
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="stdict-${{ steps.ver.outputs.v }}"
+          SHA=$(python -c "import json;print(json.load(open('dist/stdict_part.json'))['sha'][:8])")
+          CNT=$(python -c "import json;print(f\"{json.load(open('dist/stdict_part.json'))['count']:,}\")")
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" dist/stdict_part.db \
+            --title "표준국어대사전 부분 DB ${{ steps.ver.outputs.v }}" \
+            --notes "상류 커밋 \`$SHA\` 기준 · 표제어 $CNT개
+
+            적용: \`python update_stdict.py\` (우리말샘·norm_map은 보존됩니다)"
+
+      - name: 변경 없음
+        if: steps.check.outputs.changed != 'true' && !inputs.force
+        run: echo "상류 stdict/ 에 변경이 없어 빌드를 건너뜁니다."
