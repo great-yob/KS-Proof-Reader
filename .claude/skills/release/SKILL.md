@@ -90,35 +90,79 @@ Test-Path $app; Test-Path "$env:LOCALAPPDATA\Programs\KS-Proof Reader\bridge32\h
 
 ## 4. GitHub 업로드
 
-**토큰은 사용자에게 요청한다** — 저장하지 않고, 그때그때 받는다.
-필요 스코프: **`repo` + `workflow`** (workflow가 없으면 `.github/workflows/` 푸시가 거부된다).
+**토큰을 요구하지 않는다.** 인증은 이미 PC에 저장돼 있다:
 
-⚠ **토큰을 remote URL에 등록하지 말 것**(`.git/config`에 평문으로 남는다). 푸시는 1회성 URL로:
+| 작업 | 인증 주체 |
+|---|---|
+| `git push` | **Git Credential Manager** (`credential.helper=manager`, Windows 자격증명 관리자) |
+| 릴리스 생성·업로드·삭제 | **`gh` CLI** (`gh auth login`으로 1회 로그인, OAuth 토큰을 OS가 보관) |
+
 ```bash
-git push "https://great-yob:${GH_TOKEN}@github.com/great-yob/KS-Proof-Reader.git" main
+gh auth status      # 먼저 확인. 로그인돼 있지 않으면 사용자에게 `gh auth login` 실행을 요청한다
+git push origin main
 ```
+⚠ `gh auth login`은 브라우저 대화형이라 **에이전트가 대신 못 한다** — 사용자가 직접 1회 실행.
+⚠ 토큰을 remote URL에 넣지 말 것(`.git/config`에 평문으로 남는다).
 `git remote -v`는 토큰 없는 https만 있어야 한다.
 
-**릴리스 생성** — 한글 본문은 셸 이스케이프가 깨지므로 **JSON을 파일로 만들어** `--data-binary @file`로 보낸다:
+**릴리스 생성 + 자산 업로드 (한 번에)** — 본문은 **마크다운 파일**로 넘긴다.
+한글을 셸 인자로 직접 주면 이스케이프가 깨진다(과거 JSON 파일을 쓰던 이유이며,
+`--notes-file`이 그 문제를 통째로 없앤다). gh가 Content-Type도 알아서 맞춘다.
+
+```bash
+gh release create v{APP_VERSION} \
+  --title "KS-Proof Reader v{APP_VERSION}" \
+  --notes-file <릴리스노트.md> \
+  --target main \
+  "dist/release/KS-Proof-Reader-Setup-{ver}.exe" \
+  "dist/release/KS-Proof-Reader-{ver}-app.zip"
+```
+데이터 채널이면 태그 `data-{DATA_VERSION}`에 `…-data-{YYYY.MM}.zip` 하나만 올린다.
+
+릴리스 본문에는 **설치 파일을 받으라고** 안내하고, 서명이 없어 SmartScreen 경고가 뜨니
+`추가 정보 → 실행`을 눌러야 한다는 문구를 넣는다.
+
+290MB급이라 수 분 걸린다. 업로드 후 **결과를 눈으로 재조회**할 것:
+```bash
+gh release view v{APP_VERSION} --json assets \
+  --jq '.assets[] | "\(.name) \(.size) \(.state)"'      # state=uploaded 여야 한다
+```
+
+<details><summary>gh를 못 쓸 때의 폴백 (curl + 토큰)</summary>
+
+사용자에게 토큰을 요청한다(스코프 `repo`+`workflow`). 한글 본문은 JSON 파일로:
 ```bash
 curl -s -X POST -H "Authorization: token $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
   https://api.github.com/repos/great-yob/KS-Proof-Reader/releases --data-binary @rel.json
-```
-`tag_name`은 `v{APP_VERSION}` 또는 `data-{DATA_VERSION}`, `target_commitish`는 `main`.
-
-**자산 업로드** (setup.exe는 Content-Type이 다르다 — zip으로 올리면 브라우저가 잘못 받는다):
-```bash
-curl -s -X POST -H "Authorization: token $GH_TOKEN" -H "Content-Type: application/zip" \
-  --data-binary @"dist/release/<파일>.zip" \
-  "https://uploads.github.com/repos/great-yob/KS-Proof-Reader/releases/<release_id>/assets?name=<파일명>"
 curl -s -X POST -H "Authorization: token $GH_TOKEN" -H "Content-Type: application/octet-stream" \
-  --data-binary @"dist/release/KS-Proof-Reader-Setup-<ver>.exe" \
-  "https://uploads.github.com/repos/great-yob/KS-Proof-Reader/releases/<release_id>/assets?name=KS-Proof-Reader-Setup-<ver>.exe"
+  --data-binary @"dist/release/<파일>" \
+  "https://uploads.github.com/repos/.../releases/<id>/assets?name=<파일명>"
 ```
-릴리스 본문에는 **설치 파일을 받으라고** 안내하고, 서명이 없어 SmartScreen 경고가 뜨니
-`추가 정보 → 실행`을 눌러야 한다는 문구를 넣는다.
-452MB급이라 수 분 걸린다. 업로드 후 반드시 API로 `state=uploaded` 확인(응답 파싱이 실패해도
-업로드 자체는 됐을 수 있으므로 **결과를 눈으로 재조회**할 것).
+zip은 `Content-Type: application/zip`, exe는 `application/octet-stream`.
+끝나면 **토큰 폐기를 안내**한다.
+</details>
+
+## 4-b. 구버전 릴리스 삭제 (정책 — 생략 금지)
+
+새 릴리스가 **검증까지 끝난 뒤**, 같은 채널의 **이전 릴리스를 삭제한다.** 채널당 하나만 남긴다.
+결함 있는 구버전을 Releases 페이지에서 직접 받아 가는 경로를 없애기 위함이다
+(자동 업데이터는 최신만 제시하므로 기존 사용자에겐 영향이 없다).
+
+⚠ **채널을 섞지 말 것.** 앱 릴리스를 냈다면 `v*` 태그만 지운다 —
+`data-*`·`stdict-*`는 독립적으로 살아 있는 현행 릴리스다.
+
+⚠ **git 태그는 지우지 않는다.** 릴리스 삭제는 태그를 건드리지 않으며(둘은 별개),
+태그는 그 버전이 어느 커밋이었는지의 기록이라 남긴다.
+
+```bash
+gh release list --limit 30                 # 삭제 대상 확인
+gh release delete v{옛버전} --yes          # ⚠ --cleanup-tag 쓰지 말 것(태그까지 지운다)
+gh release list --limit 30                 # 사라졌는지 재확인
+```
+
+⚠ **삭제 직후 비인증 API GET으로 확인하면 캐시된 옛 목록이 그대로 보인다**(실측).
+`gh`는 인증 조회라 문제없지만, curl로 확인한다면 인증 헤더를 붙이거나 개별 릴리스
+GET(404여야 함)으로 확인할 것.
 
 ## 5. 릴리스 후 검증 (생략 금지)
 
@@ -139,7 +183,8 @@ print(u.check('app')); print(u.check('data'))"
 
 ## 6. 마무리
 
-- 사용자에게 **토큰 폐기**를 안내한다(쓰기 권한이 있고 대화에 남는다).
+- **폴백 경로로 토큰을 받았다면** 폐기를 안내한다(쓰기 권한이 있고 대화에 남는다).
+  `gh`로 진행했다면 해당 없음.
 - 릴리스 URL과 자산 크기를 보고한다.
 - 데이터 릴리스였다면 `version.py`의 `DATA_VERSION`과 DB `meta.data_version`이
   일치하는지 최종 확인.
