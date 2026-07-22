@@ -127,6 +127,13 @@ gh release create v{APP_VERSION} \
 gh release view v{APP_VERSION} --json assets \
   --jq '.assets[] | "\(.name) \(.size) \(.state)"'      # state=uploaded 여야 한다
 ```
+⚠ **이 `--jq`는 Bash에서 실행할 것.** PowerShell 5.1은 네이티브 exe에 인자를 넘길 때
+작은따옴표 안의 큰따옴표를 망가뜨려 표현식이 3조각으로 쪼개진다
+(`accepts at most 1 arg(s), received 3` — 실측). PowerShell을 써야 한다면:
+```powershell
+& gh release view v1.0.1 --json assets | ConvertFrom-Json |
+  ForEach-Object { $_.assets } | Select-Object name, size, state
+```
 
 <details><summary>gh를 못 쓸 때의 폴백 (curl + 토큰)</summary>
 
