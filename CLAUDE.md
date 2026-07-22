@@ -33,7 +33,11 @@ KS-Proof Reader — Korean-language proofreading tool for HWP (한/글) document
 ```
 
 [build_dist.py](build_dist.py) (PyInstaller `--onedir`; `--onefile` is forbidden — the 160MB `stdict.db` would be re-extracted to temp on every launch). It:
-1. Reads the three API keys from `config.ini`/env, Fernet-encrypts them into a generated `core/_org_keys.py`, bundles it, and **deletes it in a `finally` block** so no plaintext survives in the repo. `ConfigLoader._load_org_keys()` decrypts at runtime. This is obfuscation, not security — fine for internal distribution, re-design as a server proxy if it ever ships externally.
+1. Reads the three API keys from `config.ini`/env, Fernet-encrypts them into a generated `core/_org_keys.py`, bundles it, and **deletes it in a `finally` block** so no plaintext survives in the repo. `ConfigLoader._load_org_keys()` decrypts at runtime.
+
+⚠ **The repo and its releases are PUBLIC, and the decryption key ships in the same file as the ciphertext — so the embedded keys are extractable by anyone.** This was an accepted trade-off (2026-07-22): the three keys are free-tier, read-only, rate-limited and individually revocable (Gemini free tier — no billing attached; 우리말샘/온용어 — free dictionary lookups), and a public repo is what makes the unauthenticated auto-updater work at all. **The rule that follows: only ever embed keys of that character.** Never add a key with billing attached, write access, or access to customer/personal data to `collect_keys()` — route those through a server proxy instead. Rotate the embedded keys if abuse shows up in the quota dashboards.
+
+⚠ **Public repo ⇒ no customer-identifying content may be committed.** `교정샘플/` is gitignored, and measurement tables in `docs/` refer to manuscripts as 실파일A/B/C (same convention as the goldset's `실파일06/24`). Keep it that way when adding new measurements.
 2. Excludes secrets/customer data from the bundle (`key.txt`, `config.ini`, `교정샘플/`, `korean-ambiguity-data/`, caches) and verifies afterwards that none leaked — **never add a rule that includes the repo root wholesale**.
 3. Excludes `torch`/`transformers`/`tokenizers`/`huggingface_hub` — dead weight from the **removed KoGEC engine**, still present in `.venv64` but imported by nothing (960MB → 485MB). Unexclude only if a verified local model is ever reintroduced.
 
