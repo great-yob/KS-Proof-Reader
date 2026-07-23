@@ -396,7 +396,6 @@ class MainWindow(QMainWindow):
     def _on_analysis_done(self, corrections: list):
         self._corrections = corrections
         detected = len(corrections)
-        self.activity.set_detected(detected)
         # 용어 통일: '건'=교정 항목 수(분석·완료), '곳'=본문 등장/치환 위치 수(검토·적용).
         self.activity.log(f"✓ 분석 완료 — 교정 {detected}건")
         self.rail.set_step_result("analyze", f"교정 제안 : {detected}건")
@@ -657,7 +656,6 @@ class MainWindow(QMainWindow):
         applied  = result.get("applied", 0)
         occ      = result.get("occurrences", 0)
         failed   = result.get("failed", 0)
-        consumed = result.get("consumed", 0)
         flagged  = result.get("flagged", 0)
 
         # 완료 대시보드 — 파이프라인/차트용 부가 데이터(제안 목록·쪽수·글자 수·문서명) 동봉.
@@ -670,7 +668,6 @@ class MainWindow(QMainWindow):
             char_count=char_count,
             page_count=getattr(self, "_page_count", None),
             file_name=os.path.basename(self._file_path) if self._file_path else "")
-        self.activity.set_summary(applied=applied, failed=failed, excluded=consumed)
         if flagged > 0 and applied == 0:
             # 사전 전용 검수 모드 — HWP 미수정, 정오표만
             self.activity.log(f"✓ 검수 완료 — 검수 {flagged}건 정오표 기록 (HWP 미수정)")
