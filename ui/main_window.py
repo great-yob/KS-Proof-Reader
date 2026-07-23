@@ -68,6 +68,12 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("KS-AI Editor")
+        # 작업표시줄/Alt-Tab 아이콘 — 프레임리스라도 최상위 창 아이콘은 여기서 잡힌다.
+        try:
+            from ui.styles.icons import app_icon
+            self.setWindowIcon(app_icon())
+        except Exception:
+            pass
         # 네이티브 타이틀바 제거 — 창 컨트롤은 헤더가 직접 제공(프레임리스)
         self.setWindowFlag(Qt.FramelessWindowHint, True)
         self.setMinimumSize(960, 600)

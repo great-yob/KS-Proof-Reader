@@ -38,8 +38,24 @@ sys.excepthook = _excepthook
 def main():
     # 백그라운드 스레드 연산 시 메인(UI) 스레드의 GIL 확보 빈도를 극대화하여 프레임 드랍 방지
     sys.setswitchinterval(0.001)
-    
+
+    # ⚠ **명시적 AppUserModelID를 설정하지 말 것.** 커스텀 AUMID를 지정하면 Windows는
+    #   실행 중 작업표시줄 아이콘을 그 AUMID와 **일치하는 바로가기**에서 찾는다. Inno가
+    #   만든 바로가기엔 그 AUMID가 없으므로, 창 아이콘(setWindowIcon)이 멀쩡히 붙어 있어도
+    #   무시하고 **일반 아이콘으로 폴백**한다(실측: 창 WM_GETICON은 유효한데 작업표시줄만
+    #   깨져 보임). AUMID를 두지 않으면 AUMID가 EXE 경로에서 자동 파생돼 ① 창 아이콘이
+    #   그대로 쓰이고 ② 실행 버튼이 고정한 바로가기 버튼과 정상 병합된다. 프리즈드 EXE는
+    #   자체 프로세스라 파이썬 호스트 아래로 묶이는 문제도 없다.
+
     app = QApplication(sys.argv)
+
+    # 앱 아이콘 — 실행 중 창/작업표시줄/Alt-Tab 아이콘. EXE 임베드 리소스와 별개로
+    #   런타임에 명시 설정해야 한다(icons.app_icon 헤더 참조). 모든 최상위 창이 상속.
+    try:
+        from ui.styles.icons import app_icon
+        app.setWindowIcon(app_icon())
+    except Exception:
+        pass
 
     # 번들 폰트(Pretendard) 로드 후 기본 폰트 설정
     from ui.styles.fonts import load_fonts

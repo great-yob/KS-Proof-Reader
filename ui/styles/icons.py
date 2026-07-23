@@ -64,6 +64,21 @@ def make_icon(name: str, color: str, size: int = 18) -> QIcon:
     return ic
 
 
+def app_icon() -> QIcon:
+    """작업표시줄·Alt-Tab·창 아이콘용 앱 아이콘(assets/icon.ico, 다해상도).
+
+    ⚠ **실행 중** 창의 작업표시줄 아이콘은 EXE 임베드 리소스가 아니라 Qt가
+      `setWindowIcon`으로 지정한 아이콘을 쓴다. 이걸 설정하지 않으면 Qt 기본
+      아이콘(깨진 듯 보이는 빈 아이콘)이 뜬다 — 고정한 바로가기 아이콘은 EXE
+      리소스라 멀쩡한데 실행하면 깨져 보이는 원인이 바로 이 차이다.
+    """
+    p = asset_path("icon.ico")
+    ic = QIcon(str(p))
+    if ic.isNull():                     # 아주 드문 폴백 — 렌더 아이콘으로라도
+        ic = make_icon("wand-sparkles", color_for("brand"), 32)
+    return ic
+
+
 def logo_pixmap(width: int = 0, height: int = 30) -> QPixmap:
     """Sidebar 상단에 들어갈 브랜드 로고 픽스맵.
     라이트=assets/logo/ci-01.png, 다크=ci-dark-01.png 로 분리되어 있어
