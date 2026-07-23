@@ -6,7 +6,7 @@ ui/widgets/sidebar.py — 좌측 영구 사이드바(LNB)
 스텝퍼 자체는 embedded 모드로 두어 배경/테두리/폭은 이 사이드바가 담당한다.
 """
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QFrame, QVBoxLayout, QHBoxLayout, QLabel
 
 from ui.widgets.components import label
@@ -37,11 +37,35 @@ def _data_version() -> str:
         return DATA_VERSION
 
 
+class _UpdateBadge(QLabel):
+    """버전 푸터 아래의 '업데이트 있음' 배지 — 클릭하면 업데이트 창을 연다.
+
+    QLabel엔 clicked가 없어 마우스 이벤트로 직접 만든다(전용 위젯 하나를 위해
+    QPushButton을 QSS로 라벨처럼 위장시키는 것보다 단순하다).
+    """
+
+    clicked = Signal()
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setProperty("role", "chip")
+        self.setProperty("tone", "accent")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setVisible(False)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(e)
+
+
 class Sidebar(QFrame):
     """로고·네비·저작권을 담는 전체 높이 좌측 컬럼.
 
     내부 StepperRail은 `self.rail`로 노출해 MainWindow가 기존처럼 직접 제어한다.
     """
+
+    update_clicked = Signal()      # 업데이트 배지 클릭 → MainWindow가 창을 연다
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -79,7 +103,24 @@ class Sidebar(QFrame):
         #   패키징 값(version.DATA_VERSION)과 어긋나면 그 사실이 바로 보여야 한다.
         foot.addWidget(label(f"version {APP_VERSION}", role="version"))
         foot.addWidget(label(f"database {_data_version()}", role="version"))
+        # 새 릴리스가 있을 때만 나타난다(평소엔 숨김 = 레이아웃 변화 없음).
+        #   모달을 닫아도 이 배지는 남아, 언제든 다시 열 수 있는 상시 진입점이 된다.
+        self._update_badge = _UpdateBadge()
+        self._update_badge.clicked.connect(self.update_clicked)
+        foot.addSpacing(6)
+        foot.addWidget(self._update_badge, 0, Qt.AlignLeft)
         root.addLayout(foot)
+
+    def set_update_available(self, versions):
+        """업데이트 배지 표시/숨김. versions=[] 이면 숨긴다.
+
+        인자는 표시할 버전 문자열 목록(앱·데이터가 동시에 있을 수 있다).
+        """
+        if not versions:
+            self._update_badge.setVisible(False)
+            return
+        self._update_badge.setText("업데이트 " + " · ".join(versions))
+        self._update_badge.setVisible(True)
 
     def _refresh_logo(self):
         # 라이트/다크 전용 워드마크를 사이드바 본문 폭에 맞춰 표시

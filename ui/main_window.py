@@ -18,7 +18,7 @@ try:
 except Exception:
     _MSG = None
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, QTimer
 from PySide6.QtGui import QCursor, QDesktopServices
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -107,6 +107,13 @@ class MainWindow(QMainWindow):
         self._curator_panel = None
         self._login_dialog = None
         self._start_session_restore()
+
+        # 자동 업데이트 — **확인만** 자동, 설치는 사용자 클릭(core/updater.py 규율).
+        self._update_info = {}        # {channel: info} — 확인된 새 릴리스
+        self._update_worker = None
+        self._update_dialog = None
+        self._update_prompted = False  # 이번 실행에서 모달을 이미 띄웠는가
+        self._start_update_check()
 
     # ══════════════════════════════════════════════
     # DWM 네이티브 스타일 — 라운드 모서리 · 테두리선 · 그림자
@@ -241,6 +248,7 @@ class MainWindow(QMainWindow):
         self.header.logout_requested.connect(self._logout)
 
         self.rail.step_clicked.connect(self._on_rail_click)
+        self.sidebar.update_clicked.connect(self._open_update_dialog)
 
         self.file_panel.file_selected.connect(self._on_file_selected)
         self.setup_panel.options_changed.connect(self._refresh_setup_footer)
@@ -896,6 +904,90 @@ class MainWindow(QMainWindow):
         return True
 
     # ══════════════════════════════════════════════
+    # 자동 업데이트 (확인=자동 · 설치=사용자 클릭)
+    # ══════════════════════════════════════════════
+    def _start_update_check(self):
+        """앱 시작 시 백그라운드로 두 채널을 확인한다.
+
+        네트워크가 없거나 저장소가 비공개로 바뀌어도 updater가 조용히 None을
+        주므로(graceful) 이 경로는 앱 동작에 영향을 주지 않는다.
+        """
+        try:
+            from ui.workers.update_worker import UpdateCheckWorker
+        except Exception:
+            return
+        self._update_worker = UpdateCheckWorker(parent=self)
+        self._update_worker.done.connect(self._on_update_checked)
+        self._update_worker.start()
+
+    def _on_update_checked(self, result: dict):
+        self._update_info = {ch: info for ch, info in (result or {}).items() if info}
+        if not self._update_info:
+            return
+        # 사이드바 배지 — 모달을 닫아도 남는 상시 진입점
+        labels = []
+        for ch in ("app", "data"):
+            info = self._update_info.get(ch)
+            if info:
+                labels.append(("v" if ch == "app" else "") + str(info.get("version", "")))
+        self.sidebar.set_update_available(labels)
+        self.activity.log(
+            "새 버전 " + " · ".join(labels) + " 확인 — 사이드바에서 설치할 수 있습니다")
+        # 이번 실행에서 한 번만 모달로 알린다(매번 띄우면 방해가 된다).
+        if not self._update_prompted:
+            self._update_prompted = True
+            QTimer.singleShot(600, self._open_update_dialog)
+
+    def _open_update_dialog(self):
+        """앱 채널을 우선 안내한다(둘 다 있으면 앱 → 다음 실행에 데이터)."""
+        if not self._update_info:
+            return
+        if self._update_dialog is not None and self._update_dialog.isVisible():
+            self._update_dialog.raise_()
+            return
+        # ⚠ 교정·적용이 도는 중엔 설치를 권하지 않는다 — 앱 교체는 재시작을
+        #   동반하므로 진행 중인 작업이 통째로 날아간다(updater 설계 규율).
+        if self._phase in ("running", "apply_running"):
+            self.activity.log("  작업이 끝난 뒤 사이드바에서 업데이트를 설치할 수 있습니다")
+            return
+        channel = "app" if "app" in self._update_info else "data"
+        info = self._update_info[channel]
+        from ui.widgets.update_dialog import UpdateDialog
+        dlg = UpdateDialog(self, info, channel)
+        self._update_dialog = dlg
+        dlg.apply_requested.connect(self._on_update_apply)
+        dlg.exec()
+        dlg.deleteLater()
+        self._update_dialog = None
+
+    def _on_update_apply(self, channel: str, zip_path):
+        """다운로드된 패키지를 실제로 설치한다 — 사용자가 '재시작'을 누른 뒤에만.
+
+        ⚠ 이 슬롯은 **모달 dlg.exec()의 중첩 이벤트 루프 안에서** 호출된다. 거기서
+          곧바로 self.close()를 부르면 메인 창을 자식 모달이 살아 있는 채로 닫는
+          꼴이라 종료가 무시되거나 유령 창이 남는다(검수 패널이 팝업 뒤처리를
+          singleShot(0)으로 미루는 것과 같은 이유). 실제 작업은 다이얼로그가
+          완전히 닫힌 다음 턴으로 미룬다.
+        """
+        QTimer.singleShot(0, lambda: self._do_update_apply(channel, zip_path))
+
+    def _do_update_apply(self, channel: str, zip_path):
+        from core import updater
+        from ui.widgets.review_panel import LightConfirmDialog
+        log = self.activity.log
+        if channel == "data":
+            if updater.install_data(zip_path, logger=log):
+                LightConfirmDialog.ask(
+                    self, "사전 데이터 업데이트",
+                    "새 사전을 설치했습니다. 앱을 다시 시작하면 적용됩니다.",
+                    yes_text="확인", no_text="닫기")
+            return
+        # 앱 교체 — 헬퍼 배치가 앱 종료를 기다렸다가 폴더를 갈아 끼우고 재실행한다.
+        #   install_app이 True면 헬퍼가 이미 떠서 기다리는 중이므로 **반드시 종료**해야 한다.
+        if updater.install_app(zip_path, logger=log):
+            self.close()
+
+    # ══════════════════════════════════════════════
     # 워커 정리 / 종료
     # ══════════════════════════════════════════════
     def _cleanup_worker(self, attr_name: str):
@@ -919,6 +1011,20 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._cleanup_worker("_worker")
         self._cleanup_worker("_apply_worker")
+        # 업데이트 확인 워커는 순수 네트워크 대기라 중단 수단이 없다 —
+        #   _cleanup_worker의 5초 대기를 그대로 쓰면 회선이 먹통일 때 종료가
+        #   그만큼 늦어진다. 시그널만 끊고 짧게 기다린 뒤 강제 종료한다
+        #   (결과를 버려도 앱 상태에 영향이 없는 부가 기능).
+        w = getattr(self, "_update_worker", None)
+        if w is not None:
+            try:
+                w.disconnect()
+            except Exception:
+                pass
+            if w.isRunning() and not w.wait(800):
+                w.terminate()
+                w.wait(500)
+            self._update_worker = None
         # 동기화·인증 워커는 단명 — 잠시 대기 후 남아있으면 강제 종료(네트워크 블로킹 회피).
         for attr in ("_sync_workers", "_auth_workers"):
             for w in getattr(self, attr, []):

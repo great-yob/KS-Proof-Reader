@@ -12,7 +12,7 @@ version.py — 앱 버전 단일 출처(Single Source of Truth)
      → 자동 업데이터가 이 태그와 APP_VERSION을 비교해 갱신 여부를 판단한다.
 """
 
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 
 # ── 데이터 버전 (앱 버전과 **독립적으로** 올라간다) ──────────────────────
 # 사전 데이터(stdict.db + kiwipiepy 모델) 스냅샷을 가리킨다. 형식 YYYY.MM.
