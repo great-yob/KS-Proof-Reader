@@ -263,15 +263,24 @@ def install_data(zip_path: Path, logger: Optional[Callable[[str], None]] = None,
         return False
 
 
+# 앱 교체 헬퍼 배치 — 앱 종료를 기다렸다가 폴더를 갈아 끼우고 재실행한다.
+#   (실행 중인 EXE는 자기 자신을 덮어쓸 수 없어 외부 프로세스가 필요하다)
+#
+# ⚠ **창 없이(CREATE_NO_WINDOW) 돌린다** — 예전엔 CREATE_NEW_CONSOLE이라 재시작할 때
+#   시커먼 cmd 창이 떴다(사용자 보고 2026-07-23). 그래서 두 가지가 따라온다:
+#   ① 화면에 아무것도 못 띄우므로 안내 echo는 무의미하다(제거).
+#   ② `timeout`은 stdin이 콘솔이 아니면 "Input redirection is not supported"로
+#      **즉시 실패**한다 → 대기를 `ping`으로 바꿨다(콘솔 입력이 필요 없다).
+#      timeout이 실패하면 goto wait 루프가 CPU를 태우며 폭주하므로 그냥 두면 안 된다.
+# ⚠ 배치 본문은 **ASCII만** 쓴다. cmd는 .bat을 OEM 코드페이지(한국어 Windows=949)로
+#   읽는데 이 파일은 UTF-8로 저장되므로, 한글 주석을 넣으면 깨진 바이트가 섞인다.
+#   (예전엔 chcp 65001로 버텼지만 창이 없으면 그마저 의미가 없다.)
 _HELPER = r"""@echo off
-chcp 65001 >nul
-rem KS-Proof Reader 앱 업데이트 헬퍼 — 앱 종료를 기다렸다가 폴더를 교체하고 재실행한다.
-rem (실행 중인 EXE는 자기 자신을 덮어쓸 수 없어 외부 프로세스가 필요하다)
-echo 업데이트를 적용하는 중입니다. 창을 닫지 마세요...
+rem KS-AI Editor updater helper: wait for the app to exit, swap the folder, relaunch.
 :wait
 tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul
 if not errorlevel 1 (
-    timeout /t 1 /nobreak >nul
+    ping -n 2 127.0.0.1 >nul
     goto wait
 )
 robocopy "{src}" "{dst}" /E /MOVE /NFL /NDL /NJH /NJS /NC /NS >nul
@@ -305,8 +314,11 @@ def install_app(zip_path: Path, logger: Optional[Callable[[str], None]] = None) 
         bat.write_text(_HELPER.format(pid=os.getpid(), src=str(staging), dst=str(dst),
                                       exe=str(exe), tmp=str(staging.parent)),
                        encoding="utf-8")
+        # CREATE_NO_WINDOW — 콘솔은 생기되 화면에 보이지 않는다(HWP 브리지 워커와 동일
+        #   방식). ⚠ stdin을 리디렉션하지 말 것: 콘솔 핸들이 끊기면 배치 안의 명령이
+        #   입력 리디렉션 오류로 실패한다. 부모가 죽어도 자식은 살아남는다(잡 오브젝트 없음).
         subprocess.Popen(["cmd", "/c", str(bat)],
-                         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
         log("  ✔ 업데이트 준비 완료 — 앱을 종료하면 자동으로 교체 후 재시작됩니다.")
         return True
     except Exception as e:
