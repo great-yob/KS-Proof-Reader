@@ -70,23 +70,64 @@ git ls-files -z | xargs -0 grep -lE "AIza[0-9A-Za-z_-]{30}|ghp_[0-9A-Za-z]{30}|g
   `_internal/assets/{icons,fonts,logo}` 존재(없으면 아이콘·폰트가 조용히 사라진다),
   `bridge32/hwp_bridge_worker.exe` 존재 **및 32비트**(PE 헤더). 실패하면 업로드하지 않는다.
 - Inno Setup이 없으면 설치 파일만 **조용히 건너뛴다**(빌드는 성공). 로그에서
-  `✔ 최초 설치  KS-Proof-Reader-Setup-…exe` 줄을 **눈으로 확인**할 것.
+  `✔ 최초 설치  KS-AI-Editor-Setup-…exe` 줄을 **눈으로 확인**할 것.
 
-빌드본이 실제로 뜨는지 한 번 확인:
+⚠ 경로에 쓰는 이름이 둘로 갈린다 — 폴더·EXE는 **공백형** `KS-AI Editor`,
+릴리스 자산 파일명만 **하이픈형** `KS-AI-Editor-…`(`build_dist.ASSET_PREFIX`).
+`dist\KS-AI Editor\KS-AI Editor.exe` / `dist\release\KS-AI-Editor-Setup-{ver}.exe`.
+
+빌드본이 실제로 뜨는지 한 번 확인(**설치하지 않고** dist 트리에서 직접 실행):
 ```powershell
-$p=Start-Process "dist\KS-Proof Reader\KS-Proof Reader.exe" -PassThru; Start-Sleep 15
+$p=Start-Process "dist\KS-AI Editor\KS-AI Editor.exe" -PassThru; Start-Sleep 20
 $a=Get-Process -Id $p.Id -EA SilentlyContinue; if($a){"OK $($a.MainWindowTitle)"; Stop-Process -Id $p.Id -Force}else{"기동 실패"}
 ```
 
-**설치 파일 검증** — 무인 설치 → 실행 → 제거까지 한 번 돌린다(사용자가 겪을 경로):
+### 🚫 설치 파일을 이 PC에 설치하지 말 것 (기본값)
+
+**개발 PC에는 사용자가 실제로 쓰는 설치본이 들어 있다.** 그리고
+
+- `.iss`의 `AppId`는 **고정 GUID**다 → 새 버전 무인 설치는 새 설치가 아니라
+  **기존 설치본을 그 자리에서 덮어쓰는 업그레이드**다.
+- `DisableDirPage=yes` + 사용자 전용 설치라 경로는 `%LOCALAPPDATA%\Programs\KS-AI Editor`
+  **하나뿐**이다. 격리해서 깔 자리가 없다.
+- 따라서 "설치 → 확인 → 제거"를 돌리면 **사용자의 실사용 설치본이 사라진다.**
+  (2026-07-23 실제 사고: v1.0.3 검증이 사용자의 v1.0.2 설치본을 지웠다.)
+- 게다가 구버전 설치본은 **자동 업데이트를 실기로 확인할 유일한 기준선**이다.
+  그걸 지우면 "새 릴리스를 앱이 잡아서 갱신하는가"를 확인할 방법이 없어진다.
+
+**그러므로 기본은 설치 검증을 하지 않는다.** 설치 파일의 내용물은 이미
+`build_dist.verify()`가 `dist\KS-AI Editor\` 트리에서 게이트했고(bridge32 32비트·
+assets·data 배치), `.iss`는 그 트리를 통째로 담을 뿐이다. 대신 무설치로 확인한다:
+
 ```powershell
-$s = Get-ChildItem dist\release\*Setup*.exe | Select-Object -First 1
-Start-Process $s.FullName -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -Wait
-$app = "$env:LOCALAPPDATA\Programs\KS-Proof Reader\KS-Proof Reader.exe"
-Test-Path $app; Test-Path "$env:LOCALAPPDATA\Programs\KS-Proof Reader\bridge32\hwp_bridge_worker.exe"
+# 설치 파일 크기가 dist 트리와 어울리는지 + 서명 상태만 확인(실행하지 않음)
+Get-ChildItem dist\release\*Setup*.exe | Select-Object Name, @{n="MB";e={[math]::Round($_.Length/1MB,1)}}
 ```
-⚠ 브리지가 빠지면 설치는 멀쩡히 되고 **HWP 교정만 죽는다** — 반드시 같이 확인한다.
-제거: `& "$env:LOCALAPPDATA\Programs\KS-Proof Reader\unins000.exe" /VERYSILENT`
+
+### 그래도 설치 검증이 필요하다면 (`.iss`·설치 동작을 고친 릴리스)
+
+**반드시 사용자에게 먼저 물어보고**, 아래 백업–복원을 **한 세트로** 수행한다.
+백업 없이 제거 명령을 실행하는 것은 금지.
+
+```powershell
+$base = "$env:LOCALAPPDATA\Programs\KS-AI Editor"
+$bak  = "$base.bak"
+# 1) 기존 설치본 대피 (제거가 아니라 이동 — 복원 경로를 먼저 확보한다)
+if (Test-Path $base) { Move-Item $base $bak }
+# 2) 테스트 설치 → 확인 → 제거
+#    ⚠ /SUPPRESSMSGBOXES 금지: 제거 시 '사용자 데이터도 지울까요' MB_YESNO를
+#      '예'로 자동 선택해 %LOCALAPPDATA%\KS-AI Editor(설정·캐시·사전)가 증발한다.
+Start-Process (Get-ChildItem dist\release\*Setup*.exe)[0].FullName -ArgumentList "/VERYSILENT /NORESTART" -Wait
+Test-Path "$base\KS-AI Editor.exe"; Test-Path "$base\bridge32\hwp_bridge_worker.exe"
+& "$base\unins000.exe" /VERYSILENT; Start-Sleep 12
+# 3) 원상 복구 — 여기까지 반드시 실행한다
+if (Test-Path $base) { Remove-Item $base -Recurse -Force }
+if (Test-Path $bak)  { Move-Item $bak $base }
+```
+⚠ 브리지가 빠지면 설치는 멀쩡히 되고 **HWP 교정만 죽는다** — 확인한다면 같이 본다.
+⚠ 복원 후 ARP(제어판) 등록은 테스트 설치본의 것으로 덮여 있다 — 구버전 설치 파일로
+다시 깔아야 완전히 원상복구된다. 이전 버전 설치 파일은 `Work Utility\백업\`에 보관해 둘 것
+(GitHub의 구버전 릴리스는 4-b에서 삭제하므로 **다시 받을 수 없다**).
 
 ## 4. GitHub 업로드
 
@@ -111,12 +152,13 @@ git push origin main
 
 ```bash
 gh release create v{APP_VERSION} \
-  --title "KS-Proof Reader v{APP_VERSION}" \
+  --title "KS-AI Editor v{APP_VERSION}" \
   --notes-file <릴리스노트.md> \
   --target main \
-  "dist/release/KS-Proof-Reader-Setup-{ver}.exe" \
-  "dist/release/KS-Proof-Reader-{ver}-app.zip"
+  "dist/release/KS-AI-Editor-Setup-{ver}.exe" \
+  "dist/release/KS-AI-Editor-{ver}-app.zip"
 ```
+(제목·자산은 **제품명** KS-AI Editor, 저장소·태그는 **프로젝트명** KS-Proof-Reader.)
 데이터 채널이면 태그 `data-{DATA_VERSION}`에 `…-data-{YYYY.MM}.zip` 하나만 올린다.
 
 릴리스 본문에는 **설치 파일을 받으라고** 안내하고, 서명이 없어 SmartScreen 경고가 뜨니
@@ -161,6 +203,9 @@ zip은 `Content-Type: application/zip`, exe는 `application/octet-stream`.
 ⚠ **git 태그는 지우지 않는다.** 릴리스 삭제는 태그를 건드리지 않으며(둘은 별개),
 태그는 그 버전이 어느 커밋이었는지의 기록이라 남긴다.
 
+⚠ **삭제하기 전에 구버전 설치 파일을 `Work Utility\백업\`에 보관**한다. 지우고 나면
+GitHub에서 다시 받을 수 없고, 개발 PC의 설치본을 되돌릴 방법이 사라진다.
+
 ```bash
 gh release list --limit 30                 # 삭제 대상 확인
 gh release delete v{옛버전} --yes          # ⚠ --cleanup-tag 쓰지 말 것(태그까지 지운다)
@@ -187,6 +232,19 @@ u._current = lambda ch: '0.0.1' if ch=='app' else '2000.01'
 print(u.check('app')); print(u.check('data'))"
 ```
 그리고 **현재 버전에서는** `check_all()`이 `{'app': None, 'data': None}`이어야 정상(=최신).
+
+**실기 자동 업데이트 확인** — 개발 PC에 깔려 있는 **직전 버전 설치본이 기준선**이다.
+그 설치본이 새 릴리스를 잡는지 그 버전 번호로 확인한다(설치본을 건드리지 않는다):
+```bash
+.venv64/Scripts/python.exe -c "
+import sys,os; sys.path.insert(0,os.getcwd())
+from core import updater as u
+import version as v
+u._current = lambda ch: '{설치된_구버전}' if ch=='app' else v.DATA_VERSION
+print(u.check('app'))"
+```
+그래서 3단계에서 **설치본을 지우면 안 된다** — 지우는 순간 이 확인이 불가능해지고,
+사용자가 앱을 열어 갱신 알림을 받는 실제 경로도 함께 사라진다.
 
 ## 6. 마무리
 
@@ -220,6 +278,12 @@ print(u.check('app')); print(u.check('data'))"
 
 ## 하지 말 것
 
+- **개발 PC의 설치본을 제거·덮어쓰기** — `AppId`가 고정이라 테스트 설치가 곧 실사용
+  설치본 업그레이드이고, 이어지는 제거가 그것을 지운다. 그 설치본은 자동 업데이트를
+  실기로 확인할 유일한 기준선이다(3단계 참조, 2026-07-23 실사고).
+- **`unins000.exe`를 백업 없이 실행** — 특히 `/SUPPRESSMSGBOXES`와 함께 쓰면
+  사용자 데이터(`%LOCALAPPDATA%\KS-AI Editor`) 삭제 여부 질문에 '예'가 자동 선택된다.
+- **구버전 설치 파일을 백업하지 않고 릴리스를 삭제** — 되돌릴 수단이 없어진다.
 - **골드셋 실패 상태로 릴리스** — 조용한 교정 품질 저하가 사용자에게 나간다.
 - **`dist/` 산출물 커밋** — `.gitignore` 대상. 릴리스 자산으로만 배포한다.
 - **`--no-zip`으로 만든 빌드를 업로드** — 자산이 없다.
