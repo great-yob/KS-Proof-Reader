@@ -28,7 +28,44 @@ git log --oneline $(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null)..HE
 - DB의 `meta.data_version`이 최신 `data-*` 릴리스보다 크면 → **데이터 채널**
 - 둘 다면 둘 다. 애매하면 사용자에게 물어본다.
 
+## 0-b. 릴리스 경로 판별 — 빠른 / 전체 (⚠ 추측하지 말고 명령으로 판정)
+
+교정 품질 게이트(골드셋·사전 DB 불변식)는 **교정 판단 로직이 바뀌었을 때만** 의미가 있다.
+UI·업데이터·빌드 스크립트만 고친 릴리스에 그걸 돌리는 건 매번 수 분을 태우는 의식일 뿐이다.
+그래서 **바뀐 파일 목록으로** 경로를 정한다(사용자 지시 2026-07-23).
+
+```bash
+GUARD='^(nikl_dict|nikl_api|onterm_api)\.py$|^core/(correction_engine|correction_merger|gemini_checker|prompts|ai_guards|consistency_pass|morph|models|eomun_rules|spelling_pairs|josa_rules|bracket_rules|quote_rules|spacing_rules|userdict)\.py$|^ui/workers/(proofreading|apply)_worker\.py$|^(data|eval)/|^(update_stdict|update_opendict|build_stdict_part|build_norm_map|build_userdict_db|setup_dict)\.py$'
+LAST=$(git describe --tags --abbrev=0 --match 'v*')
+git diff --name-only $LAST..HEAD
+git diff --name-only $LAST..HEAD | grep -E "$GUARD" && echo "⇒ 전체 게이트" || echo "⇒ 빠른 릴리스"
+```
+
+- **하나라도 걸리면 → 전체 게이트**(1-b 수행). 교정 판단이 달라질 수 있는 파일들이다.
+- **하나도 안 걸리면 → 빠른 릴리스**(1-b 생략). UI·업데이터·빌드·문서만 바뀐 경우.
+- **판정이 애매하면 전체 게이트**로 간다. 빠른 경로는 편의고, 게이트는 안전장치다.
+
+⚠ **빠른 경로에도 실기 확인이 필요한 부류가 있다.** `core/hwp_editor.py`·
+`core/hwp_bridge_worker.py`·`core/hwpx_editor.py`·`core/__init__.py`·`installer/*.iss`는
+가드 목록에 없지만(골드셋이 **적용 경로를 전혀 테스트하지 않으므로** 돌려도 소득이 없다),
+대신 **실제 .hwp로 교정 1회**를 돌려 확인해야 한다. 골드셋으로 대체되지 않는다.
+
 ## 1. 사전 점검 (실패하면 여기서 멈춘다)
+
+### 1-a. 항상 한다 (빠른 경로에서도 생략 금지)
+
+이 저장소는 **공개**다. 아래는 전부 1초짜리 명령이고, 놓치면 **되돌릴 수 없는**
+유출(내장 키·고객 원고)이 공개 저장소에 박힌다 — 시간이 아니라 사고 비용의 문제다.
+
+```bash
+git status --short                                                  # 워킹트리 정리 상태
+git ls-files | grep -iE "config\.ini|key\.txt|_org_keys|교정샘플|\.hwpx?$|\.db$"   # 결과가 있으면 중단
+git ls-files -z | xargs -0 grep -lE "AIza[0-9A-Za-z_-]{30}|ghp_[0-9A-Za-z]{30}|github_pat_"
+```
+새로 추가된 문서에 **고객사명·원고 제목**이 없는지 확인한다. 실측 표는 `실파일A/B/C` 관례.
+(빌드 후 `core/_org_keys.py` 잔존 확인도 같은 이유로 항상 한다 — 3단계.)
+
+### 1-b. 교정 로직이 바뀐 릴리스에만 (0-b가 '전체 게이트'일 때)
 
 ```bash
 .venv64/Scripts/python.exe eval/ai_goldset/run_goldset.py
@@ -41,13 +78,8 @@ git log --oneline $(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null)..HE
 .venv64/Scripts/python.exe -c "import sqlite3;c=sqlite3.connect('data/stdict.db');print('norm_map',c.execute('SELECT COUNT(*) FROM norm_map').fetchone()[0])"
 ```
 
-**시크릿·고객정보 감사** — 이 저장소는 **공개**다:
-```bash
-git status --short
-git ls-files | grep -iE "config\.ini|key\.txt|_org_keys|교정샘플|\.hwpx?$|\.db$"   # 결과가 있으면 중단
-git ls-files -z | xargs -0 grep -lE "AIza[0-9A-Za-z_-]{30}|ghp_[0-9A-Za-z]{30}|github_pat_"
-```
-새로 추가된 문서에 **고객사명·원고 제목**이 없는지 확인한다. 실측 표는 `실파일A/B/C` 관례.
+⚠ **데이터 채널 릴리스는 경로 판별과 무관하게 항상 전체 게이트다** — 사전 DB 자체가
+바뀌는 릴리스이므로 `data/`가 가드에 걸린다(위 판별식이 자동으로 잡는다).
 
 ## 2. 버전 올림
 
@@ -285,6 +317,10 @@ print(u.check('app'))"
   사용자 데이터(`%LOCALAPPDATA%\KS-AI Editor`) 삭제 여부 질문에 '예'가 자동 선택된다.
 - **구버전 설치 파일을 백업하지 않고 릴리스를 삭제** — 되돌릴 수단이 없어진다.
 - **골드셋 실패 상태로 릴리스** — 조용한 교정 품질 저하가 사용자에게 나간다.
+- **'UI만 고쳤겠지' 감으로 골드셋 생략** — 0-b의 판별식을 **실행해서** 정한다.
+  가드에 걸리면 돌린다. 애매하면 돌린다.
+- **빠른 경로라고 1-a(시크릿 감사)까지 건너뛰기** — 이건 교정 품질 게이트가 아니라
+  공개 저장소 유출 방지이고, 1초짜리이며, 유출은 되돌릴 수 없다.
 - **`dist/` 산출물 커밋** — `.gitignore` 대상. 릴리스 자산으로만 배포한다.
 - **`--no-zip`으로 만든 빌드를 업로드** — 자산이 없다.
 - **과금·쓰기·개인정보 접근 키를 `collect_keys()`에 추가** — 이 저장소는 공개이고
