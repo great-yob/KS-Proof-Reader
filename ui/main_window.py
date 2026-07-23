@@ -984,7 +984,10 @@ class MainWindow(QMainWindow):
             return
         # 앱 교체 — 헬퍼 배치가 앱 종료를 기다렸다가 폴더를 갈아 끼우고 재실행한다.
         #   install_app이 True면 헬퍼가 이미 떠서 기다리는 중이므로 **반드시 종료**해야 한다.
-        if updater.install_app(zip_path, logger=log):
+        #   version을 함께 넘겨 제어판(ARP) 등록 버전까지 갱신한다 — 안 넘기면 폴더만
+        #   바뀌고 '앱 및 기능'에는 옛 버전이 남는다.
+        new_ver = (self._update_info.get(channel) or {}).get("version")
+        if updater.install_app(zip_path, logger=log, version=new_ver):
             self.close()
 
     # ══════════════════════════════════════════════

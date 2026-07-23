@@ -76,15 +76,19 @@ def _summarize_notes(notes: str) -> str:
             start = i + 1
             break
 
-    items, plain = [], []
+    # ② **첫 내용 블록만** 본다. 내용이 시작된 뒤 다음 제목을 만나면 거기서 끊는다.
+    #    ⚠ 이게 없으면 불릿 우선 규칙이 섹션을 뛰어넘는다 — 주요 변경이 문단이고
+    #    뒤쪽에 '그대로 유지되는 것' 같은 불릿 목록이 있으면 **그쪽**을 요약해 버렸다
+    #    (v1.0.6 릴리스에서 실제 발생). 사람이 읽는 순서를 그대로 따른다.
+    items, plain, started = [], [], False
     for raw in lines[start:]:
         s = raw.strip()
         if not s or s.startswith(("---", ">", "|", "```")):
             continue
         if s.startswith("#"):
-            if _STOP_HEAD.search(s):
-                break
-            continue                       # 하위 제목은 건너뛴다(항목이 본문)
+            if started or _STOP_HEAD.search(s):
+                break                      # 내용이 시작된 뒤의 제목 = 다음 섹션
+            continue                       # 아직 내용 전이면 하위 제목은 건너뛴다
         if any(b in s for b in _BOILERPLATE):
             continue
         bullet = s.startswith(("-", "*", "•"))
@@ -93,10 +97,12 @@ def _summarize_notes(notes: str) -> str:
         s = s.split(" — ")[0].split("예) ")[0].strip(" —·")
         if not s:
             continue
+        started = True
         (items if bullet else plain).append(s)
         if len(items) >= _NOTE_ITEMS:
             break
 
+    # 같은 블록 안에서는 불릿(변경 목록)이 문단(도입 설명)보다 정보 밀도가 높다.
     picked = (items or plain)[:_NOTE_ITEMS]
     text = " · ".join(picked)
     return (text[:_NOTE_CHARS] + "…") if len(text) > _NOTE_CHARS else text

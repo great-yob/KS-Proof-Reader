@@ -284,16 +284,79 @@ if not errorlevel 1 (
     goto wait
 )
 robocopy "{src}" "{dst}" /E /MOVE /NFL /NDL /NJH /NJS /NC /NS >nul
-start "" "{exe}"
+{arp}start "" "{exe}"
 rmdir /S /Q "{tmp}" 2>nul
 """
 
+_ARP_ROOT = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
 
-def install_app(zip_path: Path, logger: Optional[Callable[[str], None]] = None) -> bool:
+
+def _arp_update_cmds(new_version: str) -> str:
+    """제어판('앱 및 기능') 등록 정보를 새 버전으로 갱신하는 배치 명령을 만든다.
+
+    ⚠ 인앱 업데이트는 robocopy로 **폴더만** 갈아 끼운다. ARP 레지스트리는 Inno
+      설치 관리자만 쓰므로, 그냥 두면 제어판에 옛 버전이 계속 남는다
+      (실측 2026-07-23: 실제 1.0.5인데 제어판은 1.0.4). 표시상의 문제지만
+      사용자가 버전을 확인하는 곳이라 거짓말을 하게 둘 수 없다.
+
+    ⚠ AppId(GUID)를 여기 하드코딩하지 않는다 — .iss와 이중 관리가 되고, 어긋나면
+      조용히 엉뚱한 키를 만든다. **설치 경로로 우리 키를 찾고**, 못 찾으면(zip 설치·
+      개발 환경) 아무 명령도 만들지 않는다(=기능 없음, 사고 없음).
+
+    DisplayName에도 버전이 박혀 있어("KS-AI Editor 1.0.4") 함께 바꾼다.
+    반환: 배치에 끼워 넣을 문자열(없으면 "").
+    """
+    try:
+        import re
+        import winreg
+        from datapaths import app_dir
+        here = str(app_dir()).rstrip("\\/").lower()
+        root = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _ARP_ROOT)
+        i, lines = 0, []
+        while True:
+            try:
+                name = winreg.EnumKey(root, i)
+            except OSError:
+                break
+            i += 1
+            try:
+                sub = winreg.OpenKey(root, name)
+                loc = winreg.QueryValueEx(sub, "InstallLocation")[0]
+            except OSError:
+                continue
+            if str(loc).rstrip("\\/").lower() != here:
+                continue
+            key = f"HKCU\\{_ARP_ROOT}\\{name}"
+            lines.append(f'reg add "{key}" /v DisplayVersion /t REG_SZ '
+                         f'/d "{new_version}" /f >nul 2>&1')
+            try:
+                disp = winreg.QueryValueEx(sub, "DisplayName")[0]
+            except OSError:
+                disp = ""
+            # DisplayName에도 버전이 박혀 있다("KS-AI Editor 1.0.4").
+            #   ⚠ '실행 중 버전'으로 찾아 바꾸면 안 된다 — ARP가 옛 값에 머물러 있는
+            #   것이 바로 이 함수가 고치려는 증상이라, 둘은 애초에 어긋나 있다.
+            #   이름 형식을 가정하지 않고 **버전꼴 토큰**을 찾아 바꾼다(없으면 그대로 둔다).
+            if disp:
+                fixed = re.sub(r"\d+\.\d+(?:\.\d+)*", new_version, disp, count=1)
+                if fixed != disp:
+                    lines.append(f'reg add "{key}" /v DisplayName /t REG_SZ '
+                                 f'/d "{fixed}" /f >nul 2>&1')
+            break
+        return ("\n".join(lines) + "\n") if lines else ""
+    except Exception:
+        return ""      # 레지스트리 접근 실패는 업데이트를 막을 사유가 아니다
+
+
+def install_app(zip_path: Path, logger: Optional[Callable[[str], None]] = None,
+                version: Optional[str] = None) -> bool:
     """앱 패키지를 설치한다 — 압축을 풀고 **헬퍼가 앱 종료 후** 폴더를 교체·재실행.
 
     호출 측은 True를 받으면 곧바로 앱을 종료해야 한다(헬퍼가 기다리고 있다).
     ⚠ 데이터 폴더는 건드리지 않는다(app.zip에 data/가 없고, /MOVE는 원본에 있는 것만 옮긴다).
+
+    `version`을 주면 제어판 등록 정보(ARP)도 그 버전으로 갱신한다 — 안 주면 폴더만
+    바뀌고 제어판엔 옛 버전이 남는다(_arp_update_cmds 참조).
     """
     log = logger or (lambda *_: None)
     try:
@@ -312,7 +375,8 @@ def install_app(zip_path: Path, logger: Optional[Callable[[str], None]] = None) 
             return False
         bat = staging.parent / "ks_update.bat"
         bat.write_text(_HELPER.format(pid=os.getpid(), src=str(staging), dst=str(dst),
-                                      exe=str(exe), tmp=str(staging.parent)),
+                                      exe=str(exe), tmp=str(staging.parent),
+                                      arp=_arp_update_cmds(version) if version else ""),
                        encoding="utf-8")
         # CREATE_NO_WINDOW — 콘솔은 생기되 화면에 보이지 않는다(HWP 브리지 워커와 동일
         #   방식). ⚠ stdin을 리디렉션하지 말 것: 콘솔 핸들이 끊기면 배치 안의 명령이
