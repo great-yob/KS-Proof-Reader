@@ -30,6 +30,9 @@
 #define AppPublisher "Kim Daekyung"
 #define AppExeName   "KS-AI Editor.exe"
 #define AppUrl       "https://github.com/great-yob/KS-Proof-Reader"
+; 릴리스 자산 파일명 접두사 — 공백을 하이픈으로(GitHub Releases가 공백을 점으로 바꿈).
+;   build_dist.ASSET_PREFIX 와 반드시 같은 규칙이어야 한다.
+#define AssetBase    StringChange(AppName, " ", "-")
 
 ; 경로는 이 .iss 위치 기준으로 계산한다 — 공백 있는 경로를 /D 로 넘기지 않아도 된다.
 #define SrcDir   AddBackslash(SourcePath) + "..\dist\" + AppName
@@ -63,7 +66,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 
 ; ── 산출물 ──────────────────────────────────────────────────────
 OutputDir={#OutDir}
-OutputBaseFilename={#AppName}-Setup-{#AppVersion}
+OutputBaseFilename={#AssetBase}-Setup-{#AppVersion}
 SetupIconFile={#IconFile}
 UninstallDisplayIcon={app}\{#AppExeName}
 UninstallDisplayName={#AppName} {#AppVersion}

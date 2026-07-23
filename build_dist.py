@@ -55,6 +55,11 @@ ROOT = Path(__file__).resolve().parent
 #     적용한다. 이 값을 바꾸면 EXE 이름이 바뀌므로, 이미 배포된 구(舊)이름 설치본은
 #     이 이름의 새 빌드로 **자동 업데이트되지 않는다**(설치 파일로 1회 재설치 필요).
 APP_NAME = "KS-AI Editor"
+# 릴리스 자산 파일명 접두사 — **공백을 하이픈으로**. GitHub Releases는 자산명의 공백을
+#   점(.)으로 치환하므로("KS-AI Editor-…" → "KS-AI.Editor-…") 애초에 공백을 없앤다.
+#   설치 폴더·EXE·창 제목은 공백 형(APP_NAME) 그대로 — 자산 파일명만 하이픈 형이다
+#   (예전 "KS-Proof Reader"(폴더) vs "KS-Proof-Reader"(자산) 관례와 동일).
+ASSET_PREFIX = APP_NAME.replace(" ", "-")
 ORG_KEYS_PATH = ROOT / "core" / "_org_keys.py"
 
 # 번들에서 제외할 경로 조각 — PyInstaller datas 수집 시 필터로 쓴다.
@@ -347,8 +352,8 @@ def build_installer(app_ver: str):
     # 경로는 .iss가 자기 위치 기준으로 계산한다 — 공백 있는 경로를 /D로 넘기지 않는다.
     rc = subprocess.call([str(iscc), f"/DAppVersion={app_ver}", str(iss)],
                          cwd=str(ROOT))
-    # ⚠ .iss의 OutputBaseFilename({#AppName}-Setup-{ver})과 반드시 일치해야 한다.
-    out = ROOT / "dist" / "release" / f"{APP_NAME}-Setup-{app_ver}.exe"
+    # ⚠ .iss의 OutputBaseFilename({#AssetBase}-Setup-{ver})과 반드시 일치해야 한다.
+    out = ROOT / "dist" / "release" / f"{ASSET_PREFIX}-Setup-{app_ver}.exe"
     if rc != 0 or not out.is_file():
         print(f"  ✗ 설치 파일 생성 실패 (exit {rc})")
         return None
@@ -378,8 +383,8 @@ def package(outdir: Path, app_ver: str, data_ver: str, installer: bool = True) -
                   f"{setup.stat().st_size/1048576:6.0f} MB")
     print("  · 업데이트용 zip 압축 (수 분)")
     specs = [
-        (f"{APP_NAME}-{app_ver}-app.zip",  outdir, {"data"},     "앱 업데이트"),
-        (f"{APP_NAME}-data-{data_ver}.zip", outdir / "data", set(), "데이터 업데이트"),
+        (f"{ASSET_PREFIX}-{app_ver}-app.zip",  outdir, {"data"},     "앱 업데이트"),
+        (f"{ASSET_PREFIX}-data-{data_ver}.zip", outdir / "data", set(), "데이터 업데이트"),
     ]
     for name, src, skip, label in specs:
         if not src.exists():
