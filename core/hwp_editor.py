@@ -6,7 +6,7 @@ HWP COM 자동화를 실행합니다.
 
 아키텍처:
   [개발]   main.py/PySide6 ─→ HwpEditor ─→ subprocess(32bit python) ─→ 워커 ─→ COM
-  [배포본] KS-Proof Reader.exe ─→ HwpEditor ─→ bridge32/hwp_bridge_worker.exe ─→ COM
+  [배포본] KS-AI Editor.exe ─→ HwpEditor ─→ bridge32/hwp_bridge_worker.exe ─→ COM
 
 ⚠ **배포본은 32비트 파이썬을 동봉한 브리지 EXE로 실행한다**(`bridge32/`).
   과거엔 배포본도 `_find_python32()` + `.py` 스크립트 경로를 썼는데, 두 가지가 동시에

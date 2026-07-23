@@ -22,7 +22,9 @@ import os
 import sys
 from pathlib import Path
 
-APP_DIR_NAME = "KS-Proof Reader"     # %LOCALAPPDATA% 아래 폴더명
+APP_DIR_NAME = "KS-AI Editor"        # %LOCALAPPDATA% 아래 폴더명(설정·캐시·업데이터 설치 데이터)
+# ⚠ installer/KS-Proof-Reader.iss 의 [Code] UserDir 경로와 **반드시 일치**시킬 것 —
+#   제거 시 사용자 데이터 폴더를 찾는 경로다. 어긋나면 잔재가 남거나 엉뚱한 폴더를 지운다.
 _MARKER = "stdict.db"                # 데이터 폴더임을 식별하는 기준 파일
 
 

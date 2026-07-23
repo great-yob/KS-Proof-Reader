@@ -3,7 +3,7 @@
 ; ═══════════════════════════════════════════════════════════════════════════
 ;  build_dist.py 가 자동으로 호출한다. 손으로 돌릴 때:
 ;      "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" /DAppVersion=1.0.0 installer\KS-Proof-Reader.iss
-;  전제: `dist\KS-Proof Reader\` 가 이미 빌드돼 있어야 한다(앱+data+bridge32).
+;  전제: `dist\KS-AI Editor\` 가 이미 빌드돼 있어야 한다(앱+data+bridge32).
 ;
 ;  ⚠ 이 파일은 **UTF-8 BOM**으로 저장해야 한다. BOM이 없으면 Inno가 ANSI로 읽어
 ;    한글 메시지가 깨진다.
@@ -13,17 +13,22 @@
 ;    (robocopy로 폴더 통째 교체)가 권한 오류로 죽는다. 사용자 전용 설치는 UAC도 없고
 ;    업데이터도 그대로 동작한다. 형제 앱 KS-Works-Utility(electron-builder)와 같은 위치.
 ;
-;  ▌AppId는 절대 바꾸지 말 것 — 바꾸면 기존 설치를 업그레이드로 인식하지 못하고
-;    제어판에 항목이 둘로 늘어난다.
+;  ▌AppId는 제품 정체성이다. 같은 제품의 버전 업 동안에는 **절대 바꾸지 말 것**
+;    (바꾸면 업그레이드가 아니라 별개 제품으로 인식돼 제어판 항목이 둘로 늘어난다).
+;    단, **제품명을 바꾸는 rename**은 예외였다 — 2026-07-23 "KS-Proof Reader"→
+;    "KS-AI Editor"로 개명하며 AppId를 새로 발급했다. 옛 AppId를 유지하면 기존
+;    "KS-Proof Reader" 설치본이 있는 PC에서 새 설치 파일이 **옛 폴더 경로를 재사용**해
+;    설치되어(같은 AppId=업그레이드로 인식) 폴더명이 "KS-AI Editor"가 되지 못한다.
+;    → 이후로는 이 GUID를 고정한다.
 ; ═══════════════════════════════════════════════════════════════════════════
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
 #endif
 
-#define AppName      "KS-Proof Reader"
-#define AppPublisher "kim daekyung"
-#define AppExeName   "KS-Proof Reader.exe"
+#define AppName      "KS-AI Editor"
+#define AppPublisher "Kim Daekyung"
+#define AppExeName   "KS-AI Editor.exe"
 #define AppUrl       "https://github.com/great-yob/KS-Proof-Reader"
 
 ; 경로는 이 .iss 위치 기준으로 계산한다 — 공백 있는 경로를 /D 로 넘기지 않아도 된다.
@@ -32,7 +37,7 @@
 #define IconFile AddBackslash(SourcePath) + "..\assets\icon.ico"
 
 [Setup]
-AppId={{A2F5C9E1-4B7D-4E63-9C8A-1D6F3B0E75C2}
+AppId={{32456C4A-71D7-46B8-A59C-60B51DD21734}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
@@ -47,13 +52,18 @@ VersionInfoDescription={#AppName} 설치 프로그램
 DefaultDirName={localappdata}\Programs\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
+; ▌폴더 선택 페이지를 숨긴다 — 단순 편의가 아니라 **자동 업데이트를 지키는 장치**다.
+;   updater.install_app()은 EXE가 있는 폴더(app_dir)를 robocopy로 통째 교체하는데,
+;   사용자가 Program Files 같은 쓰기 불가 경로를 고르면 그 교체가 권한 오류로 죽는다.
+;   여기서 위치를 %LOCALAPPDATA%\Programs로 고정하면 그 사고를 원천 차단한다.
+DisableDirPage=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
 ; ── 산출물 ──────────────────────────────────────────────────────
 OutputDir={#OutDir}
-OutputBaseFilename=KS-Proof-Reader-Setup-{#AppVersion}
+OutputBaseFilename={#AppName}-Setup-{#AppVersion}
 SetupIconFile={#IconFile}
 UninstallDisplayIcon={app}\{#AppExeName}
 UninstallDisplayName={#AppName} {#AppVersion}
@@ -100,7 +110,8 @@ Type: filesandordirs; Name: "{app}"
 korean.RemoveUserData=설정·캐시와 자동 업데이트로 내려받은 사전 데이터도 함께 삭제할까요?%n%n%1%n%n교정한 원고 파일은 이 폴더에 저장되지 않으므로 삭제되지 않습니다.
 
 [Code]
-{ 제거 시 사용자 데이터 폴더(%LOCALAPPDATA%\KS-Proof Reader) 처리를 물어본다.
+{ 제거 시 사용자 데이터 폴더(%LOCALAPPDATA%\KS-AI Editor) 처리를 물어본다.
+  ⚠ 이 경로는 datapaths.APP_DIR_NAME 과 반드시 같아야 한다(현재: "KS-AI Editor").
   설치 폴더와 별개다 — 설정(config.ini)·조회 캐시(api_cache.db)·업데이터가 받은
   최신 사전 데이터가 여기 있다. 재설치할 사람도 있으므로 묻고 나서 지운다.
 
@@ -116,7 +127,7 @@ begin
   begin
     if UninstallSilent() then
       Exit;
-    UserDir := ExpandConstant('{localappdata}\KS-Proof Reader');
+    UserDir := ExpandConstant('{localappdata}\KS-AI Editor');
     if DirExists(UserDir) then
       if MsgBox(FmtMessage(CustomMessage('RemoveUserData'), [UserDir]),
                 mbConfirmation, MB_YESNO) = IDYES then

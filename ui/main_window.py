@@ -67,7 +67,7 @@ class _MARGINS(ctypes.Structure):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("KS-Proof Reader")
+        self.setWindowTitle("KS-AI Editor")
         # 네이티브 타이틀바 제거 — 창 컨트롤은 헤더가 직접 제공(프레임리스)
         self.setWindowFlag(Qt.FramelessWindowHint, True)
         self.setMinimumSize(960, 600)

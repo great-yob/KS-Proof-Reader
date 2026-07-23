@@ -59,7 +59,7 @@ def user_data_dir() -> Path:
     ⚠ 빌드본에서 번들 내부(`_MEIPASS` = `_internal/`)는 물론이고 설치 폴더도 쓰기 불가일
       수 있다(Program Files 등). API 캐시(api_cache.db)를 거기에 두면 저장이 조용히 실패해
       **매 실행마다 전 어휘를 재조회**하게 된다(온용어 폴백이 0.0s → 수 초로 퇴행).
-      그래서 빌드본에서는 %LOCALAPPDATA%\\KS-Proof Reader 를 쓴다.
+      그래서 빌드본에서는 %LOCALAPPDATA%\\KS-AI Editor 를 쓴다(datapaths.APP_DIR_NAME).
       개발 환경에서는 기존대로 레포의 data/ 를 쓴다(캐시 공유·디버깅 편의).
     """
     try:
@@ -69,7 +69,7 @@ def user_data_dir() -> Path:
         pass
     if getattr(sys, "frozen", False):
         base = os.environ.get("LOCALAPPDATA") or str(Path.home())
-        d = Path(base) / "KS-Proof Reader"
+        d = Path(base) / "KS-AI Editor"
     else:
         d = _get_base_dir() / "data"
     try:

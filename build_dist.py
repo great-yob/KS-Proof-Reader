@@ -29,7 +29,7 @@ build_dist.py — 배포본 빌드 (PyInstaller)
     data/event_queue.db  — 로컬 이벤트 큐
   ⚠ PyInstaller에 레포 루트를 통째로 include 하는 규칙을 추가하지 말 것.
 
-산출물: dist/KS-Proof Reader/  (onedir — data/stdict.db가 160MB라 onefile은
+산출물: dist/KS-AI Editor/  (onedir — data/stdict.db가 160MB라 onefile은
         실행 때마다 임시폴더로 압축 해제해 기동이 매우 느려진다)
 """
 
@@ -47,7 +47,14 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 ROOT = Path(__file__).resolve().parent
-APP_NAME = "KS-Proof Reader"
+# ⚠ 제품 표시 이름 = EXE 파일명 + dist 폴더명 + 설치 폴더명 + 릴리스 자산 접두사의
+#   **단일 출처**. 여기만 바꾸면 빌드 산출물 전체가 따라온다.
+#   ⚠ GitHub 저장소명(great-yob/KS-Proof-Reader)·릴리스 태그(v1.0.1)는 **별개**다 —
+#     그건 업데이터가 폴링하는 URL이라 version.py에 그대로 두고 여기서 바꾸지 않는다.
+#   ⚠ install_app()은 실행 중 EXE 이름과 app.zip 속 EXE 이름이 **같아야** 업데이트를
+#     적용한다. 이 값을 바꾸면 EXE 이름이 바뀌므로, 이미 배포된 구(舊)이름 설치본은
+#     이 이름의 새 빌드로 **자동 업데이트되지 않는다**(설치 파일로 1회 재설치 필요).
+APP_NAME = "KS-AI Editor"
 ORG_KEYS_PATH = ROOT / "core" / "_org_keys.py"
 
 # 번들에서 제외할 경로 조각 — PyInstaller datas 수집 시 필터로 쓴다.
@@ -340,7 +347,8 @@ def build_installer(app_ver: str):
     # 경로는 .iss가 자기 위치 기준으로 계산한다 — 공백 있는 경로를 /D로 넘기지 않는다.
     rc = subprocess.call([str(iscc), f"/DAppVersion={app_ver}", str(iss)],
                          cwd=str(ROOT))
-    out = ROOT / "dist" / "release" / f"KS-Proof-Reader-Setup-{app_ver}.exe"
+    # ⚠ .iss의 OutputBaseFilename({#AppName}-Setup-{ver})과 반드시 일치해야 한다.
+    out = ROOT / "dist" / "release" / f"{APP_NAME}-Setup-{app_ver}.exe"
     if rc != 0 or not out.is_file():
         print(f"  ✗ 설치 파일 생성 실패 (exit {rc})")
         return None
@@ -370,8 +378,8 @@ def package(outdir: Path, app_ver: str, data_ver: str, installer: bool = True) -
                   f"{setup.stat().st_size/1048576:6.0f} MB")
     print("  · 업데이트용 zip 압축 (수 분)")
     specs = [
-        (f"KS-Proof-Reader-{app_ver}-app.zip",  outdir, {"data"},     "앱 업데이트"),
-        (f"KS-Proof-Reader-data-{data_ver}.zip", outdir / "data", set(), "데이터 업데이트"),
+        (f"{APP_NAME}-{app_ver}-app.zip",  outdir, {"data"},     "앱 업데이트"),
+        (f"{APP_NAME}-data-{data_ver}.zip", outdir / "data", set(), "데이터 업데이트"),
     ]
     for name, src, skip, label in specs:
         if not src.exists():
