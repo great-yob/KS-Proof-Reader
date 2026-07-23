@@ -67,7 +67,10 @@ LIGHT = {
     "typo_bg":     "#E9F6EE", "typo_fg":   "#157F3C", "typo_border":   "#BCE3C7",
     "polish_bg":   "#EFEDFB", "polish_fg": "#6D4FD0", "polish_border": "#D7CFF3",
     # 활동 로그 레벨
+    #   log_start = 단계 '시작' 마커 전용. 완료(초록)·경고(주황)·오류(빨강)와
+    #   색상환에서 충분히 떨어진 파랑을 쓴다(라이트 배경 대비 ~4.9:1).
     "log_info":    "#8A93A1",
+    "log_start":   "#2563EB",
     "log_ok":      "#157F3C",
     "log_warn":    "#B4690E",
     "log_err":     "#D63B3B",
@@ -111,8 +114,9 @@ DARK = {
     "dict_bg":     "#2C2415", "dict_fg":   "#E8B468", "dict_border":   "#4A3A1C",
     "typo_bg":     "#16301F", "typo_fg":   "#6FD899", "typo_border":   "#225538",
     "polish_bg":   "#262339", "polish_fg": "#A99CF0", "polish_border": "#3C3766",
-    # 활동 로그 레벨
+    # 활동 로그 레벨 (log_start = 단계 '시작' 마커, 다크 배경 대비 ~7.5:1)
     "log_info":    "#6E7884",
+    "log_start":   "#6BA1FF",
     "log_ok":      "#54D17F",
     "log_warn":    "#E8B468",
     "log_err":     "#F1726E",

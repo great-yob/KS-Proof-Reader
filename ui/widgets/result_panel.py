@@ -1795,12 +1795,13 @@ class ResultPanel(QWidget):
             f"color:{pal['text_sub']}; }}")
 
         # 시간(고정폭 monospace) | 내용 2열 테이블 — 시간·본문 정렬을 보장한다.
-        lvl_color = {"err": pal["log_err"], "warn": pal["log_warn"],
-                     "ok": pal["log_ok"], "info": pal["text_sub"]}
+        #   레벨→색은 활동 패널과 **같은 표**를 쓴다(단일 출처). 'start'는 단계
+        #   시작 마커 전용 색이라 여기 빠지면 완료만 초록이고 시작은 회색이 된다.
+        from ui.widgets.activity_panel import _level_color
         rows = []
         for ts, lvl, msg in curated:
-            color = lvl_color.get(lvl, pal["text_sub"])
-            weight = "600" if lvl in ("ok", "err") else "400"
+            color = _level_color(pal, lvl)
+            weight = "600" if lvl in ("ok", "start", "err") else "400"
             safe = html.escape(msg)
             rows.append(
                 f'<tr>'

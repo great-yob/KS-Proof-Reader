@@ -236,11 +236,42 @@ def _condense(msg: str, lvl: str):
 
 # ══════════════════════════════════════════════════════════════
 
-_TS_FONT_PX  = 10
-_MSG_FONT_PX = 11
+_TS_FONT_PX  = 11
+_MSG_FONT_PX = 12
 _TS_GUTTER   = 12      # 시각 열 우측 여백(px)
 _ROW_PAD     = 3       # 셀 상하 여백 → 행 간격
-_LINE_HEIGHT = 138     # 내용 줄간격(%) — 2줄 이상 wrap될 때 가독성
+_LINE_HEIGHT = 140     # 내용 줄간격(%) — 2줄 이상 wrap될 때 가독성
+
+# 태그(선두 [ … ])로 단계 표시를 강제한다 — 파이프라인을 세로로 훑을 때
+#   '시작 → 완료' 리듬이 색으로 먼저 읽히게 하기 위함(사용자 지정 2026-07-23).
+#   ⚠ err만은 유지한다. 실패 라인을 초록 '완료'로 칠하면 사고를 숨기게 된다
+#     (실제로 두 조건이 겹치는 로그는 없지만, 규칙이 그렇게 남으면 언젠가 겹친다).
+_TAG_RE = re.compile(r"^\[([^\]]+)\]")
+
+
+def _display_level(text: str, lvl: str) -> str:
+    if lvl == "err":
+        return lvl
+    m = _TAG_RE.match(text or "")
+    if not m:
+        return lvl
+    tag = m.group(1)
+    if "완료" in tag:
+        return "ok"
+    if "시작" in tag:
+        return "start"
+    return lvl
+
+
+def _level_color(pal, lvl: str) -> str:
+    """레벨 → 색. 활동 패널과 완료 화면이 같은 표를 쓴다(단일 출처)."""
+    return {
+        "err":   pal["log_err"],
+        "warn":  pal["log_warn"],
+        "ok":    pal["log_ok"],
+        "start": pal["log_start"],
+        "info":  pal["text_sub"],
+    }.get(lvl, pal["text_sub"])
 
 # ⚠ PySide6의 setLineHeight(height, heightType)는 heightType을 **int**로 받는다
 #   (LineHeightTypes Enum 객체를 그대로 넘기면 TypeError, int()도 불가) → .value.
@@ -310,14 +341,13 @@ class ActivityPanel(QFrame):
 
     def _write_row(self, row: int, ts: str, lvl: str, text: str):
         pal = current_palette()
-        color = {
-            "err":  pal["log_err"], "warn": pal["log_warn"],
-            "ok":   pal["log_ok"],  "info": pal["text_sub"],
-        }.get(lvl, pal["text_sub"])
+        color = _level_color(pal, lvl)
+        weight = 600 if lvl in ("ok", "start", "err") else 400
         safe = (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
         cells = (
             f'<span style="color:{pal["text_dim"]}; font-size:{_TS_FONT_PX}px;">{ts}</span>',
-            f'<span style="color:{color}; font-size:{_MSG_FONT_PX}px;">{safe}</span>',
+            f'<span style="color:{color}; font-size:{_MSG_FONT_PX}px;'
+            f' font-weight:{weight};">{safe}</span>',
         )
         bf = QTextBlockFormat()
         bf.setLineHeight(_LINE_HEIGHT, _PROPORTIONAL)
@@ -358,6 +388,7 @@ class ActivityPanel(QFrame):
         text, key = shown
         if not text:
             return
+        lvl = _display_level(text, lvl)      # 태그([… 시작]/[… 완료])가 레벨을 이긴다
         # 같은 종류의 진행 라인은 새 행을 쌓지 않고 마지막 행을 갱신
         if key and self._rows and self._rows[-1][3] == key and self._table is not None:
             self._rows[-1] = (ts, lvl, text, key)
