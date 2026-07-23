@@ -137,6 +137,10 @@ class ProofreadingWorker(QThread):
                 log("  [사전] data/stdict.db 미존재 — 사전 기능 비활성")
         elif not self._stop.is_set():
             self.step_changed.emit("screening", "표준국어대사전 원문 스크리닝 중…")
+            # 파이프라인 단계 경계 마커 — 활동 로그가 '무엇이 언제 시작/끝났는지'를
+            #   읽을 수 있게 한다(사용자 요청 2026-07-23). 사전을 못 쓰는 경우엔
+            #   찍지 않는다 — 위 분기가 '미존재' 사유를 이미 남긴다.
+            log("[사전(국립국어원) 분석 시작]")
             self.progress.emit(10, "사전 스크리닝 중…")
             suspicious_words = validator.extract_suspicious_words(text, stop_event=self._stop)
             stats = getattr(validator, "last_stats", {})
@@ -359,6 +363,8 @@ class ProofreadingWorker(QThread):
         self.progress.emit(72, "교정 병합 중…")
         merged = CorrectionMerger.merge([], ai_list)
         log(f"  → 1차 확정 교정 항목: {len(merged)}건")
+        # 생성(AI) 구간이 끝나고 검증(사전·결정론 규칙) 구간이 시작되는 경계.
+        log("[사전+결정론규칙 검증 시작]")
 
         # [4.5] 문서 전체 일관성 강화 (청크 간 비결정성 보정)
         if merged and not self._stop.is_set():
@@ -1238,6 +1244,10 @@ class ProofreadingWorker(QThread):
                             log(f"      · '{o}'")
                 except Exception as e:
                     log(f"  [문서 대조] 검증 건너뜀: {e}")
+
+        # 검증 구간 종료 → 결과 집계 구간 시작(활동 로그 단계 경계 마커).
+        log("[사전+결정론규칙 검증 완료]")
+        log("[분석+검증 결과 정리 시작]")
 
         # 결정론 보강 패스 결과를 2줄로 요약(자동 적용 / 검토 필요) — 개별 라인 통합.
         if det_auto:
