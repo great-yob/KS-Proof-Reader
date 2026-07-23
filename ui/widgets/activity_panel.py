@@ -377,14 +377,19 @@ class ActivityPanel(QFrame):
         self._scroll_to_end()
 
     def get_proofreading_log(self):
-        """완료 보고서용 — HWP 배관 로그를 제외한 교정교열 관련 **원문** 로그.
-        반환: [(time_str, level, msg), ...]"""
-        out = []
-        for ts, lvl, msg in self._entries:
-            if any(kw in msg for kw in _PLUMBING_KW):
-                continue
-            out.append((ts, lvl, msg))
-        return out
+        """완료 보고서용 로그 — **화면에 보이는 것과 같은 요약본**을 준다.
+
+        ⚠ 과거엔 원문(_entries)을 주고 result_panel이 자기만의 큐레이션을 한 번 더
+        했다. 규칙이 두 벌이라 같은 실행의 로그가 두 화면에서 다르게 읽혔고,
+        표기를 바꿀 때마다 양쪽을 맞춰야 했다 → 표시본(_rows)으로 일원화한다
+        (사용자 지시 2026-07-23). 원문이 필요하면 `self._entries`를 직접 본다.
+
+        HWP 배관 로그는 여기서도 제외한다 — _DROP이 이미 걸러내지만 err 레벨은
+        _DROP을 통과하므로(진단 보존) 완료 보고서용으로 한 번 더 막는다.
+        반환: [(time_str, level, text), ...]
+        """
+        return [(ts, lvl, text) for ts, lvl, text, _key in self._rows
+                if not any(kw in text for kw in _PLUMBING_KW)]
 
     def clear(self):
         """새 파일에서만 호출 — 로그 초기화."""

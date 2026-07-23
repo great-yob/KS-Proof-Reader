@@ -57,84 +57,15 @@ _SOURCE_LABEL = {"dict": "사전검증", "ai_typo": "AI 오탈자", "ai_polish":
 
 
 # ══════════════════════════════════════════════════════════════
-# ▌완료 대시보드 진행 로그 큐레이션
-#   활동 패널(우측·라이브)은 전 과정을 자세히 남기지만, 완료 대시보드는 '심플한
-#   결론'이 목적이다. 청크별 진행·개별 예시·내부 재시도 등 저정보 라인을 걷어내고
-#   과교정 필터 제외 라인들을 한 줄로 합쳐, 핵심 마일스톤만 남긴다.
+# ▌완료 대시보드 진행 로그
+#   ⚠ 여기서 로그를 **다시 가공하지 않는다.** 예전엔 활동 패널이 원문 로그를
+#   주고 이 파일이 자기만의 규칙(_LOG_DROP/_LOG_LEAD/합산)으로 한 번 더
+#   큐레이션했다 — 규칙이 두 벌이라 같은 실행의 로그가 라이브 패널과 완료
+#   화면에서 다르게 읽혔고, 표기를 바꿀 때마다 양쪽을 맞춰야 했다.
+#   이제 `ActivityPanel.get_proofreading_log()`가 **화면에 보이는 요약본
+#   그대로**(`[태그] 내용`) 넘겨주므로 그대로 렌더한다(사용자 지시 2026-07-23).
+#   표기를 바꿀 곳은 ui/widgets/activity_panel.py의 _RULES 한 곳뿐이다.
 # ══════════════════════════════════════════════════════════════
-
-# 완전히 버릴 라인(부분 문자열 매칭) — 청크별 진행·안내문·내부 재시도·예시 등.
-_LOG_DROP = (
-    "분석을 시작합니다",       # 순수 필러(첫 마일스톤과 중복)
-    "분석 중…",              # [AI] 분석 중… N/18 청크 (청크별 진행)
-    "이 청크 의심 단어",      # 청크별 의심어 수
-    "통합 분석 시작",         # [AI] 오탈자·사전 통합 분석 시작…
-    "문서가 큽니다",          # 소요 시간 안내(결과엔 불필요)
-    "대부분은 작가 의도",      # ※ 설명 문단
-    "우리말샘 API",           # 폴백 세부(결과엔 불필요)
-    "재시도는 글로서리",       # 내부 재시도 세부
-    "출력 상한 도달",          # 내부 폭주 회피 세부
-    "모델 자동 전환",          # 내부 폴백 세부
-    "JSON 자동 복구",          # 내부 파싱 복구 세부
-    "JSON 부분 복구",
-    "절단 응답 부분 복구",
-)
-
-# 접두 마커(라인 맨 앞) — 제거해 좌측 정렬을 통일한다.
-_LOG_LEAD = ("→ ", "✓ ", "· ", "※ ", "ℹ ", "⚠ ", "  ")
-
-
-def _curate_result_log(entries):
-    """활동 로그(list[(ts, lvl, msg)]) → 완료 대시보드용 마일스톤 리스트.
-
-    · 저정보 라인 제거(_LOG_DROP)
-    · 개별 예시(· '원문'→'교정') 제거
-    · 'AI 교정 N건 제외' 라인들을 한 줄로 합산
-    · 접두 마커/들여쓰기 제거 + 꼬리 괄호 설명 축약
-    """
-    import re
-    out = []
-    ai_excl_total = 0
-    group_slot = None          # 합산 라인을 끼워 넣을 위치(첫 제외 라인 자리)
-    group_ts = None
-
-    for ts, lvl, msg in (entries or []):
-        m = (msg or "").strip()
-        if not m:
-            continue
-        if any(k in m for k in _LOG_DROP):
-            continue
-        # 개별 예시 라인(· '원문' → '교정' / · '토큰')만 제거 — 따옴표·화살표가 지문.
-        #   '· 본문 N곳에 해당' 같은 요약 라인(따옴표 없음)은 보존한다.
-        if m.startswith("·") and any(q in m for q in ("'", '"', "→", "‘", "’", "“", "”")):
-            continue
-
-        # 접두 마커 제거(좌측 정렬 통일). 상태(성공/경고/오류)는 lvl 색으로 표현.
-        for lead in _LOG_LEAD:
-            if m.startswith(lead):
-                m = m[len(lead):].lstrip()
-                break
-
-        # 'AI 교정 N건 제외' 계열 → 한 줄로 합산
-        gm = re.search(r"AI 교정\s+([\d,]+)\s*건 제외", m)
-        if gm:
-            ai_excl_total += int(gm.group(1).replace(",", ""))
-            if group_slot is None:
-                group_slot = len(out)
-                group_ts = ts
-                out.append(None)   # 자리 예약
-            continue
-
-        # 꼬리 괄호 설명 축약 — '…제거 (접두 교정이 부분문자열로…)' → '…제거'
-        #   (수치·핵심 진술만 남긴다. 괄호 안이 '= N건' 요약이면 보존)
-        m = re.sub(r"\s*\((?![^)]*=[^)]*\d)[^)]*\)\s*$", "", m).strip()
-
-        out.append((ts, lvl, m))
-
-    if group_slot is not None:
-        out[group_slot] = (group_ts, "info",
-                           f"AI 과교정 필터 — {ai_excl_total:,}건 정제 (표기·양식 존중)")
-    return [x for x in out if x is not None]
 
 # 메시 배경 전용 브랜드 하이라이트(장식 색 — 팔레트와 별개, 네이버 AI탭 레퍼런스 톤)
 _MESH_VIOLET = "#7C5CFF"
@@ -1844,10 +1775,9 @@ class ResultPanel(QWidget):
 
     # ── 진행 로그(요약) ────────────────────────────
     def _build_log(self):
-        # 완료 대시보드는 '심플한 결론'이 목적이라, 활동 패널의 전체 로그를
-        #   마일스톤만 남게 큐레이션하고(시간·본문 2열 고정 정렬) 보여준다.
-        #   전체 상세 로그는 라이브 활동 패널이 계속 보관한다.
-        curated = _curate_result_log(self._log)
+        # 활동 패널의 표시본을 **그대로** 쓴다(단일 출처 — 파일 상단 주석 참조).
+        #   여기선 시간·본문 2열 고정 정렬만 담당한다.
+        curated = self._log
         if not curated:
             return None
         frame, lay = self._section("교정 진행 요약", "clipboard-check",
