@@ -1050,11 +1050,34 @@ _NAME_CLAIM_RE = re.compile(r"명칭|부처명|기관명|부서명|정식 이름
 _CORRECT_CLAIM_RE = re.compile(r"정확|공식|정식|올바|옳|맞습니다")
 
 
+# 명칭 뒤에 붙는 '부가부' 시작 문자 — 공백 또는 여는 괄호류. 이걸로 시작하는 꼬리가
+#   원문·교정문 양쪽에서 완전히 같으면 '명칭만 바뀌고 부가부는 그대로'다.
+_ORG_TAIL_RE = re.compile(r"([가-힣]{2,})([\s(\[（［【「『〈《].*)$")
+
+
+def _org_name_bases(o: str, cr: str):
+    """비교할 '기관명 base' 한 쌍을 뽑는다(불가하면 (None, None)).
+
+    ① 공백·부호 없는 순한글 어절: 조사 제거 base — '성평등가족부의'→'성평등가족부'.
+    ② 명칭 뒤에 **양쪽 완전히 동일한 부가부**(공백/여는 괄호로 시작)가 붙은 형태:
+       '성평등가족부(고립·은둔 청소년)'→'여성가족부(…)' — 선행 한글 런의 조사 제거 base.
+       ⚠ 꼬리가 다르면(연도 '(2020)'→'(2021)' 등 명칭 외 편집) 순수 명칭 치환이 아니므로 제외.
+    AI가 명칭을 더 긴 스팬(괄호 부가부 포함)으로 내보내도 강등이 새지 않게 한다.
+    """
+    if re.fullmatch(r"[가-힣]+", o) and re.fullmatch(r"[가-힣]+", cr):
+        return _strip_josa(o), _strip_josa(cr)
+    mo, mc = _ORG_TAIL_RE.match(o), _ORG_TAIL_RE.match(cr)
+    if mo and mc and mo.group(2) == mc.group(2):
+        return _strip_josa(mo.group(1)), _strip_josa(mc.group(1))
+    return None, None
+
+
 def _is_org_name_substitution(c) -> bool:
     """c가 '기관·부처 명칭을 다른 명칭으로 통째 바꾸는' 개체 편집인가?
 
     발동(전부 충족 + 마지막 두 트리거 중 하나):
-      · source가 AI, 원문/교정문이 각각 **공백 없는 순한글 단일 어절**(조사 제거 base, len≥4).
+      · source가 AI, 원문/교정문에서 뽑은 **기관명 base**(순한글 단일 어절, 또는 양쪽
+        동일 부가부가 붙은 명칭의 선행 한글 런; 조사 제거 base, len≥4)가 존재.
       · **자모거리 ≥ 3** — 오탈자 교정('여상가족부'→'여성가족부', 거리 1~2)은 보존한다.
       · (구조) 원문·교정문이 **같은 기관·직위 접미사**로 끝남(부장관·부·청·위원회…) = 개명, 또는
         (사유) reason이 '명칭이 정확/공식/정식'이라는 주장.
@@ -1062,10 +1085,8 @@ def _is_org_name_substitution(c) -> bool:
     if c.source not in ("ai_typo", "ai_polish") or not c.original or c.original == c.corrected:
         return False
     o, cr = c.original.strip(), c.corrected.strip()
-    if " " in o or " " in cr:
-        return False
-    ob, cb = _strip_josa(o), _strip_josa(cr)
-    if not re.fullmatch(r"[가-힣]+", ob) or not re.fullmatch(r"[가-힣]+", cb):
+    ob, cb = _org_name_bases(o, cr)
+    if ob is None or cb is None:
         return False
     if len(ob) < 4 or len(cb) < 4 or ob == cb:
         return False

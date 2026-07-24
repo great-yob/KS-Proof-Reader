@@ -209,7 +209,9 @@ def build_integrated_prompt(text: str, suspicious_words: list[str],
     """
     sw = "\n".join(f"- {w}" for w in suspicious_words) if suspicious_words else "- (의심 단어 없음)"
     if glossary:
-        gl = "\n".join(f'- "{orig}" → "{corr}"' for orig, corr in glossary)
+        # 정렬해 주입 — 누적 순서(상류 청크의 탐지 순서)에 프롬프트가 흔들리지 않게 한다.
+        #   항목은 gemini_checker._normalize_glossary_entry로 base 정규화·중복 제거된 상태.
+        gl = "\n".join(f'- "{orig}" → "{corr}"' for orig, corr in sorted(glossary))
     else:
         gl = "- (아직 확정된 교정 없음 — 첫 청크이거나 새 단어들이 처음 등장)"
     return PROMPT_INTEGRATED.format(text=text, suspicious_words=sw, glossary=gl)

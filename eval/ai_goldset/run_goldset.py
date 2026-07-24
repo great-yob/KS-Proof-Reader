@@ -211,6 +211,33 @@ def phase_a_doc_dict():
             fails += 1
             print(f"  ✗ FAIL [관용주장] reason={reason!r} 기대={conf_want} 실제={cor.confidence}")
 
+    # demote_org_name_substitution ⑤: 기관·부처 명칭 치환(AI가 모르는 개편·개명 되돌림)
+    #   → low 강등(자동 적용 제외, 방향은 편집자 몫). ★괄호 부가부가 붙은 스팬 변형까지
+    #   포함(2026-07-24 갭 수정 — '성평등가족부(고립·은둔 청소년)'이 공백 때문에 강등을 새던 버그).
+    on_cases = [
+        # (original, corrected, source, 입력 conf, 기대 conf)
+        ("성평등가족부", "여성가족부", "ai_typo", "high", "low"),                 # 맨몸 명칭
+        ("성평등가족부의", "여성가족부의", "ai_typo", "high", "low"),               # 조사형
+        ("성평등가족부장관", "여성가족부장관", "ai_typo", "high", "low"),           # 직위 접미사
+        ("성평등가족부(고립·은둔 청소년)", "여성가족부(고립·은둔 청소년)",
+         "ai_typo", "high", "low"),                                              # ★괄호 스팬(갭)
+        ("성평등가족부 (고립·은둔 청소년)", "여성가족부 (고립·은둔 청소년)",
+         "ai_typo", "high", "low"),                                              # ★공백+괄호 스팬(갭)
+        ("여상가족부", "여성가족부", "ai_typo", "high", "high"),                   # 오탈자(거리1) → 보존
+        ("여성가족부(2020)", "여성가족부(2021)", "ai_typo", "high", "high"),        # 꼬리 다름(연도) → 보존
+        ("여성가족부의 자료", "여성가족부의 방침", "ai_typo", "high", "high"),        # 명칭 외 편집 → 보존
+        ("컨텐츠", "콘텐츠", "ai_typo", "high", "high"),                          # 근접·짧음 → 보존
+        ("성평등가족부", "여성가족부", "dict", "high", "high"),                    # AI 아님(dict) → 무간섭
+        ("성평등가족부", "여성가족부", "ai_typo", "low", "low"),                   # 이미 low → 유지
+    ]
+    for o, cr, src, conf_in, conf_want in on_cases:
+        cor = Correction(original=o, corrected=cr, reason="'여성가족부'가 정확한 부처 명칭",
+                         source=src, color=HL_TYPO, confidence=conf_in)
+        ai_guards.demote_org_name_substitution([cor])
+        if cor.confidence != conf_want:
+            fails += 1
+            print(f"  ✗ FAIL [기관명치환] {o!r}→{cr!r} 기대={conf_want} 실제={cor.confidence}")
+
     # drop_loanword_paraphrase: 외래어 순화(목표어=등재어, 글자 완전상이)는 제외, 철자교정은 보존.
     #   ⚠ 원문은 비표준 표기('파라메터')일 수 있어 _DICT에 없음 — 목표어만 등재면 순화로 판정.
     _DICT = {"파라미터", "매개변수", "결제", "결재", "지향", "지양", "인터페이스", "접속", "위험"}

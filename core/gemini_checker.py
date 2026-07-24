@@ -140,6 +140,61 @@ def _salvage_json_objects(s: str) -> list:
 #   분산시켜 회귀를 유발함(eomun.db 비활성 시 복귀로 입증). 어문 규범은 결정론 페어로만 사용.
 
 
+# ── 글로서리 정규화(청크 간 일관성 힌트의 캐스케이드 증폭 차단, 2026-07-24) ──────────
+#   문제: 글로서리에 AI 날것 스팬을 그대로 쌓으면 같은 교정의 조사/괄호 변형('…부는'·'…부의'·
+#     '…부(고립·은둔)')이 별개 항목이 되어, 하류 청크 프롬프트가 상류 청크의 '어느 표면형을
+#     골랐나'라는 미세 비결정에 흔들린다(동일 파일 재분석이 매번 다른 근본 원인 중 하나).
+#   대응: 글로서리에 넣기 전 **용어 base로 정규화**(조사 제거)하고 **base 쌍으로 중복 제거**한다.
+#     인용·문장 조각·괄호 스팬(공백/문장부호 포함 = 재등장 안 함 = 일관성 가치 0)은 아예 제외해
+#     churn을 없앤다. 주입 순서 정렬은 prompts.build_integrated_prompt이 담당(순서 churn 제거).
+#   ⚠ 이는 '프롬프트 힌트'만 바꾼다 — 교정 자체(result/merge/apply)는 무영향. 그래도 AI 입력
+#     변경이라 채택 전 eval/ai_goldset(fulldoc) 재현성·recall 검증 선결.
+_GLOSSARY_MAX_BASE_LEN = 20   # 용어 base 최대 길이(단일 토큰 backstop — 문장은 공백으로 이미 배제)
+
+
+def _gloss_strip_josa(word: str) -> str:
+    """어절 끝 조사 제거 base(형태소). 미가용/실패 시 입력 그대로(graceful no-op)."""
+    try:
+        from . import morph
+        if morph.available():
+            b = morph.strip_josa(word)
+            if b:
+                return b
+    except Exception:
+        pass
+    return word
+
+
+def _glossary_base(s: str):
+    """어절의 조사 제거 base. '재등장 가능한 단일 용어'가 아니면 None.
+
+    순수 [영숫자·한글] 단일 토큰만 용어로 본다 — 공백·문장부호·괄호가 있으면(인용·문장 조각·
+    괄호 스팬·날짜) 재등장하지 않아 글로서리 가치가 없으므로 제외한다. 순수 숫자도 제외.
+    """
+    if not re.fullmatch(r"[0-9A-Za-z가-힣]+", s) or not re.search(r"[A-Za-z가-힣]", s):
+        return None
+    base = _gloss_strip_josa(s)
+    if not base or not (2 <= len(base) <= _GLOSSARY_MAX_BASE_LEN):
+        return None
+    return base
+
+
+def _normalize_glossary_entry(original: str, corrected: str):
+    """글로서리 항목을 '재등장 가능한 용어'의 base 쌍으로 정규화(불가하면 None).
+
+    조사/스팬 변형('…부는'·'…부의')을 한 base로 접어, 하류 청크 프롬프트가 상류 청크의
+    '어느 표면형을 골랐나'에 흔들리지 않게 한다(캐스케이드 증폭 차단).
+    """
+    o = (original or "").strip()
+    c = (corrected or "").strip()
+    if not o or not c or o == c:
+        return None
+    ob, cb = _glossary_base(o), _glossary_base(c)
+    if ob is None or cb is None or ob == cb:
+        return None
+    return ob, cb
+
+
 class GeminiChecker:
     """Google Gemini 기반 AI 교정교열 (오탈자 보완 / 윤문)"""
 
@@ -282,15 +337,22 @@ class GeminiChecker:
             tagged    = self._tag(raw_items, skip_set, source, color)
             result.extend(tagged)
 
-            # 글로서리 누적 — 이 청크에서 확정된 high-confidence 교정만
+            # 글로서리 누적 — 이 청크에서 확정된 high-confidence 교정만.
+            #   ⚠ 날것 스팬이 아니라 **용어 base로 정규화**(_normalize_glossary_entry)해
+            #     넣는다: 조사/괄호 변형을 한 base로 접고 인용·문장 조각은 제외해, 하류 청크
+            #     프롬프트가 상류의 미세 비결정에 흔들리는 캐스케이드를 끊는다. base 쌍으로 dedup.
             if glossary is not None:
-                existing = {orig for orig, _ in glossary}
+                seen = {(o, c) for o, c in glossary}
                 for c in tagged:
-                    if c.confidence == "high" and c.original not in existing:
-                        glossary.append((c.original, c.corrected))
-                        existing.add(c.original)
-                        if len(glossary) >= GLOSSARY_MAX:
-                            break
+                    if c.confidence != "high":
+                        continue
+                    entry = _normalize_glossary_entry(c.original, c.corrected)
+                    if entry is None or entry in seen:
+                        continue
+                    glossary.append(entry)
+                    seen.add(entry)
+                    if len(glossary) >= GLOSSARY_MAX:
+                        break
 
             if i < total - 1:
                 time.sleep(AI_CALL_DELAY)
