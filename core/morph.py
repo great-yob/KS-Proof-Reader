@@ -371,6 +371,21 @@ def _is_noun_headword(word: str) -> bool:
     except Exception:
         return False
 
+
+def _is_headword(word: str) -> bool:
+    """`word`가 **품사 불문** 정확 등재 표제어인가(nikl_dict, graceful).
+
+    _is_noun_headword와 나눠 쓰는 이유: 우리말샘 전문용어 행은 pos가 비어 있어
+    ('한부모가족'·'한부모가정' 실측 pos='') 명사 필터를 통과하지 못한다. 복합어
+    **경계 판정**엔 품사보다 '한 낱말로 등재됐다'는 사실이 중요하므로 여기선 품사를 묻지
+    않는다. 반대로 _is_noun_headword는 '한개'(부사) 같은 비명사를 걸러야 해서 필터가 필요.
+    """
+    try:
+        import nikl_dict
+        return nikl_dict._is_exact_headword(word)
+    except Exception:
+        return False
+
 # ── 체언 뒤에서도 반드시 띄어 쓰는 '엄선된' 의존명사 ─────────────────────────
 # ⚠ 2026-06-22 정책은 노이즈를 막으려 '관형어+명사'만 띄웠다(find_spacing_suggestions).
 #   그래서 '명사+의존명사'(리플릿등·9월말)는 구조적으로 놓쳤다. 이를 **과교정 없이** 메우려고
@@ -411,6 +426,90 @@ def _insert_spaces(w: str, positions) -> str:
     return "".join(out)
 
 
+# 컷을 가로지르는 등재 복합어를 찾을 때 훑는 최대 길이(DB 조회 상한).
+_MAX_COMPOUND = 8
+
+
+def _longer_headword_over_cut(w: str, tokens, pv, t):
+    """컷(t.start)을 가로지르며 **prev+t보다 더 긴** 등재 표제어가 어절 안에 있는가.
+
+    kiwi가 **미등재 복합어의 첫 음절을 관형사로 오분석**했을 때만 참이 된다. 실제 사례
+    (2026-07-27 사용자 보고): '한부모가족지원'을 한(MM)+부모(NNG)+…로 봐 '한 부모가족지원'
+    으로 쪼갰다. 어절 전체('한부모가족지원')도 prev+t('한부모')도 미등재라 기존 가드가 전부
+    뚫렸지만, 사전엔 '한부모가족'·'한부모가정'이 있다 — 컷(1)을 지나 명사 t의 끝(3)을
+    **넘어서** 덮는 등재어가 있다는 건 그 경계가 낱말 내부라는 뜻이다.
+
+    ⚠ **반드시 run(=prev+t)보다 긴 후보만** 본다(`t_end + 1`부터 시작). 길이가 같은 후보까지
+    받으면 '갈수있다'의 '갈수'(渴水)·'한개'(부사)·'두개'(頭蓋)에 걸려 정상 교정('갈 수 있다'·
+    '한 개'·'두 개')을 통째로 막는다(골드셋 A+++가 잡는 함정). 같은 길이 판정은 위쪽
+    _is_noun_headword 가드가 품사까지 보며 담당한다.
+    ⚠ 끝에 붙은 조사·기호는 후보에서 제외(_eojeol_base) — '한개는'의 '개는'처럼 조사가
+    우연히 낱말을 이루는 오매칭을 막는다.
+    """
+    t_end = t.start + len(t.form)
+    base_end = len(_eojeol_base(w, tokens))
+    run_end = t_end
+    while run_end < len(w) and re.match(r"[가-힣]", w[run_end]):
+        run_end += 1
+    limit = min(run_end, base_end, pv.start + _MAX_COMPOUND)
+    for end in range(t_end + 1, limit + 1):
+        cand = w[pv.start:end]
+        if _is_headword(cand):
+            return cand
+    return None
+
+
+# 어미 '-는지/-ㄹ지/-는데'와 **동형인** 1글자 의존명사.
+#   kiwi는 어절 단독 분석에서 '없는지'를 없(VA)+는(ETM)+지(NNB)로 본다(문맥을 줘도 동일 —
+#   실측). 그대로 두면 '없는 지'로 쪼갠다. 시간 경과의 '지'('떠난 지 3년')와 장소·경우의
+#   '데'('간 데 없다')는 **과거 관형형('-ㄴ/-은') 뒤**에만 오므로, 그 외 관형형('-는/-ㄹ/-던')
+#   뒤는 어미로 보고 컷하지 않는다. '푸는 데 시간이'류를 놓치지만 억제 방향이라 안전하다.
+_EOMI_AMBIG_DEP = frozenset({"지", "데"})
+_PAST_ETM = frozenset({"ᆫ", "은"})
+
+# 어절이 '용언 활용형'으로도 읽히는 근소차 대안을 인정할 점수 차 상한.
+#   실측: '세울' = 세(MM)+울(NNG) -24.248 vs 세우(VV)+ᆯ(ETM) -24.831 → 차 0.58.
+#         '본가구' = 본(MM)+가구(NNG) -24.949 vs 보(VV)+ᆫ(ETM)+가구(NNG) -27.408 → 차 2.46.
+_INFLECT_GAP = 1.5
+
+
+def _reads_as_inflected_verb(w: str) -> bool:
+    """어절 전체가 **용언 활용형 하나**로도 읽히는가(근소차 대안 분석).
+
+    `find_spacing_suggestions`는 어절을 **문맥 없이 단독 분석**하므로 관형사 오분석이 난다.
+    실측: '세울'(세우다의 활용)을 세(MM)+울(NNG)로 봐 '세 울'로 쪼갰다 — 같은 어절을
+    **문장 문맥**에 넣으면 kiwi도 세우(VV)+ᆯ(ETM)로 옳게 분석한다. 문맥 재분석은 비용이
+    크므로, 대신 top_n 대안 중 **어간 하나 + 어미들**로만 이뤄지고 그 기본형이 사전에 있는
+    분석이 근소차로 존재하면 '용언 활용형일 수 있음'으로 보고 컷을 포기한다(억제 방향).
+
+    '본가구'(보/VV+ᆫ/ETM+**가구/NNG**)·'타가구'(어간 2개)처럼 대안에 체언이 남거나 어간이
+    여럿이면 해당 없음 — 정상 교정('본 가구'·'타 가구')은 그대로 살아난다.
+    """
+    kiwi = _get_kiwi()
+    if kiwi is None:
+        return False
+    try:
+        cands = kiwi.analyze(w, top_n=3)
+    except Exception:
+        return False
+    if not cands:
+        return False
+    best = cands[0][1]
+    for toks, score in cands[1:]:
+        if best - score > _INFLECT_GAP:
+            break                      # 점수순 정렬 — 더 볼 필요 없음
+        if not toks:
+            continue
+        head = toks[0]
+        if not head.tag.startswith(_VERBAL):
+            continue
+        if any(not t.tag.startswith("E") for t in toks[1:]):
+            continue                   # 어간1 + 어미들만 (체언이 남으면 활용형 아님)
+        if _is_headword(head.form + "다"):
+            return True
+    return False
+
+
 def find_spacing_suggestions(text: str, min_len: int = 2) -> list:
     """붙여 쓴 어절에서 **관형어 뒤 의존명사(NNB) 띄어쓰기 누락**만 찾는다.
 
@@ -428,12 +527,19 @@ def find_spacing_suggestions(text: str, min_len: int = 2) -> list:
 
     글자는 안 바뀌고(환각 0) 공백만 삽입. 탐지 전용 '검수 카드' 후보다(자동수정 아님).
     반환: [(eojeol, spaced), ...] (등장 순, 중복 제거). 미설치/실패 시 [].
+
+    ⚠ **2패스 구조**(2026-07-27): 1패스에서 어절을 분석하며 '컷을 가로지르는 등재 복합어'
+    (_longer_headword_over_cut)가 발견된 접두를 문서 단위로 모으고, 2패스에서 그 접두가
+    걸린 컷을 전부 취소한다. 사전이 '한부모가족'만 알고 '한부모'는 모르는 상황에서
+    '한부모가구'·단독 '한부모'까지 구제하려면 **같은 문서의 다른 어절이 낸 증거**가 필요하다.
     """
     import re as _re
     kiwi = _get_kiwi()
     if kiwi is None or not text:
         return []
-    out = []
+
+    # ── 1패스: 어절 분석(kiwi 호출은 여기서만) + 문서 스코프 '안전 접두' 수집 ──────
+    words = []
     seen = set()
     for w in text.split():
         if len(w) < min_len or w in seen:
@@ -442,9 +548,27 @@ def find_spacing_suggestions(text: str, min_len: int = 2) -> list:
         if not _re.search(r"[가-힣]", w):
             continue
         try:
-            tokens = kiwi.analyze(w)[0][0]
+            words.append((w, kiwi.analyze(w)[0][0]))
         except Exception:
             continue
+
+    straddle = {}          # (어절, 토큰 인덱스) → 가로지른 등재어 (2패스 재조회 방지)
+    safe_prefix = set()    # 문서에서 '낱말 내부'로 판명된 관형어+명사 접두('한부모')
+    for w, tokens in words:
+        for i, t in enumerate(tokens):
+            if i == 0 or t.tag not in _DEP_NOUN:
+                continue
+            pv = tokens[i - 1]
+            if pv.tag not in ("MM", "NR"):
+                continue
+            hit = _longer_headword_over_cut(w, tokens, pv, t)
+            if hit:
+                straddle[(w, i)] = hit
+                safe_prefix.add(w[pv.start:t.start + len(t.form)])
+
+    # ── 2패스: 컷 결정 ──────────────────────────────────────────────────────────
+    out = []
+    for w, tokens in words:
         cuts = set()
         for i, t in enumerate(tokens):
             if i == 0 or t.tag not in _DEP_NOUN:
@@ -459,14 +583,23 @@ def find_spacing_suggestions(text: str, min_len: int = 2) -> list:
             if (pv.tag == "MM" and len(pv.form) == 1 and pv.form in _SURNAMES
                     and t.tag in ("NNG", "NNP") and len(t.form) == 1):
                 continue
-            # 사전-명사 가드 — kiwi가 등재 명사를 관형사+의존명사로 오분석한 경우 스킵.
-            #   '이중과제'를 이(MM)+중(NNB)+과제로 봐 '이 중 과제'로 쪼개지만 '이중(二重)'은 등재
-            #   명사다. prev(MM/NR)+t 표면이 '명사/대명사' 표제어면 진짜 띄어쓰기 경계가 아니다.
-            #   ⚠ 고유어 수관형사(한/두/세…)+단위('한 개'·'두 개')는 제외 — '두개(頭蓋)' 같은 동형
-            #   명사에 걸려 정상 단위 띄어쓰기를 막지 않도록. ('갈 수'·'할 때'는 prev=ETM이라 무영향.)
-            if pv.tag in ("MM", "NR") and pv.form not in _NATIVE_CARDINAL:
-                run = w[pv.start:t.start + len(t.form)]
-                if len(run) >= 2 and _is_noun_headword(run):
+            if pv.tag in ("MM", "NR"):
+                # 사전-명사 가드 — kiwi가 등재 명사를 관형사+의존명사로 오분석한 경우 스킵.
+                #   '이중과제'를 이(MM)+중(NNB)+과제로 봐 '이 중 과제'로 쪼개지만 '이중(二重)'은
+                #   등재 명사다. prev(MM/NR)+t 표면이 '명사/대명사' 표제어면 경계가 아니다.
+                #   ⚠ 고유어 수관형사(한/두/세…) 예외는 **단위성 의존명사(NNB)에만** 적용한다 —
+                #   '두개(頭蓋)'에 걸려 '두 개'를 막지 않으려는 예외였는데, 태그를 안 보면
+                #   '한'으로 시작하는 **모든 복합어**('한부모…'·'세대원'·'세분류')가 이 가드를
+                #   통째로 우회한다(2026-07-27 사용자 보고의 1차 원인).
+                if not (pv.form in _NATIVE_CARDINAL and t.tag == "NNB"):
+                    run = w[pv.start:t.start + len(t.form)]
+                    if len(run) >= 2 and _is_noun_headword(run):
+                        continue
+                # 복합어 경계 가드 — 컷을 가로지르는 더 긴 등재어(어절 내부 증거),
+                #   또는 같은 문서의 다른 어절이 그 접두를 낱말 내부로 판정한 경우.
+                if (w, i) in straddle:
+                    continue
+                if w[pv.start:t.start + len(t.form)] in safe_prefix:
                     continue
             # 사전-명사 가드 ② — 관형형 어미(ETM) 뒤에도 등재 명사가 온다: '지난주'를 kiwi가
             #   지나(VV)+ㄴ(ETM)+주(NNB)로 봐 '지난 주'로 쪼갰다(등재 명사인데도. '지난달'·
@@ -480,6 +613,18 @@ def find_spacing_suggestions(text: str, min_len: int = 2) -> list:
                 base = _eojeol_base(w, tokens)
                 if len(base) >= 2 and _is_noun_headword(base):
                     continue
+                # 어미 동형 의존명사 가드 — '없는지'(어미 -는지)를 '없는 지'로 쪼개던 문제.
+                #   '지·데'가 의존명사인 건 과거 관형형('-ㄴ/-은') 뒤뿐이다(_EOMI_AMBIG_DEP).
+                if t.form in _EOMI_AMBIG_DEP and pv.form not in _PAST_ETM:
+                    continue
+                # 서술격조사 오분석 가드 — '외국인자격상실의심자'의 잘린 조각
+                #   '국인자격상실의심자'를 국(NNG)+이(VCP)+ㄴ(ETM)+자격상실…로 봐 쪼갰다.
+                #   'X이다'의 활용 앞 체언이 1글자면 낱말 조각일 확률이 높다('학생인 경우'처럼
+                #   체언이 2글자 이상인 정상 케이스는 그대로 통과).
+                if (i >= 3 and tokens[i - 2].tag == "VCP"
+                        and tokens[i - 3].tag.startswith("N")
+                        and len(tokens[i - 3].form) == 1):
+                    continue
             if 0 < t.start < len(w):
                 cuts.add(t.start)             # 관형어 뒤 명사 '앞' 띄움
             # 의존명사(NNB) 뒤에서 새 단어가 이어지면 그것도 띄움('갈 수 있다'의 '있다').
@@ -489,6 +634,10 @@ def find_spacing_suggestions(text: str, min_len: int = 2) -> list:
                 if nt.tag in _AFTER_NNB_STEM and 0 < nt.start < len(w):
                     cuts.add(nt.start)
         if not cuts:
+            continue
+        # 용언 활용형 가드 — 어절 단독 분석이 만든 관형사 오분석('세울'=세/MM+울/NNG)을
+        #   근소차 대안('세우'/VV+'ᆯ'/ETM)으로 되돌린다. 컷이 잡힌 어절에만 재분석(비용 최소).
+        if _reads_as_inflected_verb(w):
             continue
         spaced = _insert_spaces(w, cuts)
         if spaced != w and spaced.replace(" ", "") == w:
