@@ -88,6 +88,11 @@ def _needs_review(c: dict) -> bool:
     return c.get("source") == "dict_flag" or c.get("confidence") == "low"
 
 
+def _rep_text(occ: dict) -> str:
+    """카드의 '반복 k/N' 표시 문구(반복이 1회뿐이면 빈 문자열=숨김)."""
+    return f"반복 {occ['rep_index']}/{occ['rep_total']}" if occ["rep_total"] > 1 else ""
+
+
 class _Occupancy:
     """겹침 판정용 점유 맵 — '이미 차지한 구간 목록'을 매번 선형 탐색하던 O(등장²)를
     본문 길이만 한 바이트맵으로 바꾼다(구간 하나당 낱말 길이만큼만 읽고 쓴다).
@@ -1150,14 +1155,21 @@ class ReviewPanel(QWidget):
         top.addWidget(cat_chip)
         # 반복 표시는 항상 만들어 두고 필요할 때만 보인다 — 등장이 나중에 늘거나(역방향
         #   교정 합류) 겹침 판정이 바뀌면 k/N이 달라지는데, 라벨이 없으면 카드를 새로
-        #   만드는 수밖에 없다(=목록 전량 재생성). _sync_rep_labels가 제자리 갱신한다.
-        rep_lbl = label("")
+        #   만드는 수밖에 없다(=목록 전량 재생성). _sync_rep_label이 제자리 갱신한다.
+        # ⚠ **여기서 setVisible(True)를 부르지 말 것.** `top`은 아직 어떤 위젯에도
+        #   붙지 않은 레이아웃이라(아래 `cl.addLayout(top)`에서야 붙는다) addWidget을
+        #   해도 라벨은 **부모가 없는 상태**다. 부모 없는 위젯을 show하면 Qt가 그것을
+        #   **최상위 창으로 띄운다** — 카드마다 빈 팝업창이 하나씩 번쩍이는 원인이었다
+        #   (실측: 카드 14장 → 유령 창 14개, 사용자 보고 2026-07-27). 그래서 처음부터
+        #   올바른 텍스트로 만들고, 숨김만 지정한다(숨기기는 창을 만들지 않아 안전).
+        rep_text = _rep_text(occ)
+        rep_lbl = label(rep_text)
         rep_lbl.setStyleSheet(
             f"color: {pal['text_muted']}; font-size: 11px; border: none; background: transparent;")
-        rep_lbl.setVisible(False)   # 반복 1회 카드에선 숨김(숨은 위젯은 레이아웃에서 빠진다)
+        if not rep_text:
+            rep_lbl.setVisible(False)   # 숨은 위젯은 레이아웃에서 빠진다(여백도 안 생김)
         top.addWidget(rep_lbl)
         card._rep_lbl = rep_lbl
-        self._sync_rep_label(card)
 
         top.addStretch()
         accept_btn = IconButton("check", size=15, role="text_dim")
@@ -1585,65 +1597,21 @@ class ReviewPanel(QWidget):
           늘어난 경우에만 그 카드들을 제자리에 끼워 넣는다.
         """
         c, ci = occ["c"], occ["ci"]
-        # 카드가 실제로 끼어들 때만 목록이 밀리므로, 그때만 스크롤 앵커를 되돌린다.
-        anchor = self._capture_card_anchor(occ)
         if status == "accepted":
-            inserted = self._apply_unify_forward(ci, orig, corr, active_occ=occ)
+            self._apply_unify_forward(ci, orig, corr, active_occ=occ)
         else:
-            inserted = self._apply_flip(c, ci, orig, corr, active_occ=occ)
-        # 일반 카드가 _set_status 끝에서 _scroll_to로 하는 것과 동일하게, 미리보기를
-        #   방금 처리한 등장 위치로 옮긴다(일관성 카드는 조기 반환이라 그 경로를 안 탄다
-        #   — 사용자 보고 2026-07-21: 수락/거절해도 원문·교정문이 따라오지 않음).
-        #   ⚠ _refresh_preview가 예약한 '스크롤 원위치 복원' 뒤에 실행돼야 하므로 지연.
-        QTimer.singleShot(0, lambda: self._scroll_previews_to(self._active_occ_id))
-        if not inserted:
-            return          # 카드 목록 불변 — 스크롤도 그대로다.
+            self._apply_flip(c, ci, orig, corr, active_occ=occ)
+        # 처리한 카드를 목록 맨 위로 올리고 미리보기도 그 자리로 — **일반 카드와 완전히
+        #   같은 마무리**다(`_set_status` 끝의 `_scroll_to`). 예전엔 앵커 복원으로 카드를
+        #   '있던 자리에 그대로' 두었는데, 다른 카드는 전부 위로 정렬되는 터라 일관성
+        #   카드만 제자리에 남아 처리됐는지 헷갈렸다(사용자 보고 2026-07-27).
+        #   역방향 카드가 끼어들어 위치가 밀려도 `_place_card`가 정착까지 재조준한다.
+        self._scroll_to(occ["uid"])
 
-        def _unfreeze():
-            if not self._card_scroll.updatesEnabled():
-                self._card_scroll.setUpdatesEnabled(True)
-        # 위쪽에 카드가 끼어들면 조작한 카드가 아래로 밀린다 — 삽입~보정 사이의
-        #   중간 상태를 감췄다가 위치가 정착한 뒤 한 번에 보여준다. 정착 콜백이 오지
-        #   않아도 화면이 영영 얼지 않도록 시간 기반 백스톱을 함께 건다.
-        self._card_scroll.setUpdatesEnabled(False)
-        self._restore_card_anchor(anchor, on_done=_unfreeze)
-        QTimer.singleShot(1200, _unfreeze)
-
-    # ── 카드 목록 스크롤 고정 ──────────────────────
-    def _capture_card_anchor(self, occ: dict):
-        """방금 조작한 카드가 화면에서 놓인 위치를 기억 — 재구성 후 그대로 되돌리기 위해.
-
-        _rebuild_cards는 카드를 전부 파괴하고 앞 50장만 다시 만들기 때문에, 아무것도
-        안 하면 스크롤바 값이 달라진 콘텐츠 높이에 클램프돼 엉뚱한 곳으로 튄다
-        (사용자 보고 2026-07-21 — 반대 카드 생성 시 화면이 날아감).
-        """
-        sb = self._card_scroll.verticalScrollBar()
-        card = next((cd for cd in self._cards if cd._occ is occ), None)
-        # (기준 등장, 뷰포트 안에서의 y 오프셋, 폴백용 원래 스크롤 값)
-        return (occ, (card.pos().y() - sb.value()) if card is not None else 0, sb.value())
-
-    def _restore_card_anchor(self, anchor, on_done=None):
-        if not anchor:
-            if on_done:
-                on_done()
-            return
-        occ, offset, fallback = anchor
-
-        def stage_load():
-            # 기준 카드가 아직 로드 범위 밖이면 나올 때까지 이어서 로드.
-            while (not any(cd._occ is occ for cd in self._cards)
-                   and self._loaded_card_count < len(self._occ)):
-                self._load_more_cards(50)
-            if any(cd._occ is occ for cd in self._cards):
-                self._place_card(occ, offset, on_done=on_done)
-            else:
-                # 필터에 걸려 카드가 없는 경우(예: '미적용' 필터) — 값만 되돌린다.
-                sb = self._card_scroll.verticalScrollBar()
-                sb.setValue(min(fallback, sb.maximum()))
-                if on_done:
-                    on_done()
-
-        QTimer.singleShot(0, stage_load)
+    # ── 카드 목록 스크롤 ───────────────────────────
+    #   (`_capture_card_anchor`/`_restore_card_anchor`는 2026-07-27 삭제 — 전량 재구성
+    #    뒤 '있던 자리'로 되돌리기 위한 장치였는데, 재구성 자체가 없어졌고 일관성 카드도
+    #    일반 카드처럼 `_scroll_to`로 맨 위 정렬하도록 통일해 쓰는 곳이 사라졌다.)
 
     def _place_card(self, occ: dict, offset: int, smooth: bool = False,
                     attempt: int = 0, prev_y: int | None = None, on_done=None):
@@ -1683,9 +1651,13 @@ class ReviewPanel(QWidget):
 
     # ── 카드 목록 증분 갱신 ────────────────────────
     def _sync_rep_label(self, card) -> bool:
-        """카드의 '반복 k/N' 표시를 현재 등장 상태에 맞춘다(바뀌었으면 True)."""
-        occ = card._occ
-        want = f"반복 {occ['rep_index']}/{occ['rep_total']}" if occ["rep_total"] > 1 else ""
+        """카드의 '반복 k/N' 표시를 현재 등장 상태에 맞춘다(바뀌었으면 True).
+
+        ⚠ 카드가 **이미 화면 트리에 붙은 뒤에만** 부를 것 — 부모 없는 위젯을 보이게
+        하면 최상위 창이 뜬다(_create_card의 경고 참조). 카드 생성 시점엔 부르지 않고
+        처음부터 올바른 텍스트로 만든다.
+        """
+        want = _rep_text(card._occ)
         lbl = getattr(card, "_rep_lbl", None)
         if lbl is None or lbl.text() == want:
             return False
@@ -1759,7 +1731,8 @@ class ReviewPanel(QWidget):
         '원문 표기로 통일'을 했다면 반대 교정(corr→orig)이 수락 상태로 남아 있어
         서로 상쇄되므로 반드시 거절로 되돌린다.
 
-        등장 목록은 그대로이고 상태만 바뀌므로 **카드 재구성이 없다**(항상 False 반환).
+        등장 목록은 그대로이고 상태만 바뀌므로 **카드 재구성이 없다**(항상 False 반환 —
+        '등장이 늘었는가'를 알리는 값이다).
         """
         for o in self._occ:
             if o["ci"] == fwd_ci:
@@ -1784,8 +1757,8 @@ class ReviewPanel(QWidget):
     def _apply_flip(self, c: dict, fwd_ci: int, orig: str, corr: str, active_occ=None):
         """'원문 표기로 통일'(거절 방향) — 이 그룹 전체 거절 + 반대 교정(corr→orig) 수락.
 
-        반대 교정이 **새로 합성될 때만** 등장이 늘어난다(그때만 True 반환 — 호출자가
-        스크롤 앵커를 되돌린다). 이미 있던 반대 교정을 되살리는 경우는 상태 변경뿐이다.
+        반대 교정이 **새로 합성될 때만** 등장이 늘어난다(그때만 True 반환). 이미 있던
+        반대 교정을 되살리는 경우는 상태 변경뿐이라 카드 삽입도 일어나지 않는다.
         """
         # 카드 목록이 어디까지 만들어져 있는지 '등장 uid'로 기억 — 아래 재정렬로
         #   인덱스 기준 경계(_loaded_card_count)는 의미를 잃는다.
@@ -2124,13 +2097,16 @@ class ReviewPanel(QWidget):
              검수 필요는 선택 시 진한 경고색+흰글씨, 평소엔 연한 경고 칩.
         2행: 적용(녹)·거절(적)·직접수정(청) — 배경 고스트, 글자만 색.
         모든 칩은 라벨 레귤러·숫자만 볼드.
+
+        ⚠ **숫자만 달라졌으면 칩을 다시 만들지 않는다**(2026-07-27). 예전엔 호출 때마다
+        세 레이아웃을 비우고 칩 6개를 새로 만들었는데, 카드를 하나 처리할 때마다 집계
+        영역이 **사라졌다 나타나는 깜빡임**으로 보였다(사용자 보고). 칩의 구성(활성 필터·
+        '검수 필요' 칩 유무)이 그대로면 라벨 텍스트만 갈아 끼운다 — 위젯이 파괴되지
+        않으니 깜빡임도, 재생성 비용도 없다.
         """
         if not hasattr(self, "_cat_flow"):
             return
         pal = current_palette()
-        self._clear_layout(self._title_chips_lay)
-        self._clear_layout(self._status_row_lay)
-        self._clear_layout(self._cat_flow)
 
         from collections import Counter
         cnt, total, accepted, rejected, edited = Counter(), 0, 0, 0, 0
@@ -2144,6 +2120,31 @@ class ReviewPanel(QWidget):
             edited += bool(o["c"].get("_edited"))
             cnt[_display_category(o["c"])] += 1
         pending = total - accepted - rejected
+        review_n = cnt.get(REVIEW_CAT, 0)
+
+        # 칩 텍스트(순서 고정) — 구성이 같으면 이 값만 갈아 끼운다.
+        texts = [_count_html("전체 ", total), _count_html("미적용 ", pending)]
+        if review_n:
+            texts.append(_count_html("검수 필요 ", review_n))
+        texts += [_count_html("적용 ", accepted), _count_html("거절 ", rejected),
+                  _count_html("직접수정 ", edited)]
+        # 구성 서명: 활성 필터(칩 모양이 바뀐다) + '검수 필요' 칩 유무(개수가 바뀐다)
+        #   + 팔레트(테마 토글 시 색을 다시 입혀야 하므로 반드시 재생성시킨다).
+        sig = (self._active_filter, bool(review_n), pal["surface"])
+        chips = getattr(self, "_count_chips", None)
+        if chips is not None and getattr(self, "_chip_sig", None) == sig and len(chips) == len(texts):
+            for chip, t in zip(chips, texts):
+                if chip.text() != t:        # 바뀐 것만 — setText는 레이아웃을 무효화한다
+                    chip.setText(t)
+            self._cat_row_w.setVisible(self._cat_flow.count() > 0)
+            return
+
+        # 구성이 달라졌을 때만 전체 재생성(필터 전환·검수 필요 칩 등장/소멸·테마 변경).
+        self._clear_layout(self._title_chips_lay)
+        self._clear_layout(self._status_row_lay)
+        self._clear_layout(self._cat_flow)
+        self._count_chips = []
+        self._chip_sig = sig
 
         # ── 1행: 전체 · 미적용 · 검수 필요 (필터 선택) ──
         #   선택된 쪽이 primary(채움), 나머지는 테두리 — 클릭하면 두 칩의 모양이 맞바뀐다.
@@ -2156,24 +2157,25 @@ class ReviewPanel(QWidget):
                 text, pal["text"], on_click=lambda: self._set_filter(target),
                 border_color=pal["accent"])
 
-        self._title_chips_lay.addWidget(_filter_chip(
-            _count_html("전체 ", total), self._active_filter is None, None), 1)
-        self._title_chips_lay.addWidget(_filter_chip(
-            _count_html("미적용 ", pending), self._active_filter == PENDING_FILTER,
-            PENDING_FILTER), 1)
+        def _add(lay, chip):
+            lay.addWidget(chip, 1)
+            self._count_chips.append(chip)   # texts와 같은 순서로 쌓는다
+
+        _add(self._title_chips_lay, _filter_chip(
+            texts[0], self._active_filter is None, None))
+        _add(self._title_chips_lay, _filter_chip(
+            texts[1], self._active_filter == PENDING_FILTER, PENDING_FILTER))
         # 검수 필요 — 선택 시 진한 경고색+흰글씨, 평소엔 연한 경고 칩.
-        review_n = cnt.get(REVIEW_CAT, 0)
         if review_n:
             kind = "review_active" if self._active_filter == REVIEW_CAT else "review"
-            self._title_chips_lay.addWidget(self._make_count_chip(
-                _count_html("검수 필요 ", review_n), kind,
-                on_click=lambda: self._set_filter(REVIEW_CAT)), 1)
+            _add(self._title_chips_lay, self._make_count_chip(
+                texts[2], kind, on_click=lambda: self._set_filter(REVIEW_CAT)))
 
         # ── 2행: 적용(녹)·거절(적)·직접수정(청) — 배경 고스트, 글자만 색 ──
-        self._status_row_lay.addWidget(self._make_ghost_chip(_count_html("적용 ", accepted), pal["success"]), 1)
-        self._status_row_lay.addWidget(self._make_ghost_chip(_count_html("거절 ", rejected), pal["error"]), 1)
-        self._status_row_lay.addWidget(self._make_ghost_chip(
-            _count_html("직접수정 ", edited), pal.get("info", pal["accent"])), 1)
+        _add(self._status_row_lay, self._make_ghost_chip(texts[-3], pal["success"]))
+        _add(self._status_row_lay, self._make_ghost_chip(texts[-2], pal["error"]))
+        _add(self._status_row_lay, self._make_ghost_chip(
+            texts[-1], pal.get("info", pal["accent"])))
 
         # 카테고리행은 이제 비어 있음(검수 필요는 1행으로 이동) — 빈 줄 여백 제거.
         self._cat_row_w.setVisible(self._cat_flow.count() > 0)
