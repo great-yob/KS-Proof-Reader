@@ -88,6 +88,27 @@ def _needs_review(c: dict) -> bool:
     return c.get("source") == "dict_flag" or c.get("confidence") == "low"
 
 
+class _Occupancy:
+    """겹침 판정용 점유 맵 — '이미 차지한 구간 목록'을 매번 선형 탐색하던 O(등장²)를
+    본문 길이만 한 바이트맵으로 바꾼다(구간 하나당 낱말 길이만큼만 읽고 쓴다).
+
+    겹침 해소(_resolve_overlaps)와 미리보기 렌더(_render_with_text)가 같은 규칙을
+    쓰므로 한 곳에 둔다. 등장 5,000개 문서에서 겹침 해소 756ms·미리보기 1.9s가
+    이 선형 탐색 때문이었다(2026-07-27 실측).
+    """
+    __slots__ = ("_m",)
+
+    def __init__(self, size: int):
+        self._m = bytearray(max(0, size) + 1)
+
+    def hits(self, s: int, e: int) -> bool:
+        """[s, e)가 이미 점유된 자리와 겹치는가."""
+        return self._m.find(1, s, e) >= 0
+
+    def take(self, s: int, e: int):
+        self._m[s:e] = b"\x01" * (e - s)
+
+
 _ZWSP = "\u200b"   # ZERO WIDTH SPACE
 
 
@@ -514,6 +535,11 @@ class ReviewPanel(QWidget):
     _IDLE_TICK_MS = 30      # 틱 간격(UI가 숨 쉴 틈)
     _IDLE_QUIET_MS = 250    # 마지막 조작 후 이만큼 조용해야 프리페치 재개
     _PREFETCH_AHEAD = 2     # 화면 아래로 유지할 여유분(뷰포트 높이 배수)
+    # 미리보기 재렌더 병합 간격. 원가의 96%가 Qt setHtml(문서 파싱+레이아웃)이라
+    #   파이썬 쪽을 아무리 줄여도 클릭당 수백 ms가 남는다(실측 18만자·등장 3,830에서
+    #   475ms 중 setHtml 455ms). 카드를 연달아 처리할 때 매번 문서를 새로 조판하지 않고
+    #   마지막 조작 뒤 한 번만 그린다 — 클릭 반응은 카드 색 변경으로 즉시 돌려준다.
+    _PREVIEW_DEBOUNCE_MS = 80
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -523,8 +549,28 @@ class ReviewPanel(QWidget):
         self._options = {}
         self._full_text = ""
         self._active_ci = None
+        # 등장 식별자 — 카드/미리보기 앵커는 **등장의 목록 인덱스가 아니라 uid**로 묶는다.
+        #   인덱스로 묶으면 역방향 교정 합류(_apply_flip)로 목록이 재정렬될 때마다 모든
+        #   카드의 id가 어긋나 '전량 재생성' 말고는 정합을 맞출 방법이 없었다(성능 원인).
+        self._uid_seq = 0
+        self._occ_pos = {}        # uid → self._occ 내 인덱스
+        self._active_occ_id = None
+        self._flip_cache = {}     # (original, corrected) → _flip_info 결과
+        # 미리보기 재렌더 병합 타이머(_refresh_preview(defer=True) 참조) — _refresh_preview가
+        #   무조건 참조하므로 UI보다 먼저 만든다.
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.timeout.connect(self._refresh_preview)
         self._build_ui()
         self._build_toast()
+
+    def _new_uid(self) -> int:
+        self._uid_seq += 1
+        return self._uid_seq
+
+    def _reindex_occ(self):
+        """uid → 인덱스 표 갱신 — self._occ를 정렬·삽입한 직후 반드시 호출."""
+        self._occ_pos = {o["uid"]: i for i, o in enumerate(self._occ)}
 
     # ══════════════════════════════════════════════
     # UI
@@ -857,6 +903,8 @@ class ReviewPanel(QWidget):
         self._corrections = self._sort_by_position(corrections)
         self._options = options
         self._active_filter = None        # 새 문서 — 카테고리 필터 초기화
+        self._active_occ_id = None
+        self._flip_cache.clear()          # 본문이 바뀌었다 — 등장 수 캐시 무효
         self._build_occurrences()
         self._rebuild_cards()
         self._refresh_preview(keep_scroll=False)   # 새 문서는 맨 위에서 시작
@@ -908,6 +956,7 @@ class ReviewPanel(QWidget):
             init = c.get("status", "pending")
             for k, p in enumerate(positions):
                 self._occ.append({
+                    "uid": self._new_uid(),
                     "ci": ci, "c": c, "pos": p,
                     "end": (p + len(orig)) if p is not None else None,
                     "rep_index": k + 1, "rep_total": total,
@@ -921,6 +970,7 @@ class ReviewPanel(QWidget):
                 })
         # 문서 등장 순으로 정렬(없는 항목은 끝)
         self._occ.sort(key=lambda o: (o["pos"] is None, o["pos"] or 0))
+        self._reindex_occ()
         self._mark_stem_boundary_skips()
         self._resolve_overlaps()
         self._derive_all()
@@ -938,6 +988,11 @@ class ReviewPanel(QWidget):
         단위로 추출된 것이라 더 긴 낱말 속 조각('책임연'⊂'책임연구원으로')은 등장이 아니다.
 
         kiwi 미설치 시 strip_josa=None → 필터 미적용(현행 부분문자열 동작 유지·무회귀).
+
+        ⚠ 판정은 (본문, 교정 내용, 등장 위치)에만 의존하고 그 셋은 검수 중 바뀌지 않으므로
+        등장별로 1회만 계산한다(_stem_done). 역방향 교정 합류처럼 등장이 추가될 때 이
+        함수를 다시 불러도 새 등장만 kiwi를 태운다 — 전수 재계산이면 등장 수천 개 문서에서
+        클릭마다 수백 ms가 붙는다. 교정값 인라인 수정은 _on_corrected_edited가 무효화한다.
         """
         text = self._full_text
         if not text:
@@ -952,8 +1007,9 @@ class ReviewPanel(QWidget):
         _hang = _re.compile(r"[^가-힣]")
         for o in self._occ:
             p = o.get("pos")
-            if p is None:
+            if p is None or o.get("_stem_done"):
                 continue
+            o["_stem_done"] = True
             c = o["c"]
             orig = c.get("original", "") or ""
             corr = c.get("corrected", "") or ""
@@ -1039,7 +1095,7 @@ class ReviewPanel(QWidget):
         real = [o for o in self._occ if o["pos"] is not None]
         # 긴 span 우선, 같으면 앞 위치 우선
         real.sort(key=lambda o: (-(o["end"] - o["pos"]), o["pos"]))
-        occupied = []
+        occupied = _Occupancy(len(self._full_text))
         for o in real:
             s, e = o["pos"], o["end"]
             # 어절 base 불일치로 제외된 등장(_mark_stem_boundary_skips) — 카드/카운트에서
@@ -1047,11 +1103,11 @@ class ReviewPanel(QWidget):
             if o.get("excluded"):
                 o["shadowed"] = True
                 continue
-            if any(not (e <= os_ or s >= oe) for os_, oe in occupied):
+            if occupied.hits(s, e):
                 o["shadowed"] = True
             else:
                 o["shadowed"] = False
-                occupied.append((s, e))
+                occupied.take(s, e)
         # 카드 표시용 반복 번호를 '보이는(=shadowed 아님)' 등장 기준으로 재계산
         from collections import defaultdict
         groups = defaultdict(list)
@@ -1069,6 +1125,7 @@ class ReviewPanel(QWidget):
         card = QFrame()
         card.setObjectName(f"card_{cid}")
         card.setProperty("occ_id", cid)
+        card._occ = occ         # 반복 라벨 동기화 등 아래 헬퍼가 먼저 참조한다
         # 세로 Maximum(성장 금지) — 카드가 적어 목록에 여분 공간이 남으면 스크롤
         #   레이아웃이 카드를 세로로 부풀리고, 그 여분이 원본 라벨로 흘러 들어가
         #   빈 공간이 생겼다(실측 137px vs 정답 14px). 필요 높이(hfw)만큼만 차지.
@@ -1091,11 +1148,16 @@ class ReviewPanel(QWidget):
         cat_chip = label(cat)
         cat_chip.setStyleSheet(_pill_qss(pal, "review" if needs_review else "normal"))
         top.addWidget(cat_chip)
-        if occ["rep_total"] > 1:
-            rep_lbl = label(f"반복 {occ['rep_index']}/{occ['rep_total']}")
-            rep_lbl.setStyleSheet(
-                f"color: {pal['text_muted']}; font-size: 11px; border: none; background: transparent;")
-            top.addWidget(rep_lbl)
+        # 반복 표시는 항상 만들어 두고 필요할 때만 보인다 — 등장이 나중에 늘거나(역방향
+        #   교정 합류) 겹침 판정이 바뀌면 k/N이 달라지는데, 라벨이 없으면 카드를 새로
+        #   만드는 수밖에 없다(=목록 전량 재생성). _sync_rep_labels가 제자리 갱신한다.
+        rep_lbl = label("")
+        rep_lbl.setStyleSheet(
+            f"color: {pal['text_muted']}; font-size: 11px; border: none; background: transparent;")
+        rep_lbl.setVisible(False)   # 반복 1회 카드에선 숨김(숨은 위젯은 레이아웃에서 빠진다)
+        top.addWidget(rep_lbl)
+        card._rep_lbl = rep_lbl
+        self._sync_rep_label(card)
 
         top.addStretch()
         accept_btn = IconButton("check", size=15, role="text_dim")
@@ -1205,6 +1267,19 @@ class ReviewPanel(QWidget):
         self._style_card(card)
         return card
 
+    def _restyle_dirty(self):
+        """상태·활성 표시가 실제로 달라진 카드만 다시 칠한다.
+
+        _style_card 한 번에 인스턴스 setStyleSheet가 3회(카드+버튼2) 붙어 수백 장을
+        무조건 훑으면 그 자체가 프리즈가 된다(카드 생성 4.1ms 중 2.7ms가 setStyleSheet).
+        그래서 마지막으로 그린 값(_styled)과 비교해 바뀐 카드만 갱신한다.
+        """
+        active = self._active_occ_id
+        for cd in self._cards:
+            key = (cd._occ["status"], cd.property("occ_id") == active)
+            if getattr(cd, "_styled", None) != key:
+                self._style_card(cd)
+
     def _style_card(self, card: QFrame):
         st = card._occ["status"]
         card.setProperty("status", st)
@@ -1253,6 +1328,7 @@ class ReviewPanel(QWidget):
         card.setStyleSheet(
             f"QFrame#card_{cid} {{ background: {bg_color}; border: 1px solid {border_color}; "
             f"{left}border-radius: 8px; }}")
+        card._styled = (st, is_active)   # _restyle_dirty 비교 기준
 
     # ── 상태 토글 ─────────────────────────────────
     @staticmethod
@@ -1316,10 +1392,8 @@ class ReviewPanel(QWidget):
                     f"‘{self._short_orig(occ['c'])}’ 반복 {len(others) + 1}항목을 ‘{lbl}’ 선택으로 "
                     f"일괄 처리했습니다.")
         self._derive(ci)
-        # 전파로 상태가 바뀐 그룹의 로드된 카드 전부 리스타일(미로드 카드는 생성 시 반영).
-        for cd in self._cards:
-            if cd._occ["ci"] == ci:
-                self._style_card(cd)
+        # 전파로 상태가 바뀐 카드만 리스타일(미로드 카드는 생성 시 반영).
+        self._restyle_dirty()
         self._scroll_to(card.property("occ_id"))
         self._emit_counts()
         if not confirmed:
@@ -1337,7 +1411,12 @@ class ReviewPanel(QWidget):
             return
         data["corrected"] = new
         data["_edited"] = True
-        self._refresh_preview()
+        # 어절 경계 판정(_mark_stem_boundary_skips)은 교정값에 의존한다 — 메모를 지워
+        #   다음 재판정 때 이 교정의 등장만 다시 계산되게 한다.
+        for o in self._occ:
+            if o["c"] is data:
+                o.pop("_stem_done", None)
+        self._refresh_preview(defer=True)
         self._emit_counts()   # '직접수정' 집계 칩 즉시 갱신
 
     def _check_conflict(self, ci: int):
@@ -1375,10 +1454,12 @@ class ReviewPanel(QWidget):
         box.exec()
         return box.clickedButton() is yes
 
-    def _derive(self, ci: int):
+    def _derive(self, ci: int, occs=None):
         """occurrence 상태 → 고유 교정의 적용 상태 + 부분거절 skip 인덱스 산출.
-        occ는 self._occ의 문서 등장 순(=브리지 RepeatFind 순)과 일치한다."""
-        occs = [o for o in self._occ if o["ci"] == ci]
+        occ는 self._occ의 문서 등장 순(=브리지 RepeatFind 순)과 일치한다.
+        occs를 주면 그 목록을 쓴다(_derive_all의 한 번 훑기 결과 재사용)."""
+        if occs is None:
+            occs = [o for o in self._occ if o["ci"] == ci]
         c = self._corrections[ci]
         
         if not occs:
@@ -1422,8 +1503,13 @@ class ReviewPanel(QWidget):
                                and not (o.get("shadowed") and not o.get("excluded")))
 
     def _derive_all(self):
+        # ci별 등장을 **한 번만** 훑어 모은다 — 교정마다 self._occ 전체를 재스캔하면
+        #   O(교정수 × 등장수)라 항목이 많은 원고에서 클릭마다 헛비용이 붙는다.
+        groups = {}
+        for o in self._occ:
+            groups.setdefault(o["ci"], []).append(o)
         for ci in range(len(self._corrections)):
-            self._derive(ci)
+            self._derive(ci, groups.get(ci, []))
 
     # ══════════════════════════════════════════════
     # 용어 일관성 통일 (일관성 카드 = 문서 전체 표기 선택)
@@ -1458,8 +1544,14 @@ class ReviewPanel(QWidget):
             return False, 0
         if orig.replace(" ", "") != corr.replace(" ", ""):
             return False, 0
-        n = self._count_substring(corr)
-        return (n > 0), n
+        # 카드를 만들 때마다(툴팁 판정) 본문 전수 탐색이 돌아 목록이 길수록 헛비용이
+        #   쌓인다 — 본문은 검수 중 불변이라 (원문, 교정) 쌍으로 캐시한다.
+        key = (orig, corr)
+        hit = self._flip_cache.get(key)
+        if hit is None:
+            n = self._count_substring(corr)
+            hit = self._flip_cache[key] = ((n > 0), n)
+        return hit
 
     def _unify_dialog(self, occ: dict, status: str):
         """일관성 카드 수락/거절 = 문서 전체 통일 방향 선택 — 확인 팝업 후 반영.
@@ -1482,45 +1574,38 @@ class ReviewPanel(QWidget):
         QTimer.singleShot(0, lambda: self._do_unify(occ, orig, corr, status))
 
     def _do_unify(self, occ: dict, orig: str, corr: str, status: str):
-        """_unify_dialog 확인 후 실제 반영(무거운 부분) — 대기 커서로 감싼다.
+        """_unify_dialog 확인 후 실제 반영.
 
-        ⚠ 이 경로는 _rebuild_cards로 카드 위젯을 전부 파괴한다. 호출한 _set_status는
-          이 함수 호출 뒤 카드 객체를 만지지 않고 즉시 반환해야 한다(삭제된 C++ 객체).
+        ⚠ **카드 목록을 재구성하지 않는다**(2026-07-27 성능 수정). 통일이 실제로 바꾸는
+          것은 ① 두 그룹의 수락/거절 상태와, 거절 방향에서만 ② 역방향 교정의 등장 몇 개다.
+          예전에는 그 둘을 반영하려고 _rebuild_cards로 카드를 전부 파괴한 뒤, 조작한
+          카드가 다시 나올 때까지 **0번부터 동기 재생성**했다 — 비용이 '조작한 카드의
+          목록 위치'에 비례해, 목록 후반으로 갈수록 무한정 느려졌다(실측: 20번째 0.8초 →
+          400번째 3.6초 → 690번째 6.2초). 이제 상태만 바뀌면 다시 칠하기만 하고, 등장이
+          늘어난 경우에만 그 카드들을 제자리에 끼워 넣는다.
         """
-        from PySide6.QtWidgets import QApplication
-        from PySide6.QtGui import QCursor
         c, ci = occ["c"], occ["ci"]
+        # 카드가 실제로 끼어들 때만 목록이 밀리므로, 그때만 스크롤 앵커를 되돌린다.
         anchor = self._capture_card_anchor(occ)
-        # 카드 목록이 '전부 사라졌다 다시 채워지는' 깜빡임 차단(사용자 보고 2026-07-21).
-        #   재구성은 전량 파괴 → 첫 10장 → (다음 틱)앵커까지 로드 → (정착까지)스크롤 보정
-        #   순서라, 중간 상태가 그대로 그려지면 빈 패널이 한 번 번쩍인다. 갱신을 끊어
-        #   두면 옛 화면이 남아 있다가 완료 시점에 새 화면으로 한 번에 바뀐다.
-        self._card_scroll.setUpdatesEnabled(False)
-        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
-        try:
-            if status == "accepted":
-                self._apply_unify_forward(ci, orig, corr, active_occ=occ)
-            else:
-                self._apply_flip(c, ci, orig, corr, active_occ=occ)
-            # 앵커 카드까지는 **여기서 동기로** 만든다 — 다음 틱으로 미루면 그 사이
-            #   '카드 10장뿐인' 화면이 한 프레임 새어 나간다.
-            occ_ref = anchor[0]
-            while (not any(cd._occ is occ_ref for cd in self._cards)
-                   and self._loaded_card_count < len(self._occ)):
-                self._load_more_cards(50)
-        finally:
-            QApplication.restoreOverrideCursor()
-
-        def _unfreeze():
-            if not self._card_scroll.updatesEnabled():
-                self._card_scroll.setUpdatesEnabled(True)
+        if status == "accepted":
+            inserted = self._apply_unify_forward(ci, orig, corr, active_occ=occ)
+        else:
+            inserted = self._apply_flip(c, ci, orig, corr, active_occ=occ)
         # 일반 카드가 _set_status 끝에서 _scroll_to로 하는 것과 동일하게, 미리보기를
         #   방금 처리한 등장 위치로 옮긴다(일관성 카드는 조기 반환이라 그 경로를 안 탄다
         #   — 사용자 보고 2026-07-21: 수락/거절해도 원문·교정문이 따라오지 않음).
         #   ⚠ _refresh_preview가 예약한 '스크롤 원위치 복원' 뒤에 실행돼야 하므로 지연.
         QTimer.singleShot(0, lambda: self._scroll_previews_to(self._active_occ_id))
-        # 스크롤 위치가 정착한 뒤 갱신 재개. 혹시 정착 콜백이 오지 않아도 화면이
-        #   영영 얼지 않도록 시간 기반 백스톱을 함께 건다.
+        if not inserted:
+            return          # 카드 목록 불변 — 스크롤도 그대로다.
+
+        def _unfreeze():
+            if not self._card_scroll.updatesEnabled():
+                self._card_scroll.setUpdatesEnabled(True)
+        # 위쪽에 카드가 끼어들면 조작한 카드가 아래로 밀린다 — 삽입~보정 사이의
+        #   중간 상태를 감췄다가 위치가 정착한 뒤 한 번에 보여준다. 정착 콜백이 오지
+        #   않아도 화면이 영영 얼지 않도록 시간 기반 백스톱을 함께 건다.
+        self._card_scroll.setUpdatesEnabled(False)
         self._restore_card_anchor(anchor, on_done=_unfreeze)
         QTimer.singleShot(1200, _unfreeze)
 
@@ -1596,20 +1681,75 @@ class ReviewPanel(QWidget):
 
         QTimer.singleShot(0, step)
 
+    # ── 카드 목록 증분 갱신 ────────────────────────
+    def _sync_rep_label(self, card) -> bool:
+        """카드의 '반복 k/N' 표시를 현재 등장 상태에 맞춘다(바뀌었으면 True)."""
+        occ = card._occ
+        want = f"반복 {occ['rep_index']}/{occ['rep_total']}" if occ["rep_total"] > 1 else ""
+        lbl = getattr(card, "_rep_lbl", None)
+        if lbl is None or lbl.text() == want:
+            return False
+        lbl.setText(want)
+        lbl.setVisible(bool(want))
+        return True
+
+    def _sync_cards(self, prev_last_uid):
+        """등장 목록이 바뀐 뒤(역방향 교정 합류) 카드 목록을 **증분** 맞춘다.
+
+        전량 파괴 후 0번부터 다시 만들던 _rebuild_cards를 대체한다. 살아 있는 카드는
+        그대로 두고 ① 이제 숨겨야 할 카드만 제거, ② 새로 생긴 등장의 카드만 제자리에
+        삽입한다. 통일 1회가 만드는 카드는 보통 한 자릿수라 비용이 목록 길이와 무관해진다.
+
+        prev_last_uid: 재정렬 전 '마지막으로 훑은 등장'의 uid. 새 등장이 그 앞에 끼어들면
+        로드 경계(_loaded_card_count)가 밀리므로 uid로 다시 찾는다.
+        """
+        boundary = (self._occ_pos.get(prev_last_uid, -1) + 1) if prev_last_uid is not None else 0
+        boundary = max(boundary, 0)
+        self._loaded_card_count = boundary
+
+        # 이미 화면에 있는 카드는 필터 재판정에서 살려 둔다 — 일반 카드 경로(_set_status)도
+        #   상태가 바뀌었다고 카드를 걷어내지 않는다(필터는 목록을 다시 만들 때만 적용).
+        alive = {id(cd._occ) for cd in self._cards}
+        want = [o for o in self._occ[:boundary]
+                if not o.get("shadowed") and (id(o) in alive or self._occ_matches_filter(o))]
+        keep = {id(o) for o in want}
+
+        # ① 제거 먼저 — 그래야 아래 삽입 위치(=self._cards 내 순번)가 레이아웃 순번과 같다.
+        for cd in [c for c in self._cards if id(c._occ) not in keep]:
+            self._cards.remove(cd)
+            cd.hide()                # 유령 창 방지 — _rebuild_cards 주석 참조
+            cd.setParent(None)
+            cd.deleteLater()
+
+        # ② 빠진 자리에 새 카드 삽입(양쪽 다 등장 순서라 한 번 훑기로 맞춰진다).
+        at = 0
+        for o in want:
+            if at < len(self._cards) and self._cards[at]._occ is o:
+                at += 1
+                continue
+            card = self._create_card(o, o["uid"])
+            self._scroll_layout.insertWidget(at, card)
+            self._cards.insert(at, card)
+            at += 1
+
+        # ③ 겹침 재판정으로 다른 그룹의 반복 번호가 달라졌을 수 있다 — 텍스트가 실제로
+        #    바뀐 라벨만 갱신한다(setText는 레이아웃을 무효화하므로 무조건 호출 금지).
+        for cd in self._cards:
+            self._sync_rep_label(cd)
+        self._schedule_prefetch()
+
     def _find_reverse(self, orig: str, corr: str):
         """반대 방향 교정(corr→orig)이 이미 목록에 있으면 반환."""
         return next((r for r in self._corrections
                      if r.get("original") == corr and r.get("corrected") == orig), None)
 
     def _mark_active_occ(self, active_occ):
-        """미리보기 하이라이트의 '활성' 등장을 갱신 — 카드 재생성·미리보기 재렌더보다
-        먼저 호출해야 새 카드/HTML이 활성 상태로 그려진다(재렌더 2회를 피한다)."""
+        """미리보기 하이라이트의 '활성' 등장을 갱신 — 카드 재칠·미리보기 재렌더보다
+        먼저 호출해야 새 카드/HTML이 활성 상태로 그려진다(재렌더 2회를 피한다).
+        식별자는 uid라 목록이 재정렬돼도 다시 잡을 필요가 없다."""
         if active_occ is None:
             return
-        try:
-            self._active_occ_id = self._occ.index(active_occ)
-        except ValueError:
-            pass
+        self._active_occ_id = active_occ["uid"]
 
     def _apply_unify_forward(self, fwd_ci: int, orig: str, corr: str, active_occ=None):
         """'교정 표기로 통일'(수락 방향) — 이 그룹 전체 수락 + 반대 교정 거절.
@@ -1618,6 +1758,8 @@ class ReviewPanel(QWidget):
         문서에 원래 있던 corr 등장은 그대로라 그 자체로 통일이 완성된다. 다만 이전에
         '원문 표기로 통일'을 했다면 반대 교정(corr→orig)이 수락 상태로 남아 있어
         서로 상쇄되므로 반드시 거절로 되돌린다.
+
+        등장 목록은 그대로이고 상태만 바뀌므로 **카드 재구성이 없다**(항상 False 반환).
         """
         for o in self._occ:
             if o["ci"] == fwd_ci:
@@ -1634,12 +1776,22 @@ class ReviewPanel(QWidget):
                     o["by_user"] = True
         self._mark_active_occ(active_occ)
         self._derive_all()
-        self._rebuild_cards()
-        self._refresh_preview()
+        self._restyle_dirty()
+        self._refresh_preview(defer=True)
         self._emit_counts()
+        return False
 
     def _apply_flip(self, c: dict, fwd_ci: int, orig: str, corr: str, active_occ=None):
-        """'원문 표기로 통일'(거절 방향) — 이 그룹 전체 거절 + 반대 교정(corr→orig) 수락."""
+        """'원문 표기로 통일'(거절 방향) — 이 그룹 전체 거절 + 반대 교정(corr→orig) 수락.
+
+        반대 교정이 **새로 합성될 때만** 등장이 늘어난다(그때만 True 반환 — 호출자가
+        스크롤 앵커를 되돌린다). 이미 있던 반대 교정을 되살리는 경우는 상태 변경뿐이다.
+        """
+        # 카드 목록이 어디까지 만들어져 있는지 '등장 uid'로 기억 — 아래 재정렬로
+        #   인덱스 기준 경계(_loaded_card_count)는 의미를 잃는다.
+        prev_last_uid = (self._occ[self._loaded_card_count - 1]["uid"]
+                         if 0 < self._loaded_card_count <= len(self._occ) else None)
+
         # 1) 이 방향(A→B)의 등장 전부 거절.
         for o in self._occ:
             if o["ci"] == fwd_ci:
@@ -1672,12 +1824,15 @@ class ReviewPanel(QWidget):
                 start = i + len(corr)
             for k, p in enumerate(positions):
                 self._occ.append({
+                    "uid": self._new_uid(),
                     "ci": rev_ci, "c": rev, "pos": p, "end": p + len(corr),
                     "rep_index": k + 1, "rep_total": len(positions),
                     "status": "accepted", "shadowed": False,
                     "auto": False, "by_user": True,
                 })
+            grew = bool(positions)
         else:
+            grew = False
             rev["status"] = "accepted"
             for o in self._occ:
                 if o["c"] is rev:
@@ -1688,27 +1843,42 @@ class ReviewPanel(QWidget):
         # 3) 전역 재정렬·어절경계/겹침 재판정(결정적·멱등) 후 파생값·카드·미리보기 갱신.
         #    ⚠ _build_occurrences 전체 재구성은 다른 카드의 부분 수락/거절(occ 단위)
         #    상태를 지우므로 쓰지 않는다 — occ 상태를 보존한 채 판정만 다시 돈다.
-        self._occ.sort(key=lambda o: (o["pos"] is None, o["pos"] or 0))
-        self._mark_stem_boundary_skips()
-        self._resolve_overlaps()
-        # ⚠ 활성 등장 인덱스는 재정렬·역방향 등장 합류로 바뀐다 — 여기서 다시 잡는다.
+        if grew:
+            self._occ.sort(key=lambda o: (o["pos"] is None, o["pos"] or 0))
+            self._reindex_occ()
+            self._mark_stem_boundary_skips()   # 새 등장만 계산(_stem_done 메모)
+            self._resolve_overlaps()
+        # ⚠ 활성 등장은 재정렬·역방향 등장 합류로 자리가 바뀐다 — 여기서 다시 잡는다.
         self._mark_active_occ(active_occ)
         self._derive_all()
-        self._rebuild_cards()
-        self._refresh_preview()
+        if grew:
+            # 늘어난 등장의 카드만 제자리에 끼워 넣는다(전량 재생성 금지 — _do_unify 주석).
+            self._sync_cards(prev_last_uid)
+        self._restyle_dirty()
+        self._refresh_preview(defer=True)
         self._emit_counts()
+        return grew
 
     # ══════════════════════════════════════════════
     # 미리보기
     # ══════════════════════════════════════════════
-    def _refresh_preview(self, keep_scroll: bool = True):
+    def _refresh_preview(self, keep_scroll: bool = True, defer: bool = False):
         """원문·교정문 미리보기 재렌더.
 
         ⚠ setHtml은 문서를 통째로 갈아끼우므로 QTextBrowser 스크롤이 **0으로 리셋**된다
         — 카드 하나 수락했을 뿐인데 읽던 위치가 맨 위로 튀어 오른다(사용자 보고
         2026-07-21). 새 문서를 여는 load()만 맨 위에서 시작하고, 그 외에는 위치를 지킨다.
         복원은 즉시 한 번 + 다음 틱 한 번(문서 레이아웃이 끝나야 스크롤 최대값이 확정).
+
+        defer=True면 _PREVIEW_DEBOUNCE_MS 뒤에 한 번만 그린다(연타는 마지막 것으로 병합).
+        카드 수락/거절처럼 **연달아 일어나는** 조작에서 쓴다 — 하이라이트 색이 한 박자
+        늦게 따라올 뿐이고, 그 대신 클릭마다 문서를 다시 조판하는 수백 ms가 사라진다.
+        앵커(c{uid})는 등장이 늘어도 그대로라, 병합 대기 중인 문서로도 위치 이동은 맞는다.
         """
+        if defer:
+            self._preview_timer.start(self._PREVIEW_DEBOUNCE_MS)   # 재시작 = 병합
+            return
+        self._preview_timer.stop()
         src_sb = self._source_view.verticalScrollBar()
         prv_sb = self._preview.verticalScrollBar()
         keep = (src_sb.value(), prv_sb.value()) if keep_scroll else None
@@ -1747,25 +1917,28 @@ class ReviewPanel(QWidget):
 
     def _render_with_text(self, original: bool) -> str:
         text = self._full_text
-        items = [(i, o) for i, o in enumerate(self._occ)
+        items = [o for o in self._occ
                  if o["pos"] is not None and not o.get("shadowed")]
-        items.sort(key=lambda io: (-(io[1]["end"] - io[1]["pos"]), io[1]["pos"]))
-        chosen, occupied = [], []
-        for i, o in items:
+        items.sort(key=lambda o: (-(o["end"] - o["pos"]), o["pos"]))
+        chosen = []
+        occupied = _Occupancy(len(text))
+        for o in items:
             s, e = o["pos"], o["end"]
-            if any(not (e <= os_ or s >= oe) for os_, oe in occupied):
+            if occupied.hits(s, e):
                 continue
-            chosen.append((i, o))
-            occupied.append((s, e))
-        chosen.sort(key=lambda io: io[1]["pos"])
+            chosen.append(o)
+            occupied.take(s, e)
+        chosen.sort(key=lambda o: o["pos"])
 
         hl = self._hl_colors()
         parts, cursor = [], 0
-        for i, o in chosen:
+        active = self._active_occ_id
+        for o in chosen:
+            i = o["uid"]        # 앵커 id = 등장 uid(목록 인덱스가 아니다)
             s, e = o["pos"], o["end"]
             if cursor < s:
                 parts.append(self._escape_text(text[cursor:s]))
-            is_active = (i == getattr(self, "_active_occ_id", None))
+            is_active = (i == active)
             st = o["status"]
             
             if st == "accepted":
@@ -1792,18 +1965,18 @@ class ReviewPanel(QWidget):
 
     def _render_fallback(self, original: bool) -> str:
         pal = current_palette()
-        visible = [(i, o) for i, o in enumerate(self._occ)
-                   if not o.get("shadowed")]
+        visible = [o for o in self._occ if not o.get("shadowed")]
         if not visible:
             return (f'<p style="color:{pal["text_muted"]}; font-size:14px;">'
                     '표시할 교정 항목이 없습니다.</p>')
         hl = self._hl_colors()
         parts = []
-        for n, (i, o) in enumerate(visible):
+        for n, o in enumerate(visible):
             if n > 0:
                 parts.append(' … ')
-            
-            is_active = (i == getattr(self, "_active_occ_id", None))
+
+            i = o["uid"]
+            is_active = (i == self._active_occ_id)
             st = o["status"]
             
             if st == "accepted":
@@ -1854,20 +2027,20 @@ class ReviewPanel(QWidget):
             sync.resume()
 
     def _scroll_to(self, cid: int):
+        """cid = 등장 uid. 아직 카드가 안 만들어진 등장이면 거기까지 채운 뒤 이동한다."""
         self._note_interaction()
-        while getattr(self, '_loaded_card_count', 0) <= cid and getattr(self, '_loaded_card_count', 0) < len(getattr(self, '_occ', [])):
-            self._load_more_cards(batch_size=50)
-            
-        prev_active = getattr(self, "_active_occ_id", None)
+        target_idx = self._occ_pos.get(cid)
+        if target_idx is not None:
+            while (self._loaded_card_count <= target_idx
+                   and self._loaded_card_count < len(self._occ)):
+                self._load_more_cards(batch_size=50)
+
         self._active_occ_id = cid
-        self._refresh_preview()
-        
-        # O(1) 업데이트: 활성 상태가 변경된 카드만 스타일 갱신
-        for card in self._cards:
-            c_id = card.property("occ_id")
-            if c_id == cid or c_id == prev_active:
-                self._style_card(card)
-            
+        self._refresh_preview(defer=True)
+
+        # 활성 표시가 바뀐 카드만 스타일 갱신
+        self._restyle_dirty()
+
         from PySide6.QtCore import QTimer
         def do_scroll():
             self._scroll_previews_to(cid)
@@ -2030,8 +2203,8 @@ class ReviewPanel(QWidget):
                 o["auto"] = True
                 o["by_user"] = False
         self._derive_all()
-        self._rebuild_cards()
-        self._refresh_preview()
+        self._restyle_dirty()   # 상태만 바뀐다 — 목록 재구성 불필요(=수백 장 프리즈 회피)
+        self._refresh_preview(defer=True)
         self._emit_counts()
 
     def _rebuild_cards(self):
@@ -2061,13 +2234,12 @@ class ReviewPanel(QWidget):
         added = 0
         while idx < n and added < batch_size:
             occ = self._occ[idx]
-            cur = idx
             idx += 1
             if occ.get("shadowed"):
                 continue   # 더 긴 교정에 가려진 중복 등장 — 카드 없음
             if not self._occ_matches_filter(occ):
                 continue   # 활성 필터(카테고리/미선택)에 맞는 카드만 노출
-            card = self._create_card(occ, cur)
+            card = self._create_card(occ, occ["uid"])
             self._scroll_layout.insertWidget(self._scroll_layout.count() - 1, card)
             self._cards.append(card)
             added += 1
@@ -2084,8 +2256,8 @@ class ReviewPanel(QWidget):
                 o["auto"] = True      # _accept_all과 동일 — 개별 반대는 확인 후 허용
                 o["by_user"] = False
         self._derive_all()
-        self._rebuild_cards()
-        self._refresh_preview()
+        self._restyle_dirty()   # _accept_all과 동일
+        self._refresh_preview(defer=True)
         self._emit_counts()
 
     def refresh_theme(self):
