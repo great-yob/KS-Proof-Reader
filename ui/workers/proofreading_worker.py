@@ -996,7 +996,7 @@ class ProofreadingWorker(QThread):
                             continue
                         sp_cards.append(Correction(
                             original=eojeol, corrected=spaced,
-                            reason="[검수] 보조용언 띄어쓰기 — 본용언+보조용언은 띄어 씀이 원칙(붙임도 허용, 검토 필요)",
+                            reason="[검수] 보조용언 띄어쓰기 → 사용자 결정 필요\n— 띄어 씀이 원칙이나, 붙임도 허용",
                             source="spacing", color=HL_TYPO,
                             category="띄어쓰기", confidence="low",
                         ))
@@ -1041,12 +1041,12 @@ class ProofreadingWorker(QThread):
                         close = tie or (n_maj - n_min <= 1 and n_min >= 2)
                         conf = "low" if close else "high"
                         if tie:
-                            reason = (f"[검수] 띄어쓰기 일관성 → 사용자 결정 필요\n "
-                                      f"{majority}({n_maj}) : {minority}({n_min})")
+                            reason = (f"[검수] 띄어쓰기 일관성 → 사용자 결정 필요\n"
+                                      f"— {majority}({n_maj}) : {minority}({n_min})")
                         else:
                             tag = "[검수] " if close else ""
-                            reason = (f"{tag}띄어쓰기 일관성 → 다수 표기로 통일\n "
-                                      f"{majority}({n_maj}) : {minority}({n_min})")
+                            reason = (f"{tag}띄어쓰기 일관성 → 다수 표기로 통일\n"
+                                      f"— {majority}({n_maj}) : {minority}({n_min})")
                         sp_cards.append(Correction(
                             original=minority, corrected=majority,
                             reason=reason,
@@ -1116,8 +1116,13 @@ class ProofreadingWorker(QThread):
                             category="띄어쓰기", confidence="low",
                         ))
                         existing.add(orig)
-                    # 숫자 단위 띄어쓰기 — '13.6억원'→'13.6억 원'(큰수단위 뒤 통화 '원').
+                    # 숫자 단위 띄어쓰기 — '13.6억원'→'13.6억 원', '10만명'→'10만 명',
+                    #   '5만달러'→'5만 달러'(큰수단위 뒤 통화·수량·계량 단위).
                     #   AI가 청크별로 일부만 잡는 유형이라 결정론으로 모든 등장 보강.
+                    #   ⚠ 위 형태소 백스톱은 이 부류를 **구조적으로 못 낸다** — 워커 사전
+                    #   가드의 lookup_word()가 숫자를 떼고 조회해 '10만원'→'만원'(滿員),
+                    #   '10만명'→'만명'을 등재어로 보고 카드를 죽인다. 수량 표기는 사전
+                    #   가드가 없는 이 결정론 경로가 책임진다(2026-07-28 실측).
                     #   ⚠ AI가 이미 다룬 어절과 겹치면 스킵(원문 substring 대조 — '12,9억원'류).
                     _ai_orig = [c.original for c in merged if c.original]
                     for orig, fixed in _sr.find_unit_spacing(text):
@@ -1127,7 +1132,7 @@ class ProofreadingWorker(QThread):
                             continue
                         sp_cards.append(Correction(
                             original=orig, corrected=fixed,
-                            reason="[검수] 숫자 단위 띄어쓰기 — 큰수단위(억/만/조) 뒤 '원' 분리(검토 필요)",
+                            reason="[검수] 숫자 단위 띄어쓰기 → 단위 명사는 띄어 씀",
                             source="spacing", color=HL_TYPO,
                             category="띄어쓰기", confidence="low",
                         ))
