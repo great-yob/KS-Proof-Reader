@@ -1041,13 +1041,12 @@ class ProofreadingWorker(QThread):
                         close = tie or (n_maj - n_min <= 1 and n_min >= 2)
                         conf = "low" if close else "high"
                         if tie:
-                            reason = (f"[검수] 띄어쓰기 일관성 — '{majority}'({n_maj}회)와 "
-                                      f"'{minority}'({n_min}회)가 동률 혼재 → 원칙 방향"
-                                      f"('{majority}') 제안(검토 필요)")
+                            reason = (f"[검수] 띄어쓰기 일관성 → 사용자 결정 필요\n "
+                                      f"{majority}({n_maj}) : {minority}({n_min})")
                         else:
                             tag = "[검수] " if close else ""
-                            reason = (f"{tag}띄어쓰기 일관성 — 문서에서 '{majority}'({n_maj}회)가 "
-                                      f"'{minority}'({n_min}회)보다 우세 → 다수 표기로 통일")
+                            reason = (f"{tag}띄어쓰기 일관성 → 다수 표기로 통일\n "
+                                      f"{majority}({n_maj}) : {minority}({n_min})")
                         sp_cards.append(Correction(
                             original=minority, corrected=majority,
                             reason=reason,

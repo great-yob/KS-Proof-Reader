@@ -25,8 +25,9 @@ import time
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import (
-    QFont, QFontMetrics, QTextBlockFormat, QTextCursor, QTextFrameFormat,
-    QTextLength, QTextOption, QTextTableFormat,
+    QBrush, QColor, QFont, QFontMetrics, QTextBlockFormat, QTextCursor,
+    QTextFrameFormat, QTextLength, QTextOption, QTextTableCellFormat,
+    QTextTableFormat,
 )
 from PySide6.QtWidgets import QFrame, QVBoxLayout, QTextEdit
 
@@ -83,6 +84,28 @@ _EXAMPLE_RE = re.compile(r"^·\s*['\"‘“]")
 
 # 선두 마커 — 상태는 색(level)이 표현하므로 글자에서 뺀다.
 _LEAD_CHARS = "→·※ℹ⚠✓✕★"
+
+# 표시 문자열 선두의 `[태그]` — 재분류(_retag)와 단계 색(_display_level)이 함께 쓴다.
+_TAG_RE = re.compile(r"^\[([^\]]+)\]")
+
+# 태그 재분류 — 같은 파이프라인 단계의 로그를 사용자 어휘 한 태그로 묶는다
+#   (사용자 지정 2026-07-28). 아래 _RULES에 명시된 라인은 이미 제 단계 태그를
+#   달고 나오므로 여기 오지 않는다 — **규칙 미매칭 라인의 안전망**이다.
+#   ⚠ 키워드만 보고 무조건 덮어쓰면 안 된다: "환각 '일관성' 재띄어쓰기 AI 교정
+#     N건 제외"는 AI 과교정 필터 로그라 [AI 필터]가 맞는데 [일관성]으로 오분류된다.
+#     그래서 _condense에서 **규칙에 걸리지 않은 경우에만** 호출한다.
+_RETAG = (
+    ("실단어", "문맥 검증"),
+    ("일관성", "일관성"),
+)
+
+
+def _retag(m: str) -> str:
+    for kw, tag in _RETAG:
+        if kw in m:
+            body = _TAG_RE.sub("", m, count=1).strip()
+            return f"[{tag}] {body}" if body else f"[{tag}]"
+    return m
 
 # 세부 라벨 치환 — 파이프라인 내부 명칭을 사용자 어휘로 바꾼다(사용자 지정
 #   2026-07-23). 여기 없는 라벨은 원문 그대로 통과한다.
@@ -149,6 +172,29 @@ _RULES = tuple((re.compile(p), r, k) for p, r, k in (
     (r"^오류: AI 분석 전체 실패 — (\d+)/(\d+) 청크.*$", r"[AI 오류] 전체 실패 · \1/\2 청크", ""),
     (r"^AI 청크 (\d+)/(\d+) 실패.*$",              r"[AI 오류] 청크 \1/\2 실패", ""),
 
+    # ── 실단어 오류 = 문맥 검증(사전이 못 잡는 등재어 오타) ─
+    #   원문 태그는 [실단어]지만 화면에선 [문맥 검증]으로 묶는다(사용자 지정 2026-07-28).
+    (r"^\[실단어\] 형태소 (?:분석 비활성|빈도 집계 실패).*$",
+     "[문맥 검증] 형태소 분석 불가 · 스킵", ""),
+    (r"^\[실단어\] 후보 상한 ([\d,]+)건 도달.*$",     r"[문맥 검증] 후보 상한 \1건 도달 · 이후 절단", ""),
+    (r"^\[실단어\] 후보 없음$",                      "[문맥 검증] 실단어 후보 없음", ""),
+    (r"^\[실단어\] 후보 ([\d,]+)건.*$",              r"[문맥 검증] 실단어 후보 \1건 · AI 검증 요청", ""),
+    (r"^\[실단어\] AI 검증 — 후보 ([\d,]+)건 중 ([\d,]+)건 통과$",
+     r"[문맥 검증] AI 검증 \1건 중 \2건 통과", ""),
+    (r"^\[실단어\] AI 검증 결과 없음.*$",             "[문맥 검증] AI 검증 결과 없음 · 카드 미생성", ""),
+    (r"^\[실단어\] 탐지 스킵.*$",                    "[문맥 검증] 실단어 탐지 스킵", ""),
+    (r"^실단어 오타 검수 카드 ([\d,]+)건 추가$",       r"[문맥 검증] 실단어 오타 검수 카드 \1건 추가", ""),
+
+    # ── 일관성(청크 간 비결정성 보정 · 문서 전체 표기 통일) ─
+    #   ⚠ 아래 'AI 과교정 필터'보다 먼저 둔다 — "환각 '일관성' 재띄어쓰기 …건 제외"는
+    #     일관성 단계가 아니라 AI 필터 로그라 [AI 필터]로 남아야 하고, 그건 ^일관성
+    #     앵커에 걸리지 않는다(키워드 포함만으로 덮어쓰지 않는 이유).
+    (r"^일관성 보정: 변형 단어 ([\d,]+)건.*$",        r"[일관성] 변형 단어 \1건 보정 추가", ""),
+    (r"^일관성 가드: 사전 표제어 ([\d,]+)건.*$",       r"[일관성] 사전 표제어 \1건 전파 차단", ""),
+    (r"^일관성: 조사형으로 대체된 bare 교정 ([\d,]+)건.*$",
+     r"[일관성] 조사형 중복 교정 \1건 제거", ""),
+    (r"^일관성: 조사 변형 신뢰도 통일 ([\d,]+)건.*$",   r"[일관성] 조사 변형 신뢰도 \1건 통일", ""),
+
     # ── AI 과교정 필터(구체 규칙을 일반 규칙보다 먼저) ──
     (r"^본문 대조: .*?([\d,]+)건 제외.*$",           r"[검증] 본문 불일치 \1건 제외", ""),
     (r"^문서 대조: .*?([\d,]+)건 제외.*$",           r"[검증] 문서 미검출 \1건 제외", ""),
@@ -158,7 +204,7 @@ _RULES = tuple((re.compile(p), r, k) for p, r, k in (
      lambda m: f"[AI 필터] {_relabel(m.group(1))} {m.group(2)}건 제외", ""),
 
     # ── 사전·결정론 규칙 검증 ───────────────────────
-    (r"^일관성 보정: 변형 단어 ([\d,]+)건.*$",        r"[검증] 일관성 보정 \1건 추가", ""),
+    #   (일관성 보정은 위 '일관성' 절로 이관 — 2026-07-28)
     (r"^빈출 미등재어 ([\d,]+)건 검수 카드 제외.*$",   r"[검증] 빈출 미등재어 \1건 제외", ""),
     (r"^적용 정합성: 조사 변형 교정 ([\d,]+)건.*$",    r"[검증] 조사 변형 \1건 제외", ""),
     (r"^교정 합성: .*?([\d,]+)건을 한 카드로.*$",      r"[검증] 교정 합성 \1건 통합", ""),
@@ -231,6 +277,7 @@ def _condense(msg: str, lvl: str):
             head = re.split(r"\s—\s", m, 1)[0].strip()
             if len(head) >= 8:
                 m = head
+        m = _retag(m)      # 규칙 미매칭 라인만 — 명시 규칙의 단계 태그는 건드리지 않는다
     return m, ""
 
 
@@ -241,12 +288,13 @@ _MSG_FONT_PX = 12
 _TS_GUTTER   = 12      # 시각 열 우측 여백(px)
 _ROW_PAD     = 3       # 셀 상하 여백 → 행 간격
 _LINE_HEIGHT = 140     # 내용 줄간격(%) — 2줄 이상 wrap될 때 가독성
+_SEP_TOP_PAD = 11      # 단계 구분선 아래 여백(구분선~시작 라인 사이)
 
 # 태그(선두 [ … ])로 단계 표시를 강제한다 — 파이프라인을 세로로 훑을 때
 #   '시작 → 완료' 리듬이 색으로 먼저 읽히게 하기 위함(사용자 지정 2026-07-23).
 #   ⚠ err만은 유지한다. 실패 라인을 초록 '완료'로 칠하면 사고를 숨기게 된다
 #     (실제로 두 조건이 겹치는 로그는 없지만, 규칙이 그렇게 남으면 언젠가 겹친다).
-_TAG_RE = re.compile(r"^\[([^\]]+)\]")
+#   ⚠ _TAG_RE는 위쪽 '표시 요약' 절에 있다(_retag과 공용).
 
 
 def _display_level(text: str, lvl: str) -> str:
@@ -326,6 +374,9 @@ class ActivityPanel(QFrame):
         fmt.setCellPadding(_ROW_PAD)
         fmt.setMargin(0)
         fmt.setPadding(0)
+        # ⚠ 셀 단위 테두리(단계 구분선)는 borderCollapse가 켜져 있어야 그려진다.
+        #   표 자체 테두리는 위에서 0/None이라 이걸 켜도 외곽선은 생기지 않는다.
+        fmt.setBorderCollapse(True)
         fmt.setWidth(QTextLength(QTextLength.PercentageLength, 100))
         # 시각=고정폭, 내용=나머지 전부(VariableLength). 내용은 자기 셀 안에서만
         #   줄바꿈되므로 여러 줄이 돼도 시각 열을 침범하지 않는다.
@@ -339,10 +390,30 @@ class ActivityPanel(QFrame):
         self._table_filled = 0     # 표는 빈 행 1개로 시작 → 첫 항목이 그 행을 씀
         return self._table
 
+    def _sep_cell_format(self, pal) -> QTextTableCellFormat:
+        """단계 구분선 — '[… 시작]' 행 셀의 위쪽 테두리로 그린다.
+
+        별도의 구분선 '행'을 만들지 않는 이유: _rows/get_proofreading_log()가
+        로그 한 줄 = 한 행이라는 전제 위에 서 있고(완료 대시보드·소요시간 계산이
+        _log[0][0]을 시각으로 읽는다), 가짜 행을 끼우면 그 전제가 깨진다.
+        """
+        cf = QTextTableCellFormat()
+        cf.setTopBorder(1.0)
+        cf.setTopBorderStyle(QTextFrameFormat.BorderStyle_Solid)
+        cf.setTopBorderBrush(QBrush(QColor(pal["border"])))
+        # 표의 cellPadding은 셀 포맷을 지정하는 순간 이 셀에 한해 무시되므로 다시 준다.
+        cf.setTopPadding(_SEP_TOP_PAD)
+        cf.setBottomPadding(_ROW_PAD)
+        cf.setLeftPadding(_ROW_PAD)
+        cf.setRightPadding(_ROW_PAD)
+        return cf
+
     def _write_row(self, row: int, ts: str, lvl: str, text: str):
         pal = current_palette()
         color = _level_color(pal, lvl)
         weight = 600 if lvl in ("ok", "start", "err") else 400
+        # 단계 시작 라인 위엔 항상 구분선 — 첫 행만 예외(위에 나눌 것이 없다).
+        sep_fmt = self._sep_cell_format(pal) if (lvl == "start" and row > 0) else None
         safe = (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
         cells = (
             f'<span style="color:{pal["text_dim"]}; font-size:{_TS_FONT_PX}px;">{ts}</span>',
@@ -353,6 +424,8 @@ class ActivityPanel(QFrame):
         bf.setLineHeight(_LINE_HEIGHT, _PROPORTIONAL)
         for col, html in enumerate(cells):
             cell = self._table.cellAt(row, col)
+            if sep_fmt is not None:
+                cell.setFormat(sep_fmt)
             cur = cell.firstCursorPosition()
             cur.setPosition(cell.lastCursorPosition().position(), QTextCursor.KeepAnchor)
             cur.removeSelectedText()

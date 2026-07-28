@@ -1799,16 +1799,21 @@ class ResultPanel(QWidget):
         #   시작 마커 전용 색이라 여기 빠지면 완료만 초록이고 시작은 회색이 된다.
         from ui.widgets.activity_panel import _level_color
         rows = []
-        for ts, lvl, msg in curated:
+        for i, (ts, lvl, msg) in enumerate(curated):
             color = _level_color(pal, lvl)
             weight = "600" if lvl in ("ok", "start", "err") else "400"
             safe = html.escape(msg)
+            # 단계 시작 라인 위 구분선 — 활동 패널과 같은 규칙(첫 줄만 예외).
+            #   Qt 리치텍스트는 table의 border-collapse:collapse가 있어야 td
+            #   테두리를 그린다(위 setHtml에 이미 지정돼 있다).
+            sep = (f'border-top:1px solid {pal["border"]};padding-top:11px;'
+                   if lvl == "start" and i else "")
             rows.append(
                 f'<tr>'
-                f'<td style="color:{pal["text_muted"]};'
+                f'<td style="color:{pal["text_muted"]};{sep}'
                 f'font-size:12px;white-space:nowrap;padding:3px 16px 3px 0;'
                 f'vertical-align:top;">{ts}</td>'
-                f'<td style="color:{color};font-size:13px;font-weight:{weight};'
+                f'<td style="color:{color};{sep}font-size:13px;font-weight:{weight};'
                 f'padding:3px 0;line-height:1.5;">{safe}</td>'
                 f'</tr>')
         view.setHtml(
