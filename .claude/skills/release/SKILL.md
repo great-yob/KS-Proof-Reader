@@ -34,9 +34,12 @@ user-invocable: true
 | 앱 채널인지 데이터 채널인지 | 코드 커밋이 있으면 앱, DB `meta.data_version`이 최신 `data-*` 태그보다 크면 데이터, 둘 다면 둘 다 |
 | 버전을 얼마나 올릴지 | 버그 수정·문구 변경=PATCH, 새 기능·동작 변경=MINOR |
 
-**멈추는 경우는 단 둘이다**: ① 사전 점검 실패(골드셋·시크릿 감사·빌드 verify),
-② 아래 '설치 검증'처럼 **되돌릴 수 없는 파괴가 걸린 행위**. 둘 다 즉시 보고하고
-릴리스를 중단한다 — 실패를 안고 진행하지 않는다.
+**멈추는 경우는 하나뿐이다**: **점검 실패** — 시크릿 감사, 골드셋, Phase E 과교정
+판정, `.iss` 불변식, 빌드 verify. 즉시 보고하고 릴리스를 중단한다. 실패를 안고
+진행하거나, 게이트를 느슨하게 고쳐서 통과시키지 않는다.
+
+승인이 필요한 파괴적 행위는 **없다** — 유일한 후보였던 실제 설치 검증을 폐기했다
+(3단계 참조). 그러므로 릴리스는 처음부터 끝까지 무중단으로 돌아간다.
 
 ### 출력은 최소로 한다
 
@@ -194,7 +197,7 @@ $p=Start-Process "dist\KS-AI Editor\KS-AI Editor.exe" -PassThru; Start-Sleep 20
 $a=Get-Process -Id $p.Id -EA SilentlyContinue; if($a){"OK $($a.MainWindowTitle)"; Stop-Process -Id $p.Id -Force}else{"기동 실패"}
 ```
 
-### 🚫 설치 파일을 이 PC에 설치하지 말 것 (기본값)
+### 🚫 설치 파일을 이 PC에 설치하지 말 것 (예외 없음)
 
 **개발 PC에는 사용자가 실제로 쓰는 설치본이 들어 있다.** 그리고
 
@@ -207,42 +210,45 @@ $a=Get-Process -Id $p.Id -EA SilentlyContinue; if($a){"OK $($a.MainWindowTitle)"
 - 게다가 구버전 설치본은 **자동 업데이트를 실기로 확인할 유일한 기준선**이다.
   그걸 지우면 "새 릴리스를 앱이 잡아서 갱신하는가"를 확인할 방법이 없어진다.
 
-**그러므로 기본은 설치 검증을 하지 않는다.** 설치 파일의 내용물은 이미
-`build_dist.verify()`가 `dist\KS-AI Editor\` 트리에서 게이트했고(bridge32 32비트·
-assets·data 배치), `.iss`는 그 트리를 통째로 담을 뿐이다. 대신 무설치로 확인한다:
+**그러므로 설치 검증은 하지 않는다.** 예전엔 `.iss`를 고친 릴리스에 한해
+"백업 → 무인 설치 → 확인 → 제거 → 복원"을 돌렸으나 **2026-07-28 폐기**했다
+(사용자 판단). 비용 대비 실익이 없다:
 
-```powershell
-# 설치 파일 크기가 dist 트리와 어울리는지 + 서명 상태만 확인(실행하지 않음)
-Get-ChildItem dist\release\*Setup*.exe | Select-Object Name, @{n="MB";e={[math]::Round($_.Length/1MB,1)}}
+- **실익이 거의 없다**: `[Files]`가 `Source: "{#SrcDir}\*" … recursesubdirs` **한 줄**이라
+  설치본은 `dist\KS-AI Editor\` 트리를 그대로 미러한다. 그 트리는 이미
+  `build_dist.verify()`가 게이트한다(bridge32 32비트·assets·data 배치·kiwi 모델 버전).
+  파일 목록이 드리프트할 여지가 구조적으로 없다. 나머지 차이는 `[Setup]`의 **한 줄짜리
+  정적 값**(AppId·DefaultDirName·DisableDirPage·PrivilegesRequired)뿐인데, 그건 설치해
+  보는 것보다 **그 줄을 읽는 게 빠르고 확실하다.**
+- **비용이 크다**: 위 네 가지(실사용 설치본 파괴 + 업데이트 기준선 상실)에 더해,
+  복원 절차조차 ARP 등록까지는 못 되돌려 구버전 설치 파일이 따로 필요했다.
+  즉 검증 한 번이 **다른 검증(5단계 실기 업데이트 확인)을 망가뜨리는** 구조였다.
+
+대신 **무설치 정적 불변식 검사**로 대체한다. `.iss`가 바뀌었으면 실행한다(1초):
+
+```bash
+ISS=installer/KS-Proof-Reader.iss
+fail=0
+chk() { grep -qF "$2" "$ISS" && echo "  OK  $1" || { echo "  FAIL $1"; fail=1; }; }
+chk "AppId 고정(업그레이드를 동일 제품으로 인식)"      'AppId={{32456C4A-71D7-46B8-A59C-60B51DD21734}'
+chk "설치 경로=LOCALAPPDATA\Programs(업데이터 robocopy 전제)" 'DefaultDirName={localappdata}\Programs\'
+chk "경로 선택 페이지 비활성(경로 이탈 방지)"          'DisableDirPage=yes'
+chk "관리자 권한 불필요(UAC 없음)"                    'PrivilegesRequired=lowest'
+chk "[Files] dist 트리 통째 복사"                     'Source: "{#SrcDir}\*"; DestDir: "{app}"'
+chk "[Files] 하위폴더 포함(bridge32/data)"             'recursesubdirs'
+chk "[UninstallDelete] {app} 정리"                    'Type: filesandordirs; Name: "{app}"'
+head -c 3 "$ISS" | od -An -tx1 | grep -q "ef bb bf" \
+  && echo "  OK  UTF-8 BOM" || { echo "  FAIL UTF-8 BOM(Inno가 ANSI로 읽어 한글 깨짐)"; fail=1; }
+exit $fail
 ```
 
-### 그래도 설치 검증이 필요하다면 (`.iss`·설치 동작을 고친 릴리스)
+하나라도 FAIL이면 **릴리스를 멈추고 보고**한다. 이 여덟 줄이 옛 설치 검증이 실제로
+지키던 것 전부다 — 나머지는 `verify()`가 이미 본다.
 
-⚠ **여기가 "완주한다" 원칙의 유일한 예외다.** 이 절차는 사용자의 실사용 설치본을
-지울 수 있고 되돌릴 수단이 제한적이라, 자동 진행 대상이 아니다.
-**반드시 사용자에게 먼저 물어보고**(= 실행 원칙의 '출력 대상 2'), 승인 없이는
-릴리스의 나머지를 마친 뒤 "설치 검증만 남았다"고 보고하고 끝낸다.
-아래 백업–복원은 **한 세트로** 수행한다. 백업 없이 제거 명령을 실행하는 것은 금지.
-
-```powershell
-$base = "$env:LOCALAPPDATA\Programs\KS-AI Editor"
-$bak  = "$base.bak"
-# 1) 기존 설치본 대피 (제거가 아니라 이동 — 복원 경로를 먼저 확보한다)
-if (Test-Path $base) { Move-Item $base $bak }
-# 2) 테스트 설치 → 확인 → 제거
-#    ⚠ /SUPPRESSMSGBOXES 금지: 제거 시 '사용자 데이터도 지울까요' MB_YESNO를
-#      '예'로 자동 선택해 %LOCALAPPDATA%\KS-AI Editor(설정·캐시·사전)가 증발한다.
-Start-Process (Get-ChildItem dist\release\*Setup*.exe)[0].FullName -ArgumentList "/VERYSILENT /NORESTART" -Wait
-Test-Path "$base\KS-AI Editor.exe"; Test-Path "$base\bridge32\hwp_bridge_worker.exe"
-& "$base\unins000.exe" /VERYSILENT; Start-Sleep 12
-# 3) 원상 복구 — 여기까지 반드시 실행한다
-if (Test-Path $base) { Remove-Item $base -Recurse -Force }
-if (Test-Path $bak)  { Move-Item $bak $base }
-```
-⚠ 브리지가 빠지면 설치는 멀쩡히 되고 **HWP 교정만 죽는다** — 확인한다면 같이 본다.
-⚠ 복원 후 ARP(제어판) 등록은 테스트 설치본의 것으로 덮여 있다 — 구버전 설치 파일로
-다시 깔아야 완전히 원상복구된다. 이전 버전 설치 파일은 `Work Utility\백업\`에 보관해 둘 것
-(GitHub의 구버전 릴리스는 4-b에서 삭제하므로 **다시 받을 수 없다**).
+⚠ **되살리자는 판단이 들면 먼저 이 문단을 읽을 것.** "한 번쯤 실제로 깔아 보는 게
+안전하지 않나"는 직관은 위 두 근거(구조적 미러 + 파괴 비용)를 이기지 못한다.
+정말 필요하면 **개발 PC가 아닌 곳**(VM·다른 계정)에서 해야 하고, 그건 이 스킬의
+범위 밖이다.
 
 ## 4. GitHub 업로드
 
@@ -319,7 +325,8 @@ zip은 `Content-Type: application/zip`, exe는 `application/octet-stream`.
 태그는 그 버전이 어느 커밋이었는지의 기록이라 남긴다.
 
 ⚠ **삭제하기 전에 구버전 설치 파일을 `Work Utility\백업\`에 보관**한다. 지우고 나면
-GitHub에서 다시 받을 수 없고, 개발 PC의 설치본을 되돌릴 방법이 사라진다.
+GitHub에서 다시 받을 수 없다 — 새 버전에 결함이 드러났을 때 **되돌아갈 배포본이
+그것뿐**이고, 신규 사용자에게 건넬 수단도 사라진다.
 
 ```bash
 gh release list --limit 30                 # 삭제 대상 확인
@@ -403,12 +410,15 @@ https://github.com/great-yob/KS-Proof-Reader/releases/tag/v{APP_VERSION}
 
 ## 하지 말 것
 
-- **개발 PC의 설치본을 제거·덮어쓰기** — `AppId`가 고정이라 테스트 설치가 곧 실사용
-  설치본 업그레이드이고, 이어지는 제거가 그것을 지운다. 그 설치본은 자동 업데이트를
-  실기로 확인할 유일한 기준선이다(3단계 참조, 2026-07-23 실사고).
-- **`unins000.exe`를 백업 없이 실행** — 특히 `/SUPPRESSMSGBOXES`와 함께 쓰면
-  사용자 데이터(`%LOCALAPPDATA%\KS-AI Editor`) 삭제 여부 질문에 '예'가 자동 선택된다.
-- **구버전 설치 파일을 백업하지 않고 릴리스를 삭제** — 되돌릴 수단이 없어진다.
+- **설치 파일을 이 PC에 설치** — 어떤 이유로도 하지 않는다. `AppId`가 고정이라
+  테스트 설치가 곧 실사용 설치본 업그레이드이고, 이어지는 제거가 그것을 지운다.
+  그 설치본은 자동 업데이트를 실기로 확인할 유일한 기준선이다(2026-07-23 실사고).
+  검증은 3단계의 **정적 불변식 검사**로 대체됐다 — 절차를 되살리지 말 것.
+- **`unins000.exe` 실행** — 위와 같은 이유로 릴리스 절차에 등장할 일이 없다.
+  (혹시 쓰게 되면 `/SUPPRESSMSGBOXES` 금지 — 사용자 데이터 삭제 질문에 '예'가
+  자동 선택돼 `%LOCALAPPDATA%\KS-AI Editor`가 증발한다.)
+- **구버전 설치 파일을 백업하지 않고 릴리스를 삭제** — 결함이 드러났을 때
+  되돌아갈 배포본이 없어진다.
 - **골드셋 실패 상태로 릴리스** — 조용한 교정 품질 저하가 사용자에게 나간다.
 - **'UI만 고쳤겠지' 감으로 골드셋 생략** — 0-b의 판별식을 **실행해서** 정한다.
   가드에 걸리면 돌린다. 애매하면 돌린다.
@@ -423,5 +433,5 @@ https://github.com/great-yob/KS-Proof-Reader/releases/tag/v{APP_VERSION}
 - **Phase E FAIL을 확인 없이 기준선 갱신으로 덮기** — 증가분을 전수 확인하기 전엔
   `--save-ambig-baseline`을 쓰지 않는다(1-c). 덮는 순간 게이트가 장식이 된다.
 - **진행 승인을 묻느라 멈추기** — "빌드할까요?"는 묻지 않는다. 릴리스 지시가 곧
-  완주 권한이다(실행 원칙). 멈추는 건 점검 실패와 설치 검증뿐이다.
+  완주 권한이다(실행 원칙). 멈추는 건 점검 실패뿐이다.
 - **단계별 진행 상황을 늘어놓기** — 통과한 검사는 침묵한다. 성공 시 출력은 2줄.
