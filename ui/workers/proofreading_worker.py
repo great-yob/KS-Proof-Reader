@@ -257,6 +257,9 @@ class ProofreadingWorker(QThread):
 
         # [3] AI 교정 — Gemini 생성 엔진. API 키가 없으면 사용 불가.
         ai_list = []
+        # [7.5] 실단어 검증에서 재사용한다(같은 엔진·같은 키). use_ai=False면 None으로 남아
+        #   실단어 탐지도 함께 꺼진다 — 검증 없는 후보는 내보내지 않는다는 규칙 때문이다.
+        engine = None
         if opts.get("use_ai", True) and not self._stop.is_set():
             config = ConfigLoader()
             api_key = config.get_gemini_key()
@@ -1145,6 +1148,63 @@ class ProofreadingWorker(QThread):
                         det_review.append(("띄어쓰기", n_rev_sp))
             except Exception as e:
                 log(f"  [띄어쓰기] 백스톱 스킵: {e}")
+
+        # [7.5] 실단어 오류 검수 카드 — 오타가 **사전 등재어**에 떨어져 사전 스크리닝이
+        #     원리적으로 못 보는 부류('부고 있다'→'보고 있다', '확용하는'→'활용하는').
+        #     kiwi 언어모델의 문맥 점수로 후보를 만들고(core/realword.py) **AI가 1회
+        #     호출로 판정**해 통과한 것만 저신뢰 카드로 낸다.
+        #
+        #     ⚠ 두 단계 모두 필수다. 검증을 빼면 정밀도가 95%→36%로 무너져 카드가
+        #       노이즈가 된다(실측 2026-07-28, 실파일 12건·178만자). 그래서 엔진이
+        #       없거나(use_ai=False·키 없음) 검증이 실패하면 **후보를 통째로 버린다**.
+        #     ⚠ confidence는 **항상 low**다. 이 값을 올리는 순간 이 기능은 저장소가
+        #       영구 금지한 '거리 기반 추측 치환'(BK-tree·consistency Case B)이 된다
+        #       — core/realword.py 헤더의 금지선 참조. 절대 high로 올리지 말 것.
+        #     실측 효과: 문서당 카드 1.6건·정밀도 95%. 현행 전체 경로(사전+AI)를 통과해
+        #       교정본에까지 살아남은 오타 5건을 이 경로가 잡았다.
+        if (engine is not None and merged is not None
+                and not self._stop.is_set()
+                and hasattr(engine, "verify_realword")):
+            try:
+                from core import realword as _rw
+                if not _rw.available():
+                    log("  [실단어] 형태소 분석 비활성 — 스킵")
+                else:
+                    self.step_changed.emit("analyze", "실단어 오타 탐지 중…")
+                    cands = _rw.find_candidates(text, stop_event=self._stop, logger=log)
+                    # 이미 다른 레이어가 손댄 어절은 제외 — 같은 자리에 카드가 두 장
+                    #   생기면 적용 단계에서 등장 인덱스가 어긋난다([8] 참조).
+                    taken = set()
+                    for c in merged:
+                        if c.source == "ai_polish":
+                            continue
+                        taken.update(re.findall(r"[가-힣]+", c.original))
+                    cands = [r for r in cands if r["original"] not in taken]
+                    if cands:
+                        log(f"  [실단어] 후보 {len(cands)}건 — AI 검증 요청")
+                        ok = engine.verify_realword(cands, logger=log,
+                                                    stop_event=self._stop)
+                        rw_cards = []
+                        seen_rw = set()
+                        for r in ok:
+                            if r["original"] in seen_rw:
+                                continue
+                            seen_rw.add(r["original"])
+                            rw_cards.append(Correction(
+                                original=r["original"], corrected=r["corrected"],
+                                reason="[검수] 문맥상 어색한 낱말 — 오타 의심(검토 필요)",
+                                source="realword", color=HL_TYPO,
+                                category="맞춤법",
+                                confidence="low",   # ⚠ 고정. 위 금지선 참조.
+                            ))
+                        if rw_cards:
+                            merged.extend(rw_cards)
+                            det_review.append(("실단어 오타", len(rw_cards)))
+                            log(f"  → 실단어 오타 검수 카드 {len(rw_cards)}건 추가")
+                    else:
+                        log("  [실단어] 후보 없음")
+            except Exception as e:
+                log(f"  [실단어] 탐지 스킵: {e}")
 
         # [8] 적용 정합성 — 접두 부분문자열로 이미 처리되는 조사 변형 교정 제거.
         #     bare형('뱃지'→'배지')과 조사형('뱃지를'→'배지를')이 공존하면 적용 단계에서

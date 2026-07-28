@@ -30,6 +30,17 @@ class GeminiEngine:
             scope_typo=scope_typo, scope_spacing=scope_spacing,
             scope_polish=scope_polish, logger=logger, stop_event=stop_event)
 
+    def verify_realword(self, candidates, logger=None, stop_event=None):
+        """실단어 오류 후보 검증(core/realword.py 결과 판정) — **생성이 아니라 판정**이다.
+
+        ⚠ 이 메서드는 엔진 인터페이스의 **선택 능력(optional capability)**이다.
+          생성 책임만 교체하려는 대체 엔진은 구현하지 않아도 되며, 워커는 hasattr로
+          존재를 확인하고 없으면 실단어 탐지 기능을 조용히 끈다(카드 0건). 검증 없이
+          후보를 내보내는 경로는 만들지 않는다 — 정밀도가 36%로 떨어진다.
+        """
+        return self._checker.verify_realword_candidates(
+            candidates, logger=logger, stop_event=stop_event)
+
     @property
     def last_call_stats(self) -> dict:
         """직전 check_scope의 청크 호출 집계 — {"failed": n, "total": m}.

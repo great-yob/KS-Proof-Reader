@@ -27,6 +27,7 @@ from .prompts import (
     SYSTEM_INSTRUCTION,
     build_polish_prompt,
     build_integrated_prompt,
+    build_realword_verify_prompt,
 )
 
 
@@ -261,6 +262,59 @@ class GeminiChecker:
             max_output_tokens=AI_MAX_OUT_TYPO,
         )
 
+    def verify_realword_candidates(self, candidates: list,
+                                   logger=None,
+                                   stop_event: threading.Event = None) -> list:
+        """실단어 오류 후보를 **1회 호출**로 검증해 통과한 것만 돌려준다.
+
+        core/realword.py가 만든 후보는 정밀도가 36%라 그대로 카드가 되면 노이즈가 된다.
+        여기서 문맥과 함께 던져 yes/no만 받으면 **95%로 오른다**(실측 2026-07-28,
+        실파일 12건: 오탐 35건 중 34건 제거, 실오류 20건 중 18건 유지).
+
+        ⚠ 이건 '생성'이 아니라 '판정'이다 — 청킹도 글로서리도 쓰지 않으며 오탈자
+          생성 경로(check_typo_integrated)의 recall에 아무 영향이 없다.
+
+        ⚠ **실패 시 빈 리스트를 돌려준다(전량 드롭).** 검증 없이 통과시키면 정밀도가
+          36%로 떨어져 검수 카드가 노이즈로 뒤덮인다 — 이 저장소의 '과교정 0' 원칙상
+          미탐이 오탐보다 낫다. 호출 실패는 로그로만 알린다.
+
+        Args:
+            candidates: realword.find_candidates() 결과(순서가 곧 프롬프트 번호).
+        Returns:
+            검증을 통과한 후보의 부분집합(입력 순서 유지).
+        """
+        if not candidates:
+            return []
+        if stop_event is not None and stop_event.is_set():
+            return []
+
+        prompt = build_realword_verify_prompt(candidates)
+        parsed = self._call_and_parse(prompt, logger, stop_event=stop_event)
+        if not parsed:
+            # None(호출 실패)과 []( '전부 no' )를 구분할 수 없으므로 둘 다 드롭으로 처리한다.
+            #   어느 쪽이든 카드를 내보내지 않는 것이 안전한 동작이라 구분 실익이 없다.
+            if logger:
+                logger("  [실단어] AI 검증 결과 없음 — 후보 전량 보류(카드 미생성)")
+            return []
+
+        ok = set()
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("verdict", "")).strip().lower() != "yes":
+                continue
+            try:
+                n = int(item.get("n"))
+            except (TypeError, ValueError):
+                continue
+            if 1 <= n <= len(candidates):
+                ok.add(n)
+
+        out = [c for i, c in enumerate(candidates, 1) if i in ok]
+        if logger:
+            logger(f"  [실단어] AI 검증 — 후보 {len(candidates)}건 중 {len(out)}건 통과")
+        return out
+
     def check_polish(self, text: str,
                      logger=None, stop_event: threading.Event = None) -> list:
         """출판사 에디터 수준의 전체 윤문"""
@@ -380,7 +434,16 @@ class GeminiChecker:
            회수(recall)가 출렁였고(예: '무기체계와z' 오타 탐지가 런마다 달라짐) **AI 골드셋이
            아직 없어** 회귀 검증 불가 → 사용자 결정(2026-06-30)으로 **원복(보수)**. 캡션삭제는
            결정론 대량삭제 가드(proofreading_worker, [[safety-net-overflag-guards]] ③-d)가 전담.
-           재시도는 **AI 골드셋 마련 후** precision/recall 정량 비교 선결. [[gemini-call-hardening-and-prompts]].
+
+        ⚠ **그 '정량 비교 선결' 조건은 2026-07-28에 충족됐고, 결과는 재차 원복이다 — 재시도 금지.**
+           실Gemini 격자(실파일D 127,081자, 청커 3종 × 크기 2종 × 위상 2종 = 144호출)로 측정한 결과:
+             · 줄바꿈 보존안(pres)은 **회수가 반토막**(정당 교정 6/7건 vs 현행 11/13건).
+               ⚠ 이 문서군은 줄 중앙값이 8자(표 셀이 줄 단위로 추출)라 "줄 안을 안 쪼갠다"는
+               제약이 저절로 충족돼 **경계가 현행과 거의 같아진다** — 즉 얻는 것 없이 잃기만 한다.
+             · 표 블록 불분할 + 제목 정렬까지 넣은 구조 보존 청커(struct)는 경계 품질 지표는
+               완벽했으나(블록 내부 절단 0·표 절단 0) 위상 쌍 자카드가 **26%→8~17%로 악화**했다.
+           결론: 청크 분할 방식으로는 회수 안정성을 못 얻는다. 상세 수치는 core/models.py의
+           AI_CHUNK_TYPO 주석. [[gemini-call-hardening-and-prompts]].
         """
         # 인용 영역을 잠시 sentinel로 치환하여 split 후 복원
         quote_pattern = re.compile(r'([""＂"][^""＂"]*[""＂"])')

@@ -612,6 +612,95 @@ _NORM_VERB_CASES = [
 ]
 
 
+def phase_f_realword():
+    """실단어 오류 finder(core/realword.py) — 결정론 후보 생성부만 게이트.
+
+    ⚠ AI 검증(engine.verify_realword)은 실호출이 필요해 여기서 재지 않는다. 이 Phase가
+      지키는 것은 **후보 생성의 결정론적 성질**이다:
+        F-1 발화   — 실단어 오타를 gap 상한 안에 후보로 올리는가
+        F-2 무발화 — 정상 문장에서 후보를 만들지 않는가(과탐 방지)
+        F-3 불변식 — 설계 가드가 살아 있는가(같은 길이 치환만·희소성·신뢰도 low 고정)
+      AI 검증을 붙인 최종 정밀도는 별도 실측(문서 12건)으로 관리한다.
+    """
+    print("Phase F — 실단어 오류 finder (kiwi 문맥 점수, 결정론 후보 생성)")
+    fails = 0
+    total = 0
+    try:
+        from core import realword as _rw
+        from core.models import (REALWORD_GAP_MIN, REALWORD_RARE_MAX,
+                                 REALWORD_TOP_PER_WORD)
+    except Exception as e:
+        print(f"  (realword 스킵: {e})")
+        return 0
+    if not _rw.available():
+        print("  (kiwi 비활성 — 스킵)")
+        return 0
+
+    # ── F-1 발화 — 오타형과 정답형이 같은 문서에 있을 때 후보로 올라오는가 ──────
+    #   실파일에서 확인된 실제 오류를 축약 재현한다(빈출 조건 충족을 위해 정답형 반복).
+    fire = [
+        # (문서, 기대 (오타, 정답))
+        ("보고 있다. 보고 있다. 보고 있다. 보고 있다. 보고 있다. "
+         "목적 외 사용으로 부고 있다.", ("부고", "보고")),
+        ("활용하는 방안. 활용하는 사례. 활용하는 기준. 활용하는 절차. 활용하는 원칙. "
+         "공공정책 영역에서 이를 적극 확용하는 방향을 제시한다.", ("확용하는", "활용하는")),
+        ("검증 절차. 검증 기준. 검증 대상. 검증 방법. 검증 체계. "
+         "서비스 결과의 겁증 및 현업 통제를 담당한다.", ("겁증", "검증")),
+    ]
+    total += len(fire)
+    for doc, (bad, good) in fire:
+        got = _rw.find_candidates(doc)
+        if not any(r["original"] == bad and r["corrected"] == good for r in got):
+            fails += 1
+            print(f"  ✗ FAIL [F-1 발화] {bad!r}→{good!r} 미탐"
+                  f" (후보: {[(r['original'], r['corrected']) for r in got][:5]})")
+
+    # ── F-2 무발화 — 정상 문장에서 후보를 만들면 안 된다 ─────────────────────
+    quiet = [
+        # 전문용어가 희소하게 등장 — 회계 원고 오탐의 원형(안분·이연·차손)
+        "배분 기준. 배분 원칙. 배분 방법. 배분 절차. 배분 체계. "
+        "해당 비용은 합리적인 기준에 따라 안분하여 기능별로 배분한다.",
+        # 같은 길이 치환이 아닌 관계(파생/합성) — 삭제·삽입 편집은 후보가 되면 안 된다
+        "업무 절차. 업무 기준. 업무 방법. 업무 체계. 업무 원칙. "
+        "부서별 업무량 편차가 크다.",
+        # 정상 문장 — 애초에 희소어-빈출어 편집거리1 쌍이 없어야 한다
+        "사회보장급여의 지급 기준과 절차를 정비하여 과오지급을 예방한다.",
+    ]
+    total += len(quiet)
+    for doc in quiet:
+        got = _rw.find_candidates(doc)
+        if got:
+            fails += 1
+            print(f"  ✗ FAIL [F-2 무발화] {doc[:30]!r}… 에서 후보 발생: "
+                  f"{[(r['original'], r['corrected'], r['gap']) for r in got][:5]}")
+
+    # ── F-3 불변식 — 설계 가드가 살아 있는가 ────────────────────────────────
+    inv = []
+    inv.append(("같은 길이 치환만", _rw._sub1("부고", "보고") and
+                not _rw._sub1("업무량", "업무") and not _rw._sub1("업무", "업무량")))
+    inv.append(("gap 임계값 유지", REALWORD_GAP_MIN >= 12.0))
+    inv.append(("희소성 조건 유지", REALWORD_RARE_MAX == 1))
+    inv.append(("희소어당 후보 2개", REALWORD_TOP_PER_WORD == 2))
+    # ⚠ 이 카드는 반드시 저신뢰다 — high가 되는 순간 금지된 '거리 기반 추측 치환'이 된다
+    src = io.open(os.path.join(_ROOT, "ui", "workers", "proofreading_worker.py"),
+                  encoding="utf-8").read()
+    # ⚠ 마커는 유일해야 한다 — "[7.5]"만으로 자르면 [3]의 상호참조 주석에 먼저 걸린다.
+    seg = src.split("[7.5] 실단어 오류 검수 카드", 1)[-1].split("[8] 적용 정합성", 1)[0]
+    inv.append(("검수 카드 low 고정", 'confidence="low"' in seg
+                and 'confidence="high"' not in seg))
+    inv.append(("검증 없는 경로 부재", "verify_realword" in seg))
+    total += len(inv)
+    for name, ok in inv:
+        if not ok:
+            fails += 1
+            print(f"  ✗ FAIL [F-3 불변식] {name}")
+
+    print(f"  F-1 발화 {len(fire)}케이스 · F-2 무발화 {len(quiet)}케이스 · "
+          f"F-3 불변식 {len(inv)}항목 검사 완료")
+    print(f"  → Phase F {'✅ 통과' if fails == 0 else f'❌ {fails}건 실패'}")
+    return fails
+
+
 def phase_d_rules():
     print("Phase D — 결정론 규칙 레이어 통합 게이트 (무발화/발화/페어 불변식)")
     fails = 0
@@ -892,6 +981,7 @@ def main():
     a_fails += phase_a_doc_dict()
     a_fails += phase_a_norm_guard()
     a_fails += phase_a_spacing_guard()
+    a_fails += phase_f_realword()
     a_fails += phase_d_rules()
     if not args.no_ambig:
         a_fails += phase_e_ambiguity(save_baseline=args.save_ambig_baseline)
