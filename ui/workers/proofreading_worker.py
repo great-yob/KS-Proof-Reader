@@ -44,6 +44,9 @@ class ProofreadingWorker(QThread):
     error       = Signal(str)         # 에러 메시지
     text_extracted = Signal(str)      # 추출된 원문 텍스트
     page_count_extracted = Signal(object)  # 문서 총 페이지 수(int) 또는 None
+    # 각주·글상자에서 실려 온 라인 인덱스 — 미리보기가 그 줄을 '각주'로 표시해
+    #   본문 문장 한가운데 낀 각주를 사용자가 문장의 일부로 오해하지 않게 한다.
+    note_lines_extracted = Signal(list)
 
     def __init__(self, file_path: str, options: dict, parent=None):
         super().__init__(parent)
@@ -75,6 +78,10 @@ class ProofreadingWorker(QThread):
             editor.open()
             text = editor.get_text()
             page_count = getattr(editor, "last_page_count", None)  # hwpx direct 등은 None
+            # 각주·글상자에서 실려 온 **라인 인덱스**. 추출 텍스트는 재배열하지 않고
+            #   분류만 받는다(이유는 hwp_bridge_worker._classify_note_lines 주석).
+            #   ⚠ 아래 NFC 정규화는 개행을 가감하지 않으므로 라인 인덱스가 유지된다.
+            note_lines = getattr(editor, "last_note_lines", None) or []
         finally:
             try:
                 editor.close()
@@ -104,6 +111,10 @@ class ProofreadingWorker(QThread):
 
         self.text_extracted.emit(text)
         self.page_count_extracted.emit(page_count)
+        self.note_lines_extracted.emit(list(note_lines))
+        if note_lines:
+            log(f"  각주·글상자 {len(note_lines)}줄 식별 — 본문 문장을 쪼갠 자리는"
+                " 미리보기에 '각주'로 표시하고 AI 덧붙임 오탐을 차단합니다.")
         self.progress.emit(8, "텍스트 추출 완료")
 
         # [2] 사전 인프라 준비 + 1차 원문 스크리닝 (항상 ON — 사전이 기본 베이스)
@@ -320,6 +331,12 @@ class ProofreadingWorker(QThread):
             #   ("문서 내 일관성 유지" 사유)처럼 띄어 쓴 형태('사망 의심자')가 문서 어디에도
             #   없는데 일관성을 명분으로 분리한 AI 환각([M]이 밑줄 어절이라 못 잡음, 2026-07-21).
             ai_list = ai_guards.drop_hallucinated_consistency_respacing(ai_list, text, logger=log)
+            # 조판부호 절단 조각 앞 덧붙임 드롭 — 각주가 본문 문장을 쪼개 '을 적용해…'처럼
+            #   조사로 시작하는 조각이 되면 AI가 주어 없는 문장으로 보고 앞에 'TLS 1.3'을
+            #   덧붙인다(사용자 보고 2026-07-30). 원문이 실재해 [9.5]도 통과하는 오탐이라
+            #   추출 라인 분류(note_lines)로만 가른다.
+            ai_list = ai_guards.drop_fragment_prefix_addition(
+                ai_list, text, note_lines=note_lines, logger=log)
             # 원어 병기 명칭 치환 드롭 — '과학산업자원부(…DISR)'처럼 라틴 병기 괄호로
             #   정체가 고정된 명칭을 다른 명칭('산업통상자원부')으로 개명하는 AI 과교정
             #   차단(2026-07-14 보고, 자모거리≥4 + 병기 앵커).
@@ -1260,6 +1277,42 @@ class ProofreadingWorker(QThread):
             except Exception as e:
                 log(f"  [합성] 겹치는 교정 합성 스킵: {e}")
 
+        # [9.2] 이음매(junction) 정합 — 중첩 낱말이 같은 띄어쓰기 이음매를 서로 반대로
+        #     결정하는 문제를 정리한다(사용자 보고 2026-07-30). '수당수급자'→'수당 수급자'와
+        #     '수당수급자확인서'→'수당수급자 확인서'가 각각 정당해 보이지만 함께 수락하면
+        #     같은 이음매가 문서에서 갈린다. 실측(보고서 4종): 충돌 22쌍 중 **20쌍이
+        #     자동적용 카드 관여** — 사용자가 카드조차 보지 못한 채 표기가 갈렸다.
+        #     계층은 '낱말 자체 근거 > 이음매 근거 > 규범 기본값'이며, 양쪽 낱말 근거가
+        #     다 명확하면 **정당한 구분**으로 보존한다('출산 전후' vs '출산전후휴가').
+        #     상세 근거·불변식은 core/junction_pass.py 헤더.
+        #     ⚠ [9] 뒤에 둔다 — 철자 합성으로 글자가 바뀐 카드는 이 패스 대상이 아니다
+        #     (글자 불변만 다룸). ⚠ [9.5] **앞**에 둔다 — 미탐 보완으로 새로 만든 카드도
+        #     문서 대조 검증을 받아야 한다.
+        if merged and not self._stop.is_set():
+            try:
+                from core import junction_pass as _jp
+                try:
+                    from core import userdict as _ud2
+                    _jp_exc = _ud2.exception_set("spacing")
+                except Exception:
+                    _jp_exc = frozenset()
+                jd = _jp.resolve(merged, text, logger=log, exception_set=_jp_exc)
+                if jd.get("conflicts"):
+                    parts = []
+                    if jd["preserved"]:
+                        parts.append(f"정당한 구분 유지 {jd['preserved']}쌍")
+                    if jd["harmonized"]:
+                        parts.append(f"자동 정합 {jd['harmonized']}건")
+                    if jd["grouped"]:
+                        parts.append(f"사용자 결정 그룹 {jd['grouped']}개")
+                    log(f"  → 이음매 정합: 중첩 충돌 {jd['conflicts']}쌍 — "
+                        + " · ".join(parts))
+                if jd.get("recovered"):
+                    log(f"  → 이음매 보완: 3조각 이상 띄어쓴 다수 표기 "
+                        f"{jd['recovered']}건 카드화(기존 2분할 탐색 사각)")
+            except Exception as e:
+                log(f"  [이음매 정합] 스킵: {e}")
+
         # [9.5] 적용 가능성 검증 — '문서에서 찾을 수 있는 원문'만 카드로 내보낸다(불변식).
         #     실패 항목 근절(사용자 보고 2026-07-03 — 30.hwp 실패 33건 중 5건이 이 부류):
         #     (a) 추출 텍스트 대조 — AI가 원문을 재구성하며 줄나눔('필\n요'→'필 요')·
@@ -1337,6 +1390,7 @@ class ProofreadingWorker(QThread):
                 "category":  c.category,
                 "confidence": c.confidence,
                 "consistency_flip": c.consistency_flip,   # 검수 패널 '반대 표기로 통일'
+                "junction_group": c.junction_group,       # 검수 패널 이음매 그룹 전파
                 "status":    "pending",
             }
             for i, c in enumerate(merged)

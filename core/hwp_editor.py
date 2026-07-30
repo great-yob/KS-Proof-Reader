@@ -181,11 +181,17 @@ class HwpEditor:
 
     def get_text(self) -> str:
         """전체 텍스트 추출. 부가로 문서 총 페이지 수를 last_page_count에 보관
-        (브리지가 못 구하면 None — 호출 측은 getattr 폴백으로 읽는다)."""
+        (브리지가 못 구하면 None — 호출 측은 getattr 폴백으로 읽는다).
+
+        `last_note_lines`에는 **각주·글상자에서 실려 온 라인 인덱스**가 담긴다 —
+        추출 순서·오프셋은 그대로 두고 분류 정보만 덧붙인 것이다(왜 재배열하지
+        않는지는 hwp_bridge_worker._classify_note_lines 주석). 못 구하면 빈 목록.
+        """
         result = self._send_cmd({"cmd": "get_text"})
         if not result.get("ok"):
             raise RuntimeError(f"텍스트 추출 실패: {result.get('error')}")
         self.last_page_count = result.get("page_count")
+        self.last_note_lines = result.get("note_lines") or []
         return result.get("text", "")
 
     # 취소 반응성을 위한 배치 크기 — 브리지 apply는 단일 명령이 끝날 때까지

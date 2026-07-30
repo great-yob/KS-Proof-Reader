@@ -130,6 +130,13 @@ class Correction:
     #   생성처: 워커 [7] find_compound_spacing_consistency 소비부만. ⚠ 규범 교정
     #   (norm_map·eomun 등)에 켜지 말 것 — 비표준 표기로의 통일을 조장하게 된다.
     consistency_flip: bool = False
+    # 이음매(junction) 그룹 id — 같은 띄어쓰기 이음매를 서로 반대로 결정하는 카드들이
+    #   묶인다(빈 문자열이면 무관). 낱말 단위 이진 카드로는 다중 이음매 낱말의
+    #   '거절'이 정의되지 않으므로(예: '수당수급자확인서'는 이음매 2개 = 상태 4가지),
+    #   검수 패널은 이 그룹의 한 카드 결정을 **그룹 전체에 전파**한다.
+    #   생성처: core/junction_pass.resolve(워커 [9.6])만. ⚠ 이 그룹의 전파는 공백만
+    #   가감하며 `original`은 절대 바꾸지 않는다 — 자세한 불변식은 junction_pass 헤더.
+    junction_group: str = ""
     # 적용에서 제외할 등장(occurrence) 인덱스(문서 등장 순, 0-based).
     # 비어 있으면 모든 등장을 치환(기존 동작). 일부만 채우면 부분 거절.
     skip_occurrences: list = field(default_factory=list)

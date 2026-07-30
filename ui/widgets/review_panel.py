@@ -553,6 +553,7 @@ class ReviewPanel(QWidget):
         self._cards = []
         self._options = {}
         self._full_text = ""
+        self._note_ranges = []     # 각주 구간(표시 구분용 — 오프셋은 불변)
         self._active_ci = None
         # 등장 식별자 — 카드/미리보기 앵커는 **등장의 목록 인덱스가 아니라 uid**로 묶는다.
         #   인덱스로 묶으면 역방향 교정 합류(_apply_flip)로 목록이 재정렬될 때마다 모든
@@ -903,8 +904,15 @@ class ReviewPanel(QWidget):
     # ══════════════════════════════════════════════
     # 공개 API
     # ══════════════════════════════════════════════
-    def load(self, corrections, options, file_name="", full_text=""):
+    def load(self, corrections, options, file_name="", full_text="",
+             note_lines=None):
         self._full_text = full_text or ""
+        # 각주·글상자에서 실려 온 줄의 **문자 오프셋 구간**. HWP 추출은 각주 텍스트를
+        #   본문 문장 한가운데에 실어 오므로(…'TLS 1.3' / [각주] / '을 적용해…'),
+        #   표시를 구분하지 않으면 사용자가 각주를 문장의 일부로 읽는다(사용자 보고
+        #   2026-07-30). ⚠ 추출 텍스트·오프셋은 그대로 두고 **표시만** 구분한다 —
+        #   재배열하면 등장 인덱스가 브리지 RepeatFind 순서와 어긋난다.
+        self._note_ranges = self._note_ranges_from_lines(note_lines)
         self._corrections = self._sort_by_position(corrections)
         self._options = options
         self._active_filter = None        # 새 문서 — 카테고리 필터 초기화
@@ -1258,17 +1266,33 @@ class ReviewPanel(QWidget):
 
         cl.addWidget(inner_box)
 
+        # 이음매 그룹 전파가 corrected를 바꿀 때 이 위젯을 제자리 갱신한다
+        #   (_sync_corrected_widgets) — 카드를 재생성하지 않기 위해 참조를 들고 있는다.
+        card._corr_val = corr_val
+
         reason = data.get("description", data.get("reason", ""))
+        card._reason_lbl = None
         if reason:
             reason_lbl = sub_label(reason, wrap=True)
             reason_lbl.setStyleSheet(f"color: {pal['text_muted']}; border: none; background: transparent; font-size: 12px;")
             cl.addWidget(reason_lbl)
+            card._reason_lbl = reason_lbl
 
         # 띄어쓰기 일관성 '통일' 카드: 수락/거절이 곧 '문서 전체 통일 방향' 선택이다
         #   (별도 '반대 표기로 통일' 버튼은 2026-07-21 제거 — 사용자가 그 버튼을 못 보고
         #   그냥 '거절'만 하면 두 표기가 문서에 혼재한 채 남는 사용성 결함 때문).
         #   실제 처리는 _set_status → _unify_dialog. 버튼 의미를 툴팁으로 명시한다.
-        if not auto_apply and self._flip_info(data)[0]:
+        if not auto_apply and len(self._junction_members(data)) > 1:
+            # 이음매 그룹 카드: 이 결정이 겹치는 이음매를 공유한 다른 카드에도 전파된다.
+            n = len(self._junction_members(data)) - 1
+            _o, _c = data.get("original", ""), data.get("corrected", "")
+            accept_btn.setToolTip(
+                f"이 이음매를 '{_c}' 쪽으로 결정하고, 같은 이음매를 쓰는 "
+                f"다른 항목 {n}건에도 함께 반영합니다.")
+            reject_btn.setToolTip(
+                f"이 이음매를 '{_o}' 쪽으로 결정하고, 같은 이음매를 쓰는 "
+                f"다른 항목 {n}건에도 함께 반영합니다.")
+        elif not auto_apply and self._flip_info(data)[0]:
             _o, _c = data.get("original", ""), data.get("corrected", "")
             accept_btn.setToolTip(f"문서 전체를 '{_c}' 표기로 통일합니다.")
             reject_btn.setToolTip(f"문서 전체를 '{_o}' 표기로 통일합니다.")
@@ -1368,6 +1392,15 @@ class ReviewPanel(QWidget):
             occ["auto"] = False
             occ["by_user"] = True
             return
+        # ⚠ 이음매 그룹 라우팅은 _flip_info(낱말 단위 통일)보다 **먼저** 온다.
+        #   다중 이음매 낱말('수당수급자확인서'=이음매 2개=상태 4가지)은 accept/reject
+        #   1비트로 표현할 수 없어 낱말 단위 통일이 '거절'의 의미를 정의하지 못한다.
+        #   실측(2026-07-30): 낱말 단위 flip으로 처리하면 역방향 합성이 전파된 corrected를
+        #   original로 재활용해 ① 이미 맞던 표기를 되돌리고 ② 등장 수가 늘어 skip 인덱스가
+        #   밀려 오적용이 났다. 이음매 경로는 문서 실재 문자열(original)을 건드리지 않는다.
+        if len(self._junction_members(occ["c"])) > 1:
+            self._junction_dialog(occ, status)
+            return   # ⚠ 아래 코드는 이 경로에서 갱신된 카드 상태를 다시 뒤집는다.
         if self._flip_info(occ["c"])[0]:
             self._unify_dialog(occ, status)
             return   # ⚠ 여기서 반드시 종료 — 아래 코드는 삭제된 카드 위젯을 만진다.
@@ -1564,6 +1597,146 @@ class ReviewPanel(QWidget):
             n = self._count_substring(corr)
             hit = self._flip_cache[key] = ((n > 0), n)
         return hit
+
+    # ── 이음매(junction) 그룹 ──────────────────────
+    def _junction_members(self, c: dict) -> list:
+        """같은 이음매 그룹의 교정 목록(자기 포함). 그룹이 없으면 자기 하나만.
+
+        그룹은 워커 [9.6] core.junction_pass가 부여한다 — 중첩 낱말이 같은 띄어쓰기
+        이음매를 서로 반대로 결정하는데 **양쪽 다 문서 근거가 약해** 자동 판정을
+        할 수 없는 경우다(근거가 명확하면 거기서 이미 보존/정합으로 끝난다).
+        """
+        g = c.get("junction_group") or ""
+        if not g:
+            return [c]
+        # ⚠ _create_card가 카드마다 부르므로 전수 스캔을 두면 목록 길이의 제곱이 된다
+        #   (690장 기준 수십만 회 — 카드 생성 4.1ms 예산에 그대로 얹힌다).
+        #   교정 목록은 _apply_flip의 append 말고는 변하지 않으므로 길이로 무효화한다.
+        if getattr(self, "_jmap_n", -1) != len(self._corrections):
+            self._jmap = {}
+            for x in self._corrections:
+                k = x.get("junction_group") or ""
+                if k:
+                    self._jmap.setdefault(k, []).append(x)
+            self._jmap_n = len(self._corrections)
+        return self._jmap.get(g) or [c]
+
+    def _junction_plan(self, c: dict, status: str):
+        """이 카드의 결정을 그룹에 전파한 결과를 미리 계산 → [(교정dict, 새 corrected)].
+
+        수락 = 이 카드의 교정 표기(corrected) 이음매를 채택,
+        거절 = 원문 표기(original) 이음매를 채택. 둘 다 **공백만** 결정하며 original은
+        건드리지 않는다(junction_pass 불변식 (1)).
+        """
+        from core import junction_pass as _jp
+        orig, corr = c.get("original", "") or "", c.get("corrected", "") or ""
+        word = orig.replace(" ", "")
+        decided = _jp.spaces_of(corr if status == "accepted" else orig)
+        plan = []
+        for m in self._junction_members(c):
+            m_orig = m.get("original", "") or ""
+            m_word = m_orig.replace(" ", "")
+            new_sp = _jp.propagate(word, decided, m_word,
+                                   _jp.spaces_of(m.get("corrected", "") or ""))
+            new = _jp.apply_spaces(m_word, new_sp)
+            # 이 결정이 대상의 이음매를 전부 지배하는가. 아니면 남은 이음매는
+            #   사용자가 따로 결정해야 하므로 상태를 확정하지 않는다.
+            settled = (m is c) or not (set(new_sp) - _jp.governed(word, m_word))
+            plan.append((m, new, settled))
+        return plan
+
+    def _junction_dialog(self, occ: dict, status: str):
+        """이음매 결정 확인 팝업 — 그룹 전체에 어떻게 반영되는지 미리 보여준다."""
+        c = occ["c"]
+        plan = self._junction_plan(c, status)
+        lines = []
+        for m, new, settled in plan:
+            m_orig = m.get("original", "")
+            if new == m_orig:
+                lines.append(f"· {m_orig} — 원문 유지")
+            elif settled:
+                lines.append(f"· {m_orig} → {new}")
+            else:
+                # 남은 이음매가 있어 이 카드는 아직 확정하지 않는다(별도 결정).
+                lines.append(f"· {m_orig} → {new}  (남은 띄어쓰기는 따로 결정)")
+        target = (c.get("corrected") if status == "accepted"
+                  else c.get("original"))
+        if not LightConfirmDialog.ask(
+                self, "띄어쓰기 이음매 결정",
+                f"'{target}' 쪽으로 결정합니다.\n"
+                f"같은 이음매를 쓰는 항목이 함께 조정됩니다.\n\n"
+                + "\n".join(lines)):
+            return
+        # 팝업 테어다운을 먼저 끝낸다(유령 창 방지 — _unify_dialog와 같은 이유).
+        QTimer.singleShot(0, lambda: self._do_junction(occ, status))
+
+    def _do_junction(self, occ: dict, status: str):
+        """이음매 결정 반영 — corrected만 고치고 그룹 상태를 함께 확정한다.
+
+        ⚠ **카드 목록을 재구성하지 않는다.** 원문(original)이 그대로이므로 등장 위치·
+        개수가 변하지 않는다 — 즉 `_sync_cards`도 앵커 복원도 필요 없고, 바뀐 카드만
+        다시 칠하면 된다([[review-card-list-perf]]의 '상태만 바뀌면 _restyle_dirty' 경로).
+        """
+        c = occ["c"]
+        plan = self._junction_plan(c, status)
+        changed = set()
+        for m, new, settled in plan:
+            if new != (m.get("corrected") or ""):
+                m["corrected"] = new
+                changed.add(id(m))
+                # 어절 경계 판정은 corrected에 의존한다 — 메모를 지워 재계산시킨다
+                #   (_on_corrected_edited와 같은 처리).
+                for o in self._occ:
+                    if o["c"] is m:
+                        o.pop("_stem_done", None)
+            # 교정할 것이 없어진 카드는 '거절'로 확정한다(원문 유지 = 할 일 없음).
+            #   남은 이음매가 있는 카드는 **상태를 건드리지 않는다** — 사용자가 판단하지
+            #   않은 띄어쓰기를 자동 수락하지 않기 위함이다(governed 참조).
+            if new == (m.get("original") or ""):
+                m_status = "rejected"
+            elif settled:
+                m_status = "accepted"
+            else:
+                continue
+            for o in self._occ:
+                if o["c"] is m:
+                    o["status"] = m_status
+                    o["auto"] = False
+                    o["by_user"] = True
+        if changed:
+            # excluded 판정이 바뀔 수 있으므로 경계·겹침을 다시 본다(위치는 불변).
+            self._mark_stem_boundary_skips()
+            self._resolve_overlaps()
+            self._sync_corrected_widgets(changed)
+        self._mark_active_occ(occ)
+        self._derive_all()
+        self._restyle_dirty()
+        self._refresh_preview(defer=True)
+        self._emit_counts()
+        others = len(plan) - 1
+        if others > 0:
+            self._toast(f"같은 이음매를 쓰는 항목 {others}건에 함께 반영했습니다.",
+                        title="띄어쓰기 이음매 결정")
+        self._scroll_to(occ["uid"])
+
+    def _sync_corrected_widgets(self, changed_ids: set):
+        """전파로 corrected가 바뀐 카드의 입력칸·사유 라벨을 제자리 갱신."""
+        for card in self._cards:
+            data = getattr(card, "_occ", {}).get("c") if hasattr(card, "_occ") else None
+            if data is None or id(data) not in changed_ids:
+                continue
+            le = getattr(card, "_corr_val", None)
+            if le is not None and le.text() != data.get("corrected", ""):
+                # ⚠ editingFinished가 되울려 _on_corrected_edited가 '직접수정'으로
+                #   집계하지 않도록 시그널을 잠시 막는다.
+                le.blockSignals(True)
+                le.setPlainText(data.get("corrected", ""))
+                le.blockSignals(False)
+            lbl = getattr(card, "_reason_lbl", None)
+            if lbl is not None:
+                want = data.get("description", data.get("reason", ""))
+                if want and lbl.text() != want:
+                    lbl.setText(want)
 
     def _unify_dialog(self, occ: dict, status: str):
         """일관성 카드 수락/거절 = 문서 전체 통일 방향 선택 — 확인 팝업 후 반영.
@@ -1910,7 +2083,7 @@ class ReviewPanel(QWidget):
             i = o["uid"]        # 앵커 id = 등장 uid(목록 인덱스가 아니다)
             s, e = o["pos"], o["end"]
             if cursor < s:
-                parts.append(self._escape_text(text[cursor:s]))
+                parts.append(self._escape_body(text[cursor:s], cursor))
             is_active = (i == active)
             st = o["status"]
             
@@ -1931,7 +2104,7 @@ class ReviewPanel(QWidget):
                 f'{shown_text}</span></a>')
             cursor = e
         if cursor < len(text):
-            parts.append(self._escape_text(text[cursor:]))
+            parts.append(self._escape_body(text[cursor:], cursor))
         pal = current_palette()
         return (f'<div style="line-height:2.0; font-size:14px; color:{pal["text"]};">'
                 f'{"".join(parts)}</div>')
@@ -1973,6 +2146,76 @@ class ReviewPanel(QWidget):
     @staticmethod
     def _escape_text(s: str) -> str:
         return html.escape(s).replace("\n", "<br>")
+
+    def _note_ranges_from_lines(self, note_lines):
+        """각주 라인 인덱스 → `_full_text` 문자 오프셋 구간 목록.
+
+        ⚠ **'문장을 끊은' 각주만 표시한다.** note_lines에는 각주 말고 표지 글상자·목차·
+        머리말도 들어 있어(실측 1,009줄) 전부 표시하면 문서 앞부분이 온통 '[각주]'가 된다.
+        사용자가 오해한 상황은 **본문 문장 한가운데 끼어든** 경우이므로, 앞 본문 조각이
+        문장부호로 끝나지 않고 뒤에도 본문 조각이 이어지는 각주만 골라 표시한다.
+        """
+        if not note_lines or not self._full_text:
+            return []
+        want = set(note_lines)
+        lines = self._full_text.split("\n")
+        starts, pos = [], 0
+        for ln in lines:
+            starts.append(pos)
+            pos += len(ln) + 1        # +1 = 개행
+
+        def prev_nb(i):
+            j = i - 1
+            while j >= 0 and not lines[j].strip():
+                j -= 1
+            return j
+
+        def next_nb(i):
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            return j if j < len(lines) else -1
+
+        out = []
+        for i, ln in enumerate(lines):
+            if i not in want or not ln.strip():
+                continue
+            p, n = prev_nb(i), next_nb(i)
+            if p < 0 or n < 0 or p in want or n in want:
+                continue
+            before = lines[p].rstrip()
+            # 앞 조각이 문장부호로 끝나면 문장이 끊긴 게 아니다(각주가 문단 사이에 있음).
+            if not before or before[-1] in ".?!…。」’”':;":
+                continue
+            out.append((starts[i], starts[i] + len(ln)))
+        return out
+
+    def _escape_body(self, s: str, base: int) -> str:
+        """비강조 본문 조각을 HTML로 — 각주 구간은 흐리게 + '각주' 표지로 구분한다.
+
+        `base`는 이 조각이 `_full_text`에서 시작하는 오프셋이다(오프셋을 바꾸지 않으므로
+        앵커·등장 인덱스에 영향 없음).
+        """
+        if not self._note_ranges or not s:
+            return self._escape_text(s)
+        pal = current_palette()
+        end = base + len(s)
+        parts, cur = [], base
+        for ns, ne in self._note_ranges:
+            if ne <= cur or ns >= end:
+                continue
+            a, b = max(ns, cur), min(ne, end)
+            if a > cur:
+                parts.append(self._escape_text(s[cur - base:a - base]))
+            parts.append(
+                f'<span style="color:{pal["text_muted"]}; font-size:12px;">'
+                f'[각주]&nbsp;</span>'
+                f'<span style="color:{pal["text_muted"]}; font-size:13px;">'
+                f'{self._escape_text(s[a - base:b - base])}</span>')
+            cur = b
+        if cur < end:
+            parts.append(self._escape_text(s[cur - base:]))
+        return "".join(parts)
 
     def _on_text_clicked(self, url):
         if url.scheme() == "cid":

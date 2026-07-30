@@ -103,6 +103,31 @@ def analyze_bases(word: str) -> list:
     return bases
 
 
+# ── URL·경로·이메일 어절 보호 ─────────────────────────────────────────────
+# 실측(2026-07-30, 양육지원 연구 .hwp 참고문헌): find_spacing_suggestions가
+#   'http://www.law.go.kr/법령/남녀고용평등과일･가정양립지원에관한법률.' 어절을 분석해
+#   '…관한 법률.'로 띄우는 카드를 냈다. URL에 공백이 들어가면 **링크가 깨진다** — 그리고
+#   교정문이 원문과 글자가 같아(공백만 추가) 어느 가드도 이를 이상하게 보지 않는다.
+#   ⚠ 한글이 섞인 URL(국가법령정보센터 링크)이라 '한글 포함' 조건으로는 못 걸러진다.
+#   spacing_rules._SKIP_TOKEN과 같은 부류의 판정이지만 그쪽은 토큰 내부 부호 규칙용이라
+#   여기서 어절 단위로 따로 둔다(그 모듈은 이미 골드셋에 고정돼 있어 건드리지 않는다).
+_URLISH = re.compile(
+    r"(https?://|ftp://|www\.|[\w.+-]+@[\w-]+\.[a-z]{2,}"
+    r"|\.(?:com|org|net|io|kr|co|gov|edu|go|or|ac|re|html?|pdf|hwp|docx?|xlsx?"
+    r"|pptx?|py|js|json|md|txt|csv)(?:\b|/)|[A-Za-z]:[\\/]|/{2,})",
+    re.I,
+)
+
+
+def is_urlish(word: str) -> bool:
+    """URL·파일 경로·이메일처럼 보이는 어절인가 — 띄어쓰기 제안에서 통째로 제외한다.
+
+    띄어쓰기 finder들은 '글자 불변(공백만 삽입)'이라 안전하다는 전제로 동작하는데,
+    URL·경로에서는 공백 삽입 자체가 값을 파괴하므로 그 전제가 성립하지 않는다.
+    """
+    return bool(word) and bool(_URLISH.search(word))
+
+
 def strip_josa(word: str):
     """어절 끝의 조사(J*)와 계사(이다/아니다 VCP·VCN + 그 어미)만 잘라낸 base 반환.
 
@@ -547,6 +572,8 @@ def find_spacing_suggestions(text: str, min_len: int = 2) -> list:
         seen.add(w)
         if not _re.search(r"[가-힣]", w):
             continue
+        if is_urlish(w):        # URL·경로에 공백을 넣으면 링크가 깨진다(is_urlish 주석)
+            continue
         try:
             words.append((w, kiwi.analyze(w)[0][0]))
         except Exception:
@@ -689,7 +716,7 @@ def find_dependent_noun_spacing(text: str) -> list:
         return []
     out, seen = [], set()
     for w in text.split():
-        if w in seen or not _re.search(r"[가-힣]", w):
+        if w in seen or not _re.search(r"[가-힣]", w) or is_urlish(w):
             continue
         seen.add(w)
         try:
@@ -779,6 +806,8 @@ def find_symbol_noun_spacing(text: str) -> list:
         qroles = None    # 줄에 따옴표 후보가 실제로 나올 때만 계산(지연)
         for wm in re.finditer(r"\S+", line):
             w = wm.group()
+            if is_urlish(w):     # URL의 ')' 등을 '닫는 기호'로 보고 띄우면 링크가 깨진다
+                continue
             if w in seen or not any((ch in _CLOSE_SYM or ch in _QUOTE_SYM) for ch in w):
                 continue
             seen.add(w)
@@ -865,7 +894,7 @@ def find_auxiliary_verb_spacing(text: str) -> list:
         return []
     out, seen = [], set()
     for w in text.split():
-        if w in seen or not _re.search(r"[가-힣]", w):
+        if w in seen or not _re.search(r"[가-힣]", w) or is_urlish(w):
             continue
         seen.add(w)
         try:
@@ -914,7 +943,7 @@ def find_aux_connective_spacing(text: str) -> list:
         return []
     out, seen = [], set()
     for w in text.split():
-        if w in seen or not _re.search(r"[가-힣]", w):
+        if w in seen or not _re.search(r"[가-힣]", w) or is_urlish(w):
             continue
         seen.add(w)
         try:

@@ -740,6 +740,87 @@ def drop_hallucinated_consistency_respacing(ai_list: list, document_text: str, l
 
 
 # ══════════════════════════════════════════════════════════
+# ▌⑱ 조판부호(각주) 절단 조각 앞 덧붙임 드롭 — 추출 라인 분류 필요
+# ══════════════════════════════════════════════════════════
+# HWP GetText(option 0xff)는 각주·글상자 텍스트를 **본문 문장 한가운데**에 실어 오고,
+# 경계 개행 때문에 한 문장이 여러 조각으로 쪼개진다(실측 복지지갑 연구 .hwp):
+#     …이름 일치를 엄격히 검증하고, TLS 1.3      ← 본문
+#      전송 구간 암호화를 위한 최신 프로토콜로…    ← 각주
+#     을 적용해 전진 기밀성이 보장되는…           ← 본문(이어짐)
+# AI는 세 번째 줄을 **주어 없는 문장**으로 보고 'TLS 1.3'을 앞에 덧붙이는 교정을 낸다
+# (사용자 보고 2026-07-30 — 실제 카드로 노출됐다). 원문은 문서에 실재하므로 [9.5] 게이트도
+# 통과하고, 글자를 더하는 교정이라 다른 가드도 안 잡는다.
+#
+# ⚠ 추출 텍스트를 재배열해 문장을 이어붙이는 방식은 **채택하지 않았다** — 각주 분량이
+# 본문의 25.7%라 본문만 쓰면 각주가 교정 대상에서 빠지고, 본문·각주에 함께 나오는 낱말이
+# 385개라 등장 인덱스가 브리지 RepeatFind 순서와 어긋난다(부분 거절 오적용). 순서는 그대로
+# 두고 '이 라인은 각주다'라는 분류만 받아, 절단 조각 앞 덧붙임을 결정론으로 드롭한다.
+def drop_fragment_prefix_addition(ai_list: list, document_text: str,
+                                  note_lines=None, logger=None):
+    """조판부호로 잘린 조각의 **맨 앞에 텍스트를 덧붙이는** AI 교정을 드롭.
+
+    발동 조건(전부 충족해야 함 — 좁게 잡는다):
+      · AI 생성 교정이고, corrected가 original로 **끝나며** 앞에만 글자가 붙었다
+        (`corrected.endswith(original)` — 중간 수정이 섞이면 대상 아님)
+      · original이 추출 텍스트의 어떤 **라인 맨 앞**에서 시작한다
+      · 그 라인 **직전의 비어 있지 않은 라인이 각주·글상자 라인**이다(note_lines)
+      · ★**덧붙인 말이 각주 앞 본문 조각의 끝과 정확히 일치한다** — 즉 AI는 없는 말을
+        보충한 게 아니라 **추출이 쪼갠 문장을 다시 이어붙이고 있다**. 문서에는 그 말이
+        이미 있으므로 적용하면 중복이 된다.
+
+    ⚠ 마지막 조건이 핵심이다. 없이 '조각 맨 앞 + 앞 덧붙임'만 보면 짧은 원문이 우연히
+    어떤 조각의 접두사인 경우까지 걸린다(실측: '복지지갑'→'한국 복지지갑'이 오드롭됐다).
+
+    note_lines가 비면(구버전 브리지·hwpx 직접 백엔드) 입력 그대로 — 무회귀.
+    반환: 걸러낸 리스트(원본 미변경).
+    """
+    if not ai_list or not document_text or not note_lines:
+        return ai_list
+    notes = set(note_lines)
+    lines = document_text.split("\n")
+
+    def _prev_nonblank(i):
+        j = i - 1
+        while j >= 0 and not lines[j].strip():
+            j -= 1
+        return j
+
+    # 각주 라인 직후의 '이어지는 본문' 조각 → 그 각주 **앞**의 본문 조각(끊긴 앞부분).
+    targets = []
+    for i in range(1, len(lines)):
+        if i in notes or not lines[i].strip():
+            continue
+        j = _prev_nonblank(i)
+        if j < 0 or j not in notes:
+            continue
+        k = _prev_nonblank(j)          # 각주 이전의 본문 조각
+        if k < 0 or k in notes or not lines[k].strip():
+            continue
+        targets.append((lines[i].strip(), lines[k].strip()))
+    if not targets:
+        return ai_list
+    kept, dropped = [], 0
+    for c in ai_list:
+        o = (c.original or "").strip()
+        cr = (c.corrected or "").strip()
+        hit = False
+        if (c.source in ("ai_typo", "ai_polish") and o and cr and cr != o
+                and cr.endswith(o) and len(cr) > len(o)):
+            prefix = cr[:-len(o)].strip()
+            if prefix:
+                hit = any(frag.startswith(o) and before.endswith(prefix)
+                          for frag, before in targets)
+        if hit:
+            dropped += 1
+            continue
+        kept.append(c)
+    if logger and dropped:
+        logger(f"  → 조판부호 절단 조각 앞 덧붙임 AI 교정 {dropped}건 제외 "
+               f"(각주가 문장을 쪼갠 자리 — 원문에 누락된 말이 아님)")
+    return kept
+
+
+# ══════════════════════════════════════════════════════════
 # ▌⑰ 영문 병기(괄호) 앵커 명칭 치환 드롭 — 문서 텍스트 필요
 # ══════════════════════════════════════════════════════════
 # '과학산업자원부(Department of Industry, Science and Resources, DISR)'의 앞 낱말을

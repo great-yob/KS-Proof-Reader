@@ -343,8 +343,58 @@ def phase_a_doc_dict():
             fails += 1
             print(f"  ✗ FAIL [괄호조사] {o!r}→{c!r} 기대={want!r} 실제={got!r}")
 
+    # ── 조판부호(각주) 절단 조각 앞 덧붙임 드롭 ────────────────────────────────
+    #   HWP 추출은 각주 텍스트를 본문 문장 한가운데 실어 오고 경계 개행 때문에 한 문장이
+    #   쪼개진다. AI는 '을 적용해…' 조각을 주어 없는 문장으로 보고 앞 조각 끝('TLS 1.3')을
+    #   덧붙이는 오탐을 낸다(사용자 보고 2026-07-30). 문서에 그 말이 이미 있으므로 중복이다.
+    #   ⚠ '덧붙인 말 == 각주 앞 조각의 끝'까지 확인해야 한다 — 안 하면 짧은 원문이 우연히
+    #   어떤 조각의 접두사인 경우까지 드롭된다(실측 '복지지갑'→'한국 복지지갑' 오드롭).
+    fr_lines = [
+        "검증하고, TLS 1.3",                      # 0 본문(끊긴 앞부분)
+        "",                                       # 1
+        " 전송 구간 암호화를 위한 최신 프로토콜.",   # 2 ★각주
+        "",                                       # 3
+        "을 적용해 전진 기밀성을 보장한다.",         # 4 본문(이어짐)
+        "",                                       # 5
+        "복지지갑은 이용자에게 제공된다.",           # 6 본문(각주 무관)
+    ]
+    fr_doc = "\n".join(fr_lines)
+    fr_notes = [2]
+    fr_cases = [
+        # (원문, 교정문, source, 드롭 기대)
+        ("을 적용해 전진 기밀성을 보장한다.",
+         "TLS 1.3을 적용해 전진 기밀성을 보장한다.", "ai_typo", True),
+        # 같은 조각의 중간 수정 → 앞 덧붙임 아님 → 보존
+        ("을 적용해 전진 기밀성을 보장한다.",
+         "을 적용해 전진 기밀성을 보장하였다.", "ai_typo", False),
+        # 덧붙였지만 앞 조각 끝과 불일치 → 보존(진짜 보충일 수 있다)
+        ("을 적용해 전진 기밀성을 보장한다.",
+         "표준을 적용해 전진 기밀성을 보장한다.", "ai_typo", False),
+        # 각주와 무관한 조각의 앞 덧붙임 → 보존
+        ("복지지갑은 이용자에게 제공된다.",
+         "한국 복지지갑은 이용자에게 제공된다.", "ai_typo", False),
+        # 결정론 카드는 대상 아님
+        ("을 적용해 전진 기밀성을 보장한다.",
+         "TLS 1.3을 적용해 전진 기밀성을 보장한다.", "spacing", False),
+    ]
+    for o, c, src, want_drop in fr_cases:
+        cor = Correction(original=o, corrected=c, source=src, color=0,
+                         category="맞춤법", confidence="high")
+        kept = ai_guards.drop_fragment_prefix_addition(
+            [cor], fr_doc, note_lines=fr_notes)
+        if (len(kept) == 0) != want_drop:
+            fails += 1
+            print(f"  ✗ FAIL [각주절단] {o[:14]!r}→{c[:18]!r} "
+                  f"기대드롭={want_drop} 실제드롭={len(kept) == 0}")
+    # note_lines 없으면 무회귀(구버전 브리지·hwpx 직접 백엔드)
+    cor = Correction(original=fr_cases[0][0], corrected=fr_cases[0][1],
+                     source="ai_typo", color=0, category="맞춤법")
+    if len(ai_guards.drop_fragment_prefix_addition([cor], fr_doc, note_lines=[])) != 1:
+        fails += 1
+        print("  ✗ FAIL [각주절단] note_lines 없을 때 무회귀 실패")
+
     n = (len(exp_cases) + len(hd_cases) + len(dm_cases) + len(ws_cases) + len(pj_cases)
-         + len(gn_cases) + len(cv_cases))
+         + len(gn_cases) + len(cv_cases) + len(fr_cases) + 1)
     print(f"  → {n - fails}/{n} 통과" + ("  ✅" if fails == 0 else "  ❌"))
     return fails
 
@@ -701,6 +751,178 @@ def phase_f_realword():
     return fails
 
 
+def phase_g_junction():
+    """이음매 정합 패스(core/junction_pass.py) 게이트.
+
+    이 패스는 중첩 낱말이 같은 띄어쓰기 이음매를 서로 반대로 결정하는 문제를 다룬다
+    (사용자 보고 2026-07-30). 자동 판정이 원리적으로 불가능한 영역이 있어서
+    (정당한 구분 vs 결함을 사전·빈도로 못 가름 — 실측) 계층이 지키는 성질을 게이트한다:
+
+      G-1 우선순위 계층 — 낱말 자체 근거가 이음매보다 강한가(정당한 구분 보존)
+      G-2 자동 정합    — 상대 근거가 **전무할 때만** 정합하는가
+      G-3 불변식       — original 불변 · 글자 불변 · URL 미개입 · 결합 방향 미생성
+      G-4 전파 산술    — propagate/governed 가 시뮬레이션대로 동작하는가
+    """
+    print("Phase G — 이음매(junction) 정합 계층 (결정론)")
+    fails = 0
+    try:
+        from core import junction_pass as _jp
+        from core.models import Correction, HL_TYPO
+        from core import morph as _morph
+    except Exception as e:
+        print(f"  (junction_pass 스킵: {e})")
+        return 0
+    if not _morph.available():
+        print("  (kiwi 비활성 — 스킵)")
+        return 0
+
+    def card(o, c, conf="low", src="spacing"):
+        return Correction(original=o, corrected=c, reason="띄어쓰기", source=src,
+                          color=HL_TYPO, category="띄어쓰기", confidence=conf,
+                          consistency_flip=True)
+
+    # ── G-1 정당한 구분 보존 ────────────────────────────────────────────────
+    #   '출산 전후'(일반)와 '출산전후휴가'(고용보험법 용어)는 **달라야 맞다**. 양쪽
+    #   낱말이 각자 문서 다수 표기를 가지면 이음매 빈도로 눌러선 안 된다(맞춤법 제50항).
+    doc1 = ("출산 전후 " * 6 + "출산전후 " * 2
+            + "출산전후휴가 " * 4 + "출산전후 휴가 " * 1)
+    cards1 = [card("출산전후", "출산 전후"), card("출산전후 휴가", "출산전후휴가")]
+    d1 = _jp.resolve(cards1, doc1)
+    if d1["preserved"] < 1 or d1["harmonized"]:
+        fails += 1
+        print(f"  ✗ FAIL [G-1] 정당한 구분이 보존되지 않음 {d1} "
+              f"→ {[(c.original, c.corrected) for c in cards1]}")
+    if any(c.junction_group for c in cards1):
+        fails += 1
+        print("  ✗ FAIL [G-1] 정당한 구분 쌍이 사용자 결정 그룹으로 묶임")
+
+    # ── G-2 자동 정합은 '상대 근거 전무'일 때만 ───────────────────────────────
+    #   '수급자 확인서'가 문서 다수(근거 명확)이고, 괄호가 섞인 낱말은 변이가 없어
+    #   근거 0 → 그 카드의 이음매를 다수 표기에 맞춘다.
+    doc2 = ("수급자 확인서 " * 6 + "수급자확인서 " * 1
+            + "급여(현금)수급자확인서 ")
+    cards2 = [card("수급자확인서", "수급자 확인서"),
+              card("급여(현금)수급자확인서", "급여(현금) 수급자확인서")]
+    d2 = _jp.resolve(cards2, doc2)
+    tgt = next((c for c in cards2 if c.original.startswith("급여(")), None)
+    if tgt is None or tgt.corrected != "급여(현금) 수급자 확인서":
+        fails += 1
+        print(f"  ✗ FAIL [G-2] 자동 정합 실패 {d2} "
+              f"→ {tgt.corrected if tgt else None!r}")
+    #   반대로 양쪽 근거가 '약함'이면 정합하지 말고 사용자 결정 그룹으로.
+    doc3 = "수당수급자 수당 수급자 수당수급자확인서 수당수급자 확인서 "
+    cards3 = [card("수당수급자", "수당 수급자"),
+              card("수당수급자확인서", "수당수급자 확인서")]
+    d3 = _jp.resolve(cards3, doc3)
+    if d3["grouped"] != 1 or d3["harmonized"]:
+        fails += 1
+        print(f"  ✗ FAIL [G-2] 근거 약한 충돌이 그룹화되지 않음 {d3}")
+    if not all(c.junction_group and c.confidence == "low" for c in cards3):
+        fails += 1
+        print("  ✗ FAIL [G-2] 그룹 카드에 junction_group·low 강등 누락")
+
+    # ── G-3 불변식 ─────────────────────────────────────────────────────────
+    inv = []
+    #   (a) original 불변 · 글자 불변 — 모든 시나리오에서
+    inv.append(("original 불변·글자 불변", all(
+        c.original.replace(" ", "") == c.corrected.replace(" ", "")
+        for c in cards1 + cards2 + cards3)))
+    #   (b) URL 미개입 — 참고문헌 URL에 공백을 넣으면 링크가 깨진다
+    url = "http://www.law.go.kr/법령/남녀고용평등과일･가정양립지원에관한법률."
+    doc4 = "가정 양립 " * 6 + "가정양립 " * 2 + url
+    cards4 = [card("가정양립", "가정 양립"),
+              card(url, url.replace("관한법률", "관한 법률"))]
+    _jp.resolve(cards4, doc4)
+    inv.append(("URL 카드 미개입",
+                cards4[1].corrected == url.replace("관한법률", "관한 법률")))
+    #   (c) 결합 방향 미탐 보완 금지 — '띄어 쓴 구를 붙임'은 만들지 않는다(⑩ 노이즈 클래스)
+    doc5 = "학교밖청소년지원 학교밖청소년지원 학교 밖 청소년 지원 "
+    cards5 = []
+    d5 = _jp.resolve(cards5, doc5)
+    inv.append(("결합 방향 보완 미생성",
+                all(" " not in c.original for c in cards5)))
+    #   (d) 보완 카드의 원문은 반드시 문서에 실재(브리지 적용 가능성)
+    doc6 = ("기초연금 수급자 확인서 " * 6 + "기초연금수급자확인서 ")
+    cards6 = []
+    _jp.resolve(cards6, doc6)
+    inv.append(("보완 카드 원문 실재",
+                bool(cards6) and all(c.original in doc6 for c in cards6)))
+    inv.append(("3조각 다수형 보완 동작",
+                any(c.corrected == "기초연금 수급자 확인서" for c in cards6)))
+    for name, ok in inv:
+        if not ok:
+            fails += 1
+            print(f"  ✗ FAIL [G-3 불변식] {name}")
+
+    # ── G-4 전파 산술 — 사용자 시뮬레이션 3종 ────────────────────────────────
+    W1, W2 = "수당수급자", "수당수급자확인서"
+    sims = [
+        # (결정 낱말, 결정 공백, 대상, 대상 현재 공백, 기대 결과, 기대 확정여부)
+        ("수락 A", W1, {2}, W2, {5}, {2, 5}, False),   # 남은 이음매 5 → 미확정
+        ("거절 B", W2, set(), W1, {2}, set(), True),   # 전부 지배 → 확정
+        ("거절 C", W1, set(), W2, {5}, {5}, False),    # 5는 미지배 → 미확정
+    ]
+    for name, dw, ds, tw, ts, want, want_settled in sims:
+        got = _jp.propagate(dw, ds, tw, ts)
+        settled = not (set(got) - _jp.governed(dw, tw))
+        if set(got) != want or settled != want_settled:
+            fails += 1
+            print(f"  ✗ FAIL [G-4 전파] {name}: {sorted(got)} "
+                  f"(기대 {sorted(want)}) settled={settled}/{want_settled}")
+
+    # ── G-5 조사·기호가 붙은 낱말에서의 전파 산술 ─────────────────────────────
+    #   이음매 산술은 '공백 제거 좌표의 문자열 오프셋'이라 조사·괄호·따옴표가 붙어도
+    #   그대로 성립한다. 다만 **결정 카드가 결정하지 않은 이음매는 건드리지 않는다** —
+    #   '가정양립'{2}를 '일가정양립을'에 옮기면 '일가정 양립을'이지 '일 가정 양립을'이
+    #   아니다(일|가정은 다른 이음매다). 실측 doc11에서 '일 가정 양립을'이 나온 것은
+    #   그 카드의 corrected가 이미 '일 가정양립을'이었기 때문이다.
+    josa = [
+        ("조사", "수급자확인서", {3}, "수급자확인서를", set(), "수급자 확인서를"),
+        ("복합조사", "수급자확인서", {3}, "수급자확인서에서의", set(), "수급자 확인서에서의"),
+        ("괄호", "수급자확인서", {3}, "급여(현금)수급자확인서", {6},
+         "급여(현금) 수급자 확인서"),
+        ("따옴표", "수당수급자", {2}, "‘수당수급자확인서’", {6}, "‘수당 수급자 확인서’"),
+        ("미결정 이음매 불간섭", "가정양립", {2}, "일가정양립을", set(), "일가정 양립을"),
+        ("기존 공백 누적", "가정양립", {2}, "일가정양립을", {1}, "일 가정 양립을"),
+    ]
+    for name, dw, ds, tw, ts, want in josa:
+        got = _jp.apply_spaces(tw, _jp.propagate(dw, ds, tw, ts))
+        if got != want:
+            fails += 1
+            print(f"  ✗ FAIL [G-5 조사·기호] {name}: {tw!r} → {got!r} (기대 {want!r})")
+
+    # ── G-6 URL·경로 보존 ──────────────────────────────────────────────────
+    #   띄어쓰기 finder는 '공백만 삽입=안전'을 전제로 하는데 URL·경로에서는 공백 삽입이
+    #   값을 파괴한다(실측: 참고문헌 국가법령정보센터 링크가 '…관한 법률.'로 쪼개짐).
+    urlish = [
+        ("http://www.law.go.kr/법령/남녀고용평등과일･가정양립지원에관한법률.", True),
+        ("www.moel.go.kr/policy", True), ("hong@example.co.kr", True),
+        ("C:\\Users\\a.hwp", True), ("보고서.hwp", True),
+        ("일가정양립을", False), ("급여(현금)수급자확인서", False), ("3.14", False),
+    ]
+    for w, want in urlish:
+        if _morph.is_urlish(w) != want:
+            fails += 1
+            print(f"  ✗ FAIL [G-6 URL] is_urlish({w!r}) != {want}")
+    #   finder 산출물에 URL 어절이 섞이지 않는가(실 텍스트)
+    doc_url = ("가정 양립 " * 6 + "가정양립 " * 2
+               + "http://www.law.go.kr/법령/남녀고용평등과일･가정양립지원에관한법률. "
+               + "자료는 보고서.hwp 및 www.moel.go.kr/notice 참조. ")
+    leaked = [o for f in (_morph.find_spacing_suggestions,
+                          _morph.find_symbol_noun_spacing,
+                          _morph.find_dependent_noun_spacing)
+              for o, _c in f(doc_url) if _morph.is_urlish(o)]
+    if leaked:
+        fails += 1
+        print(f"  ✗ FAIL [G-6 URL] finder가 URL 어절 카드를 냄: {leaked[:3]}")
+
+    print(f"  G-1 보존 · G-2 정합/그룹 · G-3 불변식 {len(inv)}항목 · "
+          f"G-4 전파 {len(sims)}케이스 · G-5 조사·기호 {len(josa)}케이스 · "
+          f"G-6 URL {len(urlish)}판정+누출검사 완료")
+    print(f"  → Phase G {'✅ 통과' if fails == 0 else f'❌ {fails}건 실패'}")
+    return fails
+
+
 def phase_d_rules():
     print("Phase D — 결정론 규칙 레이어 통합 게이트 (무발화/발화/페어 불변식)")
     fails = 0
@@ -982,6 +1204,7 @@ def main():
     a_fails += phase_a_norm_guard()
     a_fails += phase_a_spacing_guard()
     a_fails += phase_f_realword()
+    a_fails += phase_g_junction()
     a_fails += phase_d_rules()
     if not args.no_ambig:
         a_fails += phase_e_ambiguity(save_baseline=args.save_ambig_baseline)

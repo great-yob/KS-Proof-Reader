@@ -498,6 +498,7 @@ class HwpBridge:
                 pending_break = False
                 buf += text
         self.hwp.ReleaseScan()
+        text = buf.replace('\r', '\n').strip()
         # 문서 총 페이지 수 — 교정 현장 단위(하루 80~100쪽)라 결과 보고서의
         #   대표 수치로 쓴다. 버전에 따라 없을 수 있어 실패 시 None(표시 생략).
         page_count = None
@@ -505,8 +506,66 @@ class HwpBridge:
             page_count = int(self.hwp.PageCount)
         except Exception:
             pass
-        return {"text": buf.replace('\r', '\n').strip(),
+        return {"text": text,
+                "note_lines": self._classify_note_lines(text),
                 "page_count": page_count}
+
+    # ── 각주·글상자 라인 식별 ────────────────────────────────────────────────
+    #   위 스캔(option 0xff)은 각주·글상자 텍스트를 **본문 문장 한가운데**에 실어 오고,
+    #   경계 개행 때문에 한 문장이 여러 조각으로 쪼개진다. 실측(복지지갑 연구 .hwp):
+    #     …이름 일치를 엄격히 검증하고, TLS 1.3      ← 본문
+    #      전송 구간 암호화를 위한 최신 프로토콜로…    ← 각주
+    #     을 적용해 전진 기밀성이 보장되는…           ← 본문(이어짐)
+    #   AI는 '을 적용해…'를 주어 없는 문장으로 보고 'TLS 1.3'을 덧붙이는 **오탐**을 낸다
+    #   (사용자 보고 2026-07-30). 어느 라인이 각주인지 알면 그 오탐을 결정론으로 막고
+    #   미리보기에도 각주로 표시할 수 있다.
+    #
+    #   ⚠ **추출 텍스트 자체는 절대 재배열하지 않는다.** 본문만 뽑아(option 0x00) 그것을
+    #   파이프라인 텍스트로 쓰면 ① 각주 분량(실측 본문의 25.7%)이 교정 대상에서 빠지고
+    #   ② 본문·각주에 함께 나오는 낱말이 385개라 등장 인덱스가 브리지 RepeatFind 순서와
+    #   어긋난다(부분 거절 오적용 — 이 저장소가 반복해서 데인 부류). 그래서 순서·오프셋은
+    #   그대로 두고 **분류 정보만** 덧붙인다.
+    #
+    #   ⚠ state 4/5 depth 카운터로는 못 가른다 — 실측에서 진입 230회 : 탈출 266회로
+    #   **불균형**이라 카운터가 어긋나고, '컨트롤 내용'에는 각주 말고 표지 글상자·머리말도
+    #   섞인다. 그래서 본문 전용 스캔과 대조하는 방식을 쓴다.
+    def _classify_note_lines(self, text):
+        """본문 전용 스캔(option 0x00)과 대조해 '본문에 없는 라인'의 인덱스를 돌려준다.
+
+        판정이 실패하면 빈 목록 — 호출부는 전부 본문으로 취급(현행 동작 유지).
+        짧은 각주 라인이 우연히 본문에도 존재하면 '본문'으로 오분류되는데, 그 방향은
+        마커·가드가 발동하지 않을 뿐이라 안전하다(억제 실패 = 현행 동작).
+        """
+        if not text:
+            return []
+        body = ""
+        try:
+            try:
+                self.hwp.InitScan(0x00, 0x77, 0, 0, 0, 0)
+            except Exception:
+                self.hwp.InitScan(0x00, 0x77)
+            while True:
+                state, t = self.hwp.GetText()
+                if state in (0, 1):
+                    break
+                if t:
+                    body += t
+            self.hwp.ReleaseScan()
+        except Exception:
+            try:
+                self.hwp.ReleaseScan()
+            except Exception:
+                pass
+            return []
+        body = body.replace('\r', '\n')
+        if not body.strip():
+            return []
+        out = []
+        for i, ln in enumerate(text.split('\n')):
+            s = ln.strip()
+            if s and s not in body:
+                out.append(i)
+        return out
 
     def verify(self, originals):
         """각 원문 문자열이 문서에서 '찾기'로 도달 가능한지 검증 (치환 없음 — 문서 무변경).
