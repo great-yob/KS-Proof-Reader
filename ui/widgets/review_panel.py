@@ -635,6 +635,12 @@ class ReviewPanel(QWidget):
 
         self._source_view = QTextBrowser()
         self._source_view.setOpenExternalLinks(False)
+        # ⚠ setOpenLinks(False)가 없으면 QTextBrowser가 anchorClicked 뒤에 **스스로**
+        #   setSource("cid:N")을 호출한다 — 그런 리소스는 없으니 문서는 그대로지만
+        #   프래그먼트 없는 URL이라 스크롤을 0으로 되돌려, 본문 하이라이트를 클릭한
+        #   쪽만 맨 위로 튀었다(사용자 보고 2026-07-30 — 카드 클릭은 이 경로를 타지
+        #   않아 정상이었다). 링크 처리는 _on_text_clicked가 전담한다.
+        self._source_view.setOpenLinks(False)
         self._source_view.setFrameShape(QFrame.NoFrame)
         self._source_view.setStyleSheet("background: transparent; border: none;")
         self._source_view.anchorClicked.connect(self._on_text_clicked)
@@ -664,6 +670,7 @@ class ReviewPanel(QWidget):
 
         self._preview = QTextBrowser()
         self._preview.setOpenExternalLinks(False)
+        self._preview.setOpenLinks(False)   # 원문 뷰와 동일 — 이유는 _build_source_panel 주석
         self._preview.setFrameShape(QFrame.NoFrame)
         self._preview.setStyleSheet("background: transparent; border: none;")
         self._preview.anchorClicked.connect(self._on_text_clicked)
@@ -905,14 +912,16 @@ class ReviewPanel(QWidget):
     # 공개 API
     # ══════════════════════════════════════════════
     def load(self, corrections, options, file_name="", full_text="",
-             note_lines=None):
+             footnote_lines=None):
         self._full_text = full_text or ""
-        # 각주·글상자에서 실려 온 줄의 **문자 오프셋 구간**. HWP 추출은 각주 텍스트를
-        #   본문 문장 한가운데에 실어 오므로(…'TLS 1.3' / [각주] / '을 적용해…'),
-        #   표시를 구분하지 않으면 사용자가 각주를 문장의 일부로 읽는다(사용자 보고
-        #   2026-07-30). ⚠ 추출 텍스트·오프셋은 그대로 두고 **표시만** 구분한다 —
-        #   재배열하면 등장 인덱스가 브리지 RepeatFind 순서와 어긋난다.
-        self._note_ranges = self._note_ranges_from_lines(note_lines)
+        # 각주에서 실려 온 줄의 **문자 오프셋 구간**. HWP 추출은 각주 텍스트를 본문 문장
+        #   한가운데에 실어 오므로(…'TLS 1.3' / [각주] / '을 적용해…'), 표시를 구분하지
+        #   않으면 사용자가 각주를 문장의 일부로 읽는다(사용자 보고 2026-07-30).
+        #   ⚠ 추출 텍스트·오프셋은 그대로 두고 **표시만** 구분한다 — 재배열하면 등장
+        #   인덱스가 브리지 RepeatFind 순서와 어긋난다.
+        #   ⚠ `footnote_lines`에는 **실제 각주만** 넣을 것(워커의 `note_lines`는 글상자·
+        #   표·목차까지 포함하는 다른 목록이다 — 그걸 넘기면 표지가 온 문서에 붙는다).
+        self._note_ranges = self._note_ranges_from_lines(footnote_lines)
         self._corrections = self._sort_by_position(corrections)
         self._options = options
         self._active_filter = None        # 새 문서 — 카테고리 필터 초기화
@@ -2147,47 +2156,48 @@ class ReviewPanel(QWidget):
     def _escape_text(s: str) -> str:
         return html.escape(s).replace("\n", "<br>")
 
-    def _note_ranges_from_lines(self, note_lines):
+    def _note_ranges_from_lines(self, footnote_lines):
         """각주 라인 인덱스 → `_full_text` 문자 오프셋 구간 목록.
 
-        ⚠ **'문장을 끊은' 각주만 표시한다.** note_lines에는 각주 말고 표지 글상자·목차·
-        머리말도 들어 있어(실측 1,009줄) 전부 표시하면 문서 앞부분이 온통 '[각주]'가 된다.
-        사용자가 오해한 상황은 **본문 문장 한가운데 끼어든** 경우이므로, 앞 본문 조각이
-        문장부호로 끝나지 않고 뒤에도 본문 조각이 이어지는 각주만 골라 표시한다.
+        ⚠ 인자는 **실제 각주·미주 라인만** 담긴 목록이어야 한다(브리지
+        `_classify_footnote_lines`가 `fn`/`en` ctrl로 확정한 것). 예전엔 컨트롤 텍스트
+        전부(`note_lines`)를 받아 '문장을 끊은 것만' 골라내는 휴리스틱으로 노이즈를
+        걸렀는데, 그 방식은 **글상자·표·목차에도 `[각주]` 표지를 붙였다**(사용자 보고
+        2026-07-30 — 실측 1,719줄 중 각주는 3줄). 입력이 정확해졌으므로 휴리스틱은
+        **제거**했다. 되살리지 말 것: 진짜 각주를 골라내는 일은 앞단(ctrl 식별)의 몫이다.
+
+        연속된 각주 줄은 **한 구간으로 묶어** 표지를 1개만 붙인다(사이에 낀 빈 줄은
+        묶음을 끊지 않는다 — 추출이 각주마다 경계 개행을 넣기 때문).
         """
-        if not note_lines or not self._full_text:
+        if not footnote_lines or not self._full_text:
             return []
-        want = set(note_lines)
+        want = set(footnote_lines)
         lines = self._full_text.split("\n")
         starts, pos = [], 0
         for ln in lines:
             starts.append(pos)
             pos += len(ln) + 1        # +1 = 개행
 
-        def prev_nb(i):
-            j = i - 1
-            while j >= 0 and not lines[j].strip():
-                j -= 1
-            return j
+        n_lines = len(lines)
 
-        def next_nb(i):
+        def is_note(i):
+            return i in want and bool(lines[i].strip())
+
+        out, i = [], 0
+        while i < n_lines:
+            if not is_note(i):
+                i += 1
+                continue
+            run_start = run_end = i
             j = i + 1
-            while j < len(lines) and not lines[j].strip():
+            while j < n_lines:
+                if is_note(j):
+                    run_end = j
+                elif lines[j].strip():
+                    break                      # 본문 줄 — 묶음 종료
                 j += 1
-            return j if j < len(lines) else -1
-
-        out = []
-        for i, ln in enumerate(lines):
-            if i not in want or not ln.strip():
-                continue
-            p, n = prev_nb(i), next_nb(i)
-            if p < 0 or n < 0 or p in want or n in want:
-                continue
-            before = lines[p].rstrip()
-            # 앞 조각이 문장부호로 끝나면 문장이 끊긴 게 아니다(각주가 문단 사이에 있음).
-            if not before or before[-1] in ".?!…。」’”':;":
-                continue
-            out.append((starts[i], starts[i] + len(ln)))
+            i = j                              # 다음 탐색은 묶음 뒤부터
+            out.append((starts[run_start], starts[run_end] + len(lines[run_end])))
         return out
 
     def _escape_body(self, s: str, base: int) -> str:
@@ -2195,6 +2205,10 @@ class ReviewPanel(QWidget):
 
         `base`는 이 조각이 `_full_text`에서 시작하는 오프셋이다(오프셋을 바꾸지 않으므로
         앵커·등장 인덱스에 영향 없음).
+
+        ⚠ `[각주]` 표지는 **구간의 시작(a == ns)에서만** 붙인다. 각주 안에 교정 카드가
+        있으면 그 각주가 강조 구간 앞뒤로 쪼개져 이 함수에 여러 번 들어오는데, 조각마다
+        표지를 붙이면 한 각주에 표지가 2~3개 달린다(실측: 각주 3개 문서에서 표지 4개).
         """
         if not self._note_ranges or not s:
             return self._escape_text(s)
@@ -2207,9 +2221,11 @@ class ReviewPanel(QWidget):
             a, b = max(ns, cur), min(ne, end)
             if a > cur:
                 parts.append(self._escape_text(s[cur - base:a - base]))
+            if a == ns:
+                parts.append(
+                    f'<span style="color:{pal["text_muted"]}; font-size:12px;">'
+                    f'[각주]&nbsp;</span>')
             parts.append(
-                f'<span style="color:{pal["text_muted"]}; font-size:12px;">'
-                f'[각주]&nbsp;</span>'
                 f'<span style="color:{pal["text_muted"]}; font-size:13px;">'
                 f'{self._escape_text(s[a - base:b - base])}</span>')
             cur = b

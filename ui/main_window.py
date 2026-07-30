@@ -90,7 +90,7 @@ class MainWindow(QMainWindow):
         self._corrections = []
         self._extracted_text = ""
         self._page_count = None
-        self._note_lines = []      # 각주·글상자 라인 인덱스(미리보기 표시용)
+        self._footnote_lines = []   # **실제 각주** 라인 인덱스(미리보기 [각주] 표지용)
         self._result = {}
         self._worker = None
         self._apply_worker = None
@@ -381,7 +381,7 @@ class MainWindow(QMainWindow):
         self._worker.step_changed.connect(self._on_step_changed)
         self._worker.text_extracted.connect(self._on_text_extracted)
         self._worker.page_count_extracted.connect(self._on_page_count)
-        self._worker.note_lines_extracted.connect(self._on_note_lines)
+        self._worker.footnote_lines_extracted.connect(self._on_footnote_lines)
         self._worker.finished.connect(self._on_analysis_done)
         self._worker.error.connect(self._on_error)
         self._worker.start()
@@ -397,9 +397,13 @@ class MainWindow(QMainWindow):
         """텍스트 추출 직후(분석 시작 직전) — 전체 글자 수 확보."""
         self._extracted_text = text
 
-    def _on_note_lines(self, note_lines: list):
-        """각주·글상자 라인 인덱스 — 검수 미리보기 표시용(review_panel.load에 전달)."""
-        self._note_lines = list(note_lines or [])
+    def _on_footnote_lines(self, footnote_lines: list):
+        """**실제 각주** 라인 인덱스 — 미리보기 `[각주]` 표지용(review_panel.load에 전달).
+
+        ⚠ 워커의 `note_lines_extracted`(컨트롤 텍스트 전부)를 여기에 연결하면 글상자·
+        표·목차까지 각주로 표시된다 — 그건 AI 가드용이고 표시용이 아니다.
+        """
+        self._footnote_lines = list(footnote_lines or [])
 
     def _on_page_count(self, page_count):
         """문서 총 페이지 수(없으면 None) — 완료 대시보드 대표 수치용."""
@@ -438,15 +442,18 @@ class MainWindow(QMainWindow):
             self.review_panel.load(corrections, self._options,
                                    os.path.basename(self._file_path),
                                    full_text=self._extracted_text,
-                                   note_lines=self._note_lines)
+                                   footnote_lines=self._footnote_lines)
                                    
             self._start_apply()
             return
 
         # 수동 검토 모드
+        # ⚠ footnote_lines를 빠뜨리면 미리보기 '[각주]' 표지가 통째로 사라진다(오류·로그
+        #   없이 조용히 — 실제로 그렇게 새어 나갔다). 전자동 경로와 인자 목록을 같이 볼 것.
         self.review_panel.load(corrections, self._options,
                                os.path.basename(self._file_path),
-                               full_text=self._extracted_text)
+                               full_text=self._extracted_text,
+                               footnote_lines=self._footnote_lines)
 
         # 교정 N'건'(항목)이 본문 몇 '곳'(등장)에 해당하는지 한 줄로 연결 — 검토 단계의
         #   '수락 X / Y곳' 숫자(Y=등장)가 분석의 '교정 N건'(N=항목)과 왜 다른지 설명.
@@ -788,7 +795,7 @@ class MainWindow(QMainWindow):
         self._corrections = []
         self._extracted_text = ""
         self._page_count = None
-        self._note_lines = []      # 각주·글상자 라인 인덱스(미리보기 표시용)
+        self._footnote_lines = []   # **실제 각주** 라인 인덱스(미리보기 [각주] 표지용)
         self._result = {}
         self.file_panel.set_file("")
         self.activity.clear()

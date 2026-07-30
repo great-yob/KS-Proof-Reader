@@ -234,7 +234,17 @@ def verb_inflection_lemma(text: str, eojeol: str, max_occurrences: int = 4):
     return None
 
 
-def is_known_form(word: str, exists_fn) -> bool:
+# `single_char_tail_ok=False`에서도 **정상으로 인정하는 1글자 꼬리** — 행정·기술 문서에서
+#   자유롭게 새 낱말을 만드는 '라벨 접미사'다(서비스명·분포표·결합키·보안팀·접속일·카드망).
+#   이 목록이 없으면 그런 정상 복합어가 모두 검수 카드가 된다(실측 3문서 순증 9/2/5건 중
+#   대부분이 이 부류였다). ⚠ 이 규칙은 **낱말 전체가 미등재일 때만** 발동하므로, 등재어
+#   ('도서관'·'박물관')는 애초에 이 경로에 오지 않는다 — 그래서 '관'은 넣지 않는다.
+#   목록을 늘릴 때는 반드시 실문서 순증을 재측정할 것(늘리면 미탐이 늘어난다).
+_LABEL_SUFFIX_1 = frozenset(
+    "명표값키팀망일별용형율률급서처법점량회차료액비세층권호식")
+
+
+def is_known_form(word: str, exists_fn, *, single_char_tail_ok: bool = True) -> bool:
     """word가 '사전 등재어들의 활용/복합 형태'인가? (탐지용 — 관대)
 
     원칙: **미등재 '내용 명사(NNG/NNP)·어근(XR)·용언 어간(VV/VA/VX)' 이 있을 때만**
@@ -249,6 +259,14 @@ def is_known_form(word: str, exists_fn) -> bool:
     내용 형태소가 하나도 없으면(순수 문법형) True. 분석 실패/미설치 시 False.
 
     exists_fn(base) -> bool : 사전 등재 여부 콜백 (nikl_dict.lookup_word 등)
+
+    ★`single_char_tail_ok=False`면 **끝이 1글자 NNG/NNP인 분해는 정상으로 인정하지
+    않는다**(False). 위 '1글자는 조회 제외' 규칙의 사각을 막기 위한 것 — 표제어에 없는
+    낱말이 '등재어 + 1글자 명사'로 쪼개지면 그 1글자가 검사에서 빠져 **무조건 정상**이
+    돼 버린다. 실측(사용자 보고 2026-07-30): 오타 `재산관`('재산과'의 오타)이
+    `재산/NNG + 관/NNG`으로 분해돼 미등재인데도 의심어에서 빠졌다. 미등재 낱말을
+    걸러내는 **스크리닝 게이트에서만** 쓸 것 — 가드·재검증 경로는 관대해야 한다
+    (거기서 엄격해지면 정상 복합어를 저신뢰로 강등한다).
     """
     kiwi = _get_kiwi()
     if kiwi is None or not word:
@@ -259,6 +277,17 @@ def is_known_form(word: str, exists_fn) -> bool:
         return False
     if not tokens:
         return False
+    if not single_char_tail_ok:
+        # ⚠ **명사 복합어 모양일 때만** 발동한다(앞 형태소가 전부 NNG/NNP/XR).
+        #   낱말을 문맥 없이 분석하면 kiwi가 **용언 활용형을 관형사+명사로 오분석**한다
+        #   — 실측 '세울'(세우다+ㄹ, "계획을 세울 여유")→`세/MM + 울/NNG`,
+        #   '이룰'→`이/MM + 룰/NNG`. 이 제한이 없으면 정상 활용형이 오탈자 카드가 된다
+        #   (이 저장소가 이미 고친 부류 — '세울·없는지·국인' 3종 회귀).
+        last = tokens[-1]
+        if (last.tag in ("NNG", "NNP") and len(last.form) == 1
+                and len(tokens) >= 2 and last.form not in _LABEL_SUFFIX_1
+                and all(t.tag in ("NNG", "NNP", "XR") for t in tokens[:-1])):
+            return False
     for t in tokens:
         tag = t.tag
         if tag in ("NNG", "NNP") or tag == "XR":

@@ -1309,6 +1309,25 @@ def _shares_syllable(a: str, b: str) -> bool:
     return bool(set(a) & set(b))
 
 
+def _verb_lemma_single(token: str):
+    """토큰이 **단일 용언 활용형**이면 기본형('통해서'→'통하다'), 아니면 None.
+
+    내용 형태소가 딱 하나이고 그것이 용언(V)일 때만 돌려준다 — 복합어('제공하고'=
+    제공/NNG+하/XSV…)나 명사는 None이라 호출부의 어간 비교 경로를 타지 않는다.
+    형태소 분석 미설치·실패 시 None(현행 동작 유지).
+    """
+    if not token:
+        return None
+    try:
+        from core import morph as _m
+        bases = _m.analyze_bases(token)
+    except Exception:
+        return None
+    if len(bases) == 1 and bases[0][1] == "V" and len(bases[0][0]) >= 3:
+        return bases[0][0]
+    return None
+
+
 def _is_word_swap(o_tok: str, c_tok: str, exists_fn) -> bool:
     """토큰 치환 (o_tok→c_tok)이 '오타 교정'이 아니라 '유효 단어의 유의어 치환'인가?
 
@@ -1331,6 +1350,21 @@ def _is_word_swap(o_tok: str, c_tok: str, exists_fn) -> bool:
     ob, cb = _strip_josa(o), _strip_josa(cc)
     if not ob or not cb or ob == cb:
         return False
+    # ★용언 활용형은 **어미가 음절을 공유해** 표면 비교가 무력해진다 — '통해서'→'거쳐서'는
+    #   전혀 다른 낱말(통하다/거치다)인데 어미 '서'를 공유해 아래 _shares_syllable에서
+    #   '오탈자'로 통과했다(사용자 보고 2026-07-30: `표준어`·high로 올라왔다).
+    #   둘 다 **단일 용언 활용형**이면 표면이 아니라 **기본형 어간**으로 판정한다.
+    #   ⚠ 한쪽이라도 기본형을 못 얻으면 이 경로는 건너뛴다(현행 동작 유지) — 그래서
+    #   '되어졌다'→'되었다'(이중피동)·'재고된다'→'제고된다'(어휘 교정)는 영향 없다(실측).
+    lo, lc = _verb_lemma_single(o), _verb_lemma_single(cc)
+    if lo and lc and lo != lc:
+        so, sc = lo[:-1], lc[:-1]                 # 기본형에서 '다' 제거 = 어간
+        if (so and sc and not _shares_syllable(so, sc)
+                and _jamo_distance(so, sc) >= 3):
+            try:
+                return bool(exists_fn(lo) and exists_fn(lc))
+            except Exception:
+                return False
     if _shares_syllable(ob, cb):                  # 음절 공유 → 오탈자/최소대립쌍
         return False
     if _jamo_distance(ob, cb) < 3:                # 자모거리 근소 → 오탈자
@@ -1456,3 +1490,254 @@ def drop_destandardizing_variant(corrections: list, exists_fn, logger=None):
         logger(f"  → 반표준화 AI 교정 {dropped}건 제외 "
                f"(등재 표준형→미등재 근접변이 — 사이시옷/받침 되돌림)")
     return kept
+
+
+# ══════════════════════════════════════════════════════════
+# ▌㉔ 저자가 정의한 약칭 보호 — '(이하 가나다원)' 선언어는 교정 대상이 아니다
+# ══════════════════════════════════════════════════════════
+# 사용자 보고 2026-07-30(실파일: 복지지갑 연구): 본문 첫머리가
+#   `한국가나다연구원(이하 가나다원)은 …`
+# 으로 약칭을 **명시 선언**했는데, AI가 '가나다원이'→'가나다연구원이' 교정을 냈고
+# 일관성 패스 Case A(조사 변형)가 그것을 bare형 '가나다원'으로 전파해 **46곳 전부**가
+# 교정 카드가 됐다. 확장형('가나다연구원')은 저자가 고른 약칭도 아니고 정식 명칭
+# ('한국가나다연구원')도 아니어서 어느 쪽으로도 옳지 않다.
+#
+# ⚠ **기존 빈출 미등재어 가드로는 막히지 않는다** — 그 가드는 워커 [6] '사전 안전망'의
+# dict_flag 카드에만 걸리고, AI 생성 교정에는 적용되지 않는다. 오히려 AI가 그 낱말을
+# 다뤘다는 사실이 안전망의 `covered` 판정을 통과시켜 사전 쪽 판단을 아예 건너뛰게 했다.
+# 그래서 **AI 단계에서** 막아야 한다(일관성 전파 [4.5] 앞 = 워커 [3]).
+#
+# 원리: 약칭 선언은 저자의 표기 결정이므로, 선언된 형태는 그 자체로 정답이다.
+# 판정은 결정론이고 **드롭만** 한다(교정값을 고치지 않는다 — 확장이 옳은지 알 수 없다).
+# 약칭 **자체의 오타**('사보윈')는 original이 선언형과 다르므로 영향받지 않는다.
+_ABBREV_DECL_RE = re.compile(
+    r"[(（\[]\s*(?:이하|약칭|줄여(?:서)?|통칭)\s*"
+    r"[\'\"‘“「『]?\s*([가-힣A-Za-z0-9]{2,20})\s*[\'\"’”」』]?"
+    r"(?:\s*(?:이?라\s*(?:고\s*)?(?:한다|함|칭한다|부른다)|으?로\s*(?:표기|칭함|한다)))?"
+    r"\s*[)）\]]")
+
+
+def author_defined_abbreviations(document_text: str) -> frozenset:
+    """문서에서 저자가 선언한 약칭 집합. '(이하 가나다원)' → {'가나다원'}.
+
+    괄호 안 선언만 본다 — 괄호 없는 '이하 …'는 평문에서 흔해 오검출이 크다.
+    """
+    if not document_text:
+        return frozenset()
+    out = set()
+    for m in _ABBREV_DECL_RE.finditer(document_text):
+        w = (m.group(1) or "").strip()
+        if len(w) >= 2:
+            out.add(w)
+    return frozenset(out)
+
+
+def drop_author_defined_abbrev_expansion(ai_list: list, document_text: str,
+                                        logger=None):
+    """㉔ 저자가 '(이하 X)'로 선언한 약칭 X를 다른 표기로 바꾸는 AI 교정을 제외한다.
+
+    ai_typo·ai_polish 단일 낱말 카드만 대상. 반환: 걸러낸 리스트(원본 미변경).
+    """
+    if not ai_list or not document_text:
+        return ai_list
+    abbrevs = author_defined_abbreviations(document_text)
+    if not abbrevs:
+        return ai_list
+    try:
+        from core.consistency_pass import _strip_josa
+    except Exception:
+        _strip_josa = lambda w: w
+    kept, dropped, hit = [], 0, set()
+    for c in ai_list:
+        orig = (c.original or "").strip()
+        corr = (c.corrected or "").strip()
+        if (c.source in ("ai_typo", "ai_polish") and orig and corr != orig):
+            base = (_strip_josa(orig) or orig).replace(" ", "")
+            if base in abbrevs:
+                dropped += 1
+                hit.add(base)
+                continue
+        kept.append(c)
+    if logger and dropped:
+        names = " · ".join(sorted(hit)[:3])
+        logger(f"  → 저자 선언 약칭 AI 교정 {dropped}건 제외 "
+               f"('(이하 …)'로 저자가 정의한 표기: {names})")
+    return kept
+
+
+# ══════════════════════════════════════════════════════════
+# ▌㉕ 문법·표현 재구성 AI 교정 강등 — '오탈자·띄어쓰기' 경계를 넘은 것은 high 금지
+# ══════════════════════════════════════════════════════════
+# 사용자 보고 2026-07-30(실파일: 복지지갑 연구). 아래 5건이 전부 `맞춤법` · **high**로
+# 나왔다 — 즉 자동 적용 대상이었다:
+#   · '결제하는 기능은' → '결제 기능은'            (사유: 어색한 표현 정비)
+#   · '카드 신청이 되면' → '카드가 신청되면'        (사유: 조사를 바꿔 자연스럽게 연결)
+#   · '방향이 전제로 되어야' → '방향을 전제로 해야'  (사유: 문장 호응 관계 교정)
+#   · '… 문제가 아닌' → '… 문제가 아니라'          (사유: 주격 조사 보완·어미 교정)
+#   · '보관을 원칙으로 하며' → '보관하는 것을 …'     (사유: 문장 구성의 매끄러움)
+# 이들은 오탈자도 띄어쓰기도 아니라 **문장 구조·문법 형태소를 바꾸는 편집 판단**이다.
+# 맞고 틀림이 문맥에 달려 있어 편집자가 봐야 하고, 카테고리도 `맞춤법`이 아니다.
+#
+# ⚠ 기존 강등 가드가 전부 사각이었다: 사유에 '문맥/맥락'(㉓)·헤지 표현·'관례/관용'이
+# 없고, 낱말 치환도 아니어서 [K]·[T]·[U]·[V] 어느 것도 발동하지 않는다. 사유 **문구**로
+# 잡으려는 시도는 AI 표현이 매번 달라 깨지므로, **구조로** 판정한다.
+#
+# 판정(결정론·강등만·글자 미변경):
+#   ① 공백 제거 후 글자가 같으면 → 띄어쓰기 교정이므로 **면제**(다른 계층 소관).
+#   ② 어절 수가 달라지면 → 낱말을 넣거나 뺐다 → 강등.
+#   ③ **문법 형태소의 태그 열**(조사 J*/어미 E*/파생접미사 XS*/지정사 VC*)이 달라지면
+#      → 문법 골격을 바꿨다 → 강등.
+# ⚠ **태그 열**로 비교하는 것이 핵심이다(form+tag로 비교하면 '사용율'→'사용률'처럼
+#   접미사 **철자**만 고친 정상 교정까지 걸린다 — 실측). 반대로 태그가 같은 조사 교체
+#   ('카드이'→'카드가' 받침 호응)는 정상 맞춤법이라 발동하지 않는 게 맞다.
+# ⚠ 알려진 과강등 1종(수용): 앞말이 받침 없는 '…이'를 kiwi가 지정사(VCP)로 읽어
+#   '카드이 신청되면'→'카드가 신청되면'류가 강등될 수 있다. 강등은 억제 방향이라
+#   안전하고(자동 적용만 막고 카드는 남는다), 받침 호응 조사 교정은 결정론 finder가
+#   별도 source로 담당한다.
+_GRAM_TAG_PREFIX = ("J", "E")                          # 조사 · 어미(ETM/ETN 포함)
+_GRAM_TAG_EXACT = ("XSV", "XSA", "XSN", "VCP", "VCN")   # 파생접미사 · 지정사
+
+
+def _gram_tag_seq(s: str):
+    """문법 형태소의 **태그 열**. 형태소 분석이 안 되면 None(판정 보류)."""
+    from core import morph as _m
+    if not _m.available():
+        return None
+    kiwi = _m._get_kiwi()
+    if kiwi is None:
+        return None
+    try:
+        tokens = kiwi.analyze(s)[0][0]
+    except Exception:
+        return None
+    return [t.tag for t in tokens
+            if t.tag.startswith(_GRAM_TAG_PREFIX) or t.tag in _GRAM_TAG_EXACT]
+
+
+def _is_grammar_restructuring(original: str, corrected: str) -> bool:
+    o, c = (original or "").strip(), (corrected or "").strip()
+    if not o or not c or o == c:
+        return False
+    if o.replace(" ", "") == c.replace(" ", ""):
+        return False                      # ① 띄어쓰기만 — 면제
+    if len(o.split()) != len(c.split()):
+        return True                       # ② 어절 수 변화
+    a, b = _gram_tag_seq(o), _gram_tag_seq(c)
+    if a is None or b is None:
+        return False                      # 형태소 분석 불가 → 보류(현행 동작)
+    return a != b                         # ③ 문법 골격 변화
+
+
+def demote_grammar_restructuring(corrections: list, logger=None) -> list:
+    """㉕ 문법 골격·어절 구성을 바꾸는 AI 교정을 low로 강등한다(제자리 수정 후 반환).
+
+    오탈자(내용 형태소 철자)·띄어쓰기는 건드리지 않는다.
+    """
+    demoted = 0
+    for c in corrections:
+        if (c.source in ("ai_typo", "ai_polish") and c.confidence != "low"
+                and _is_grammar_restructuring(c.original, c.corrected)):
+            c.confidence = "low"
+            if not (c.reason or "").startswith("[검수]"):
+                c.reason = ("[검수] " + (c.reason or "")
+                            + " (오탈자·띄어쓰기 범위를 넘는 문법·표현 재구성 — 검토 필요)")
+            demoted += 1
+    if logger and demoted:
+        logger(f"  → 문법·표현 재구성 AI 교정 {demoted}건 검수 카드로 강등 "
+               "(조사·어미·어절 구성 변경 — 자동 적용 제외)")
+    return corrections
+
+
+# ══════════════════════════════════════════════════════════
+# ▌㉖ 낱말 삭제 AI 교정 강등 — '중복'인지 '저자 의도'인지 규칙으로 판단 불가
+# ══════════════════════════════════════════════════════════
+# 사용자 보고 2026-07-30(실파일: 복지지갑 연구):
+#   원문 '인증위험 기반 인증의 도입은' → 교정 '위험 기반 인증의 도입은'
+#   사유 "중복된 단어의 오탈자('인증')를 바로잡음"  · 카테고리 `맞춤법` · **high**
+# AI는 '인증위험'의 '인증'을 중복으로 보고 지웠지만, '인증 위험'(authentication risk)이
+# 저자가 쓴 전문용어인지 정말 중복 오타인지는 **문맥으로만 알 수 있다**. 자동 적용하면
+# 저자의 용어가 조용히 사라진다.
+#
+# ⚠ 기존 그물 전부 사각(실측): ㉕(문법 재구성)은 어절 수(4→4)와 문법 태그 열이 같아
+# 미발동 — 지워진 '인증'은 **내용** 형태소다. [K] 단어교체는 `'위험' in '인증위험'`이라
+# 첫 줄 `if o in cc or cc in o: return False`(조사·병기 추가/삭제로 간주)에서 빠진다.
+# ㉓ '문맥상' 강등은 사유에 '문맥/맥락'이 없어 미발동(사유는 "중복된 단어의 오탈자").
+#
+# 판정(결정론·강등만·글자 미변경):
+#   ① 공백 제거 후 같으면 면제(띄어쓰기).
+#   ② **내용 형태소 열이 '삭제만'으로 얻어질 때**(치환·추가가 섞이면 대상 아님).
+#      ⚠ 삭제 전용인 것이 중요하다 — kiwi는 미등재 오타를 통째 1형태소로 보다가 교정 후
+#        쪼개므로('상담채녈'→'상담/채널') '개수 변화'로 보면 정상 오탈자가 걸린다.
+#   ③ 단, 지워진 낱말이 **바로 옆 낱말과 완전히 같으면**(그리고 그리고 → 그리고) 명백한
+#      중복 오타이므로 강등하지 않는다. 판단 불가인 것만 검수로 넘긴다.
+def _content_morph_forms(s: str):
+    """내용 형태소의 form 열(조사·어미·파생접미사·지정사 제외). 분석 불가면 None."""
+    from core import morph as _m
+    if not _m.available():
+        return None
+    kiwi = _m._get_kiwi()
+    if kiwi is None:
+        return None
+    try:
+        tokens = kiwi.analyze(s)[0][0]
+    except Exception:
+        return None
+    return [t.form for t in tokens
+            if not (t.tag.startswith(_GRAM_TAG_PREFIX) or t.tag in _GRAM_TAG_EXACT)]
+
+
+def _deleted_indices(src: list, dst: list):
+    """dst가 src에서 항목을 **삭제만** 해서 얻어지면 삭제된 인덱스 목록, 아니면 None."""
+    i = j = 0
+    dels = []
+    while i < len(src) and j < len(dst):
+        if src[i] == dst[j]:
+            i += 1
+            j += 1
+        else:
+            dels.append(i)
+            i += 1
+    if j != len(dst):
+        return None                    # 치환·추가가 섞였다 → 이 가드 대상 아님
+    dels += list(range(i, len(src)))
+    return dels
+
+
+def _is_undecidable_word_deletion(original: str, corrected: str) -> bool:
+    o, c = (original or "").strip(), (corrected or "").strip()
+    if not o or not c or o == c:
+        return False
+    if o.replace(" ", "") == c.replace(" ", ""):
+        return False
+    of, cf = _content_morph_forms(o), _content_morph_forms(c)
+    if of is None or cf is None or not cf or len(cf) >= len(of):
+        return False
+    dels = _deleted_indices(of, cf)
+    if not dels:
+        return False
+    for idx in dels:
+        prev_f = of[idx - 1] if idx > 0 else None
+        next_f = of[idx + 1] if idx + 1 < len(of) else None
+        if of[idx] not in (prev_f, next_f):
+            return True                # 인접 완전중복이 아니다 → 판단 불가
+    return False                       # 전부 인접 완전중복 → 명백한 중복 오타
+
+
+def demote_word_deletion(corrections: list, logger=None) -> list:
+    """㉖ 내용 낱말을 지우는 AI 교정을 low로 강등한다(제자리 수정 후 반환).
+
+    인접 완전중복 삭제('그리고 그리고'→'그리고')는 명백한 오타이므로 제외한다.
+    """
+    demoted = 0
+    for c in corrections:
+        if (c.source in ("ai_typo", "ai_polish") and c.confidence != "low"
+                and _is_undecidable_word_deletion(c.original, c.corrected)):
+            c.confidence = "low"
+            if not (c.reason or "").startswith("[검수]"):
+                c.reason = ("[검수] " + (c.reason or "")
+                            + " (낱말 삭제 — 중복인지 저자 의도인지 판단 불가, 검토 필요)")
+            demoted += 1
+    if logger and demoted:
+        logger(f"  → 낱말 삭제 AI 교정 {demoted}건 검수 카드로 강등 "
+               "(중복 여부는 문맥 판단 — 자동 적용 제외)")
+    return corrections

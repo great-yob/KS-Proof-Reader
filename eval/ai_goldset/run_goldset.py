@@ -289,7 +289,9 @@ def phase_a_doc_dict():
     # drop_word_substitution_paraphrase: 문맥 윤문의 '단어 교체'(하에→아래) 차단 —
     #   조사 추가·오탈자·최소대립쌍은 보존. 실 사전이 필요해 _WDICT로 등재 여부 모사.
     _WDICT = {"하", "아래", "위험", "리스크", "몇일", "며칠", "역활", "역할",
-              "지향", "지양", "정부", "정책"}
+              "지향", "지양", "정부", "정책",
+              # 용언 기본형 — 어미가 음절을 공유하는 유의어 치환 판정용(아래 ws_cases)
+              "통하다", "거치다", "되다", "제공하다", "이용하다", "활용하다"}
     w_exists = lambda w: (len(w) < 2) or (w in _WDICT)   # lookup_word의 1글자 자동-True 모사
     ws_cases = [
         # (원문, 교정, 기대_제외)
@@ -301,6 +303,12 @@ def phase_a_doc_dict():
         ("몇일 후", "며칠 후", False),             # 오탈자(자모2) 보존
         ("역활 분담", "역할 분담", False),         # 오탈자(공유 '역') 보존
         ("지향 한다", "지양 한다", False),         # 최소대립쌍 보존
+        # ★용언 활용형 유의어 치환(2026-07-30 보고) — 어미 '서'를 공유해 표면 비교로는
+        #   오탈자로 통과했다. 어간(통하/거치) 비교로 잡는다.
+        ("재배열 과정을 통해서", "재배열 과정을 거쳐서", True),
+        # 무발화: 한쪽이 단일 용언이 아니거나 기본형을 못 얻는 경우는 현행 동작 유지
+        ("되어졌다", "되었다", False),             # 이중피동 교정 — 보존
+        ("정보를 제공하고", "정보를 제공하며", False),  # 복합용언(제공+하) → 경로 미진입
     ]
     for o, c, expect_drop in ws_cases:
         cor = Correction(original=o, corrected=c, reason="r", source="ai_typo",
@@ -452,6 +460,82 @@ def phase_a_norm_guard():
             fails += 1
             print(f"  ✗ FAIL [온용어거부권] {word!r} 기대거부={exp} 실제={got}")
     n = len(cases) + len(veto_cases)
+    print(f"  → {n - fails}/{n} 통과" + ("  ✅" if fails == 0 else "  ❌"))
+    return fails
+
+
+def phase_a_grammar_demote():
+    """㉕ 문법·표현 재구성 AI 교정 강등 가드(kiwi) — 발화/무발화 양방향.
+
+    실파일 보고 5건(오탈자·띄어쓰기 경계를 넘은 AI 문맥 교정이 전부 high로 나옴)을
+    회귀 케이스로 고정한다. **무발화 쪽이 더 중요하다** — 정상 오탈자·띄어쓰기 교정을
+    강등하면 자동 적용이 통째로 무력해진다.
+    """
+    print("Phase A++++ — 문법·표현 재구성 강등 가드 (kiwi)")
+    fails = 0
+    demote_cases = [   # 강등돼야 함(사용자 보고 2026-07-30, 실파일 10)
+        ("결제하는 기능은 「전자금융거래법」상 전자금융업에 속한다.",
+         "결제 기능은 「전자금융거래법」상 전자금융업에 속한다."),
+        ("행복이음에서 카드 신청이 되면", "행복이음에서 카드가 신청되면"),
+        ("부과하지 않는 방향이 전제로 되어야 할 필요가 있다.",
+         "부과하지 않는 방향을 전제로 해야 할 필요가 있다."),
+        ("이때 복지 멤버십 제안하는 양의 문제가 아닌",
+         "이때 복지멤버십이 제안하는 양의 문제가 아니라"),
+        ("보관을 원칙으로 하며", "보관하는 것을 원칙으로 하며"),
+    ]
+    keep_cases = [     # high 유지돼야 함(오탈자=내용 형태소 철자 / 띄어쓰기)
+        ("상담채녈", "상담채널"), ("컨텐츠", "콘텐츠"), ("메세지를", "메시지를"),
+        ("어플리케이션", "애플리케이션"), ("데이타베이스에", "데이터베이스에"),
+        ("수용성이 재고된다", "수용성이 제고된다"),
+        ("사용율", "사용률"),                    # 접미사 '철자'만 — form 비교면 오발화
+        ("복지 지갑", "복지지갑"), ("이상거래탐지", "이상거래 탐지"),
+        ("행상활동", "행상 활동"),
+    ]
+    for o, c in demote_cases:
+        cor = Correction(original=o, corrected=c, reason="교정", source="ai_typo",
+                         color=HL_TYPO, confidence="high")
+        ai_guards.demote_grammar_restructuring([cor])
+        if cor.confidence != "low":
+            fails += 1
+            print(f"  ✗ FAIL [강등 누락] {o[:30]!r} → {c[:30]!r}")
+    for o, c in keep_cases:
+        cor = Correction(original=o, corrected=c, reason="교정", source="ai_typo",
+                         color=HL_TYPO, confidence="high")
+        ai_guards.demote_grammar_restructuring([cor])
+        if cor.confidence != "high":
+            fails += 1
+            print(f"  ✗ FAIL [과강등] {o!r} → {c!r}")
+    # 타 source(결정론 finder)는 건드리지 않는다
+    det = Correction(original="가족관계", corrected="가족 관계", reason="", source="spacing",
+                     color=HL_TYPO, confidence="high")
+    ai_guards.demote_grammar_restructuring([det])
+    if det.confidence != "high":
+        fails += 1
+        print("  ✗ FAIL [타 source 강등] source=spacing 이 강등됐다")
+
+    # ㉖ 낱말 삭제 강등 — 중복인지 저자 의도인지 판단 불가한 삭제만 강등한다.
+    del_cases = [
+        # (원문, 교정, 강등기대)
+        ("인증위험 기반 인증의 도입은", "위험 기반 인증의 도입은", True),   # 보고 2026-07-30
+        ("LH 주택공사의 사업", "LH의 사업", True),                      # 중복어 삭제
+        ("그리고 그리고 이어서", "그리고 이어서", False),                 # 인접 완전중복 = 명백한 오타
+        ("정보를 정보를 제공한다", "정보를 제공한다", False),              # 인접 완전중복
+        ("상담채녈을", "상담채널을", False),      # kiwi 분절 변화(1→2) — 삭제 아님
+        ("컨텐츠를", "콘텐츠를", False),          # 철자만
+        ("복지 지갑", "복지지갑", False),         # 띄어쓰기만
+        ("이상거래탐지", "이상거래 탐지", False),  # 띄어쓰기만
+        ("수용성이 재고된다", "수용성이 제고된다", False),   # 철자만
+        ("보관을 원칙으로 하며", "보관하는 것을 원칙으로 하며", False),  # 추가(삭제 아님)
+    ]
+    for o, c, expect in del_cases:
+        cor = Correction(original=o, corrected=c, reason="교정", source="ai_typo",
+                         color=HL_TYPO, confidence="high")
+        ai_guards.demote_word_deletion([cor])
+        got = (cor.confidence == "low")
+        if got != expect:
+            fails += 1
+            print(f"  ✗ FAIL [낱말삭제] {o!r}→{c!r} 기대강등={expect} 실제={got}")
+    n = len(demote_cases) + len(keep_cases) + 1 + len(del_cases)
     print(f"  → {n - fails}/{n} 통과" + ("  ✅" if fails == 0 else "  ❌"))
     return fails
 
@@ -1203,6 +1287,7 @@ def main():
     a_fails += phase_a_doc_dict()
     a_fails += phase_a_norm_guard()
     a_fails += phase_a_spacing_guard()
+    a_fails += phase_a_grammar_demote()
     a_fails += phase_f_realword()
     a_fails += phase_g_junction()
     a_fails += phase_d_rules()

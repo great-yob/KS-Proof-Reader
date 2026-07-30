@@ -44,9 +44,14 @@ class ProofreadingWorker(QThread):
     error       = Signal(str)         # 에러 메시지
     text_extracted = Signal(str)      # 추출된 원문 텍스트
     page_count_extracted = Signal(object)  # 문서 총 페이지 수(int) 또는 None
-    # 각주·글상자에서 실려 온 라인 인덱스 — 미리보기가 그 줄을 '각주'로 표시해
-    #   본문 문장 한가운데 낀 각주를 사용자가 문장의 일부로 오해하지 않게 한다.
+    # ⚠ 두 목록은 **범위가 다르다. 서로 대체하지 말 것.**
+    #   note_lines     = 컨트롤 텍스트 **전부**(각주·미주·글상자·표·목차·머리말).
+    #                    AI 앞덧붙임 가드 ⑱가 쓴다 — 넓을수록 보호가 두텁다.
+    #   footnote_lines = 그중 **실제 각주·미주**만(`fn`/`en` ctrl로 확정). 미리보기
+    #                    `[각주]` 표지 전용 — note_lines로 그리면 조판부호가 붙은 모든
+    #                    항목에 표지가 달린다(사용자 보고 2026-07-30, 실측 1,719 vs 3).
     note_lines_extracted = Signal(list)
+    footnote_lines_extracted = Signal(list)
 
     def __init__(self, file_path: str, options: dict, parent=None):
         super().__init__(parent)
@@ -82,6 +87,7 @@ class ProofreadingWorker(QThread):
             #   분류만 받는다(이유는 hwp_bridge_worker._classify_note_lines 주석).
             #   ⚠ 아래 NFC 정규화는 개행을 가감하지 않으므로 라인 인덱스가 유지된다.
             note_lines = getattr(editor, "last_note_lines", None) or []
+            footnote_lines = getattr(editor, "last_footnote_lines", None) or []
         finally:
             try:
                 editor.close()
@@ -112,9 +118,12 @@ class ProofreadingWorker(QThread):
         self.text_extracted.emit(text)
         self.page_count_extracted.emit(page_count)
         self.note_lines_extracted.emit(list(note_lines))
+        self.footnote_lines_extracted.emit(list(footnote_lines))
         if note_lines:
-            log(f"  각주·글상자 {len(note_lines)}줄 식별 — 본문 문장을 쪼갠 자리는"
-                " 미리보기에 '각주'로 표시하고 AI 덧붙임 오탐을 차단합니다.")
+            log(f"  각주·글상자 등 컨트롤 {len(note_lines)}줄 식별 — 본문 문장을 쪼갠"
+                " 자리의 AI 덧붙임 오탐을 차단합니다.")
+        if footnote_lines:
+            log(f"  그중 실제 각주 {len(footnote_lines)}줄 — 미리보기에 '각주'로 표시합니다.")
         self.progress.emit(8, "텍스트 추출 완료")
 
         # [2] 사전 인프라 준비 + 1차 원문 스크리닝 (항상 ON — 사전이 기본 베이스)
@@ -341,6 +350,12 @@ class ProofreadingWorker(QThread):
             #   정체가 고정된 명칭을 다른 명칭('산업통상자원부')으로 개명하는 AI 과교정
             #   차단(2026-07-14 보고, 자모거리≥4 + 병기 앵커).
             ai_list = ai_guards.drop_glossed_name_substitution(ai_list, text, logger=log)
+            # 저자 선언 약칭 보호 — '한국가나다연구원(이하 가나다원)'처럼 저자가 괄호로
+            #   정의한 약칭은 저자의 표기 결정이라 교정 대상이 아니다. ⚠ 반드시 [4.5]
+            #   일관성 전파 **앞**에 둘 것 — 뒤에 두면 조사형 씨앗 하나가 bare형으로
+            #   퍼져 46곳 전부가 카드가 된다(사용자 보고 2026-07-30).
+            ai_list = ai_guards.drop_author_defined_abbrev_expansion(
+                ai_list, text, logger=log)
             # 괄호 뒤 조사 받침 호응 보정 — AI가 조사 교체(격 판단)는 맞게 잡고 받침 형태를
             #   틀린 경우('가시성(visibility)가'→AI '…를') 괄호 앞 체언(가시성, 받침 ㅇ)에
             #   호응시켜 '을'로 보정(find_paren_josa와 동일 원칙의 결정론 fix-up, 2026-07-06).
@@ -361,6 +376,16 @@ class ProofreadingWorker(QThread):
             #   옛 명칭으로 되돌린다('성평등가족부장관'→'여성가족부장관', 2026-07-21 보고).
             #   기관명 치환은 표기 교정이 아니라 사실 편집 → 자동 적용 금지, 편집자 검수.
             ai_list = ai_guards.demote_org_name_substitution(ai_list, logger=log)
+            # 문법·표현 재구성 강등 — 조사·어미·어절 구성을 바꾸는 교정은 오탈자·띄어쓰기
+            #   경계를 넘은 편집 판단이라 high(자동 적용)로 두면 안 된다('결제하는 기능은'→
+            #   '결제 기능은', '방향이 전제로 되어야'→'방향을 전제로 해야', 2026-07-30 보고).
+            #   ⚠ 사유 문구가 아니라 **구조**로 판정한다(상세는 ai_guards ㉕ 주석).
+            #   Case A 변형이 confidence를 복사하므로 반드시 [4.5] 일관성 전파 앞.
+            ai_list = ai_guards.demote_grammar_restructuring(ai_list, logger=log)
+            # 낱말 삭제 강등 — '인증위험 기반'→'위험 기반'처럼 내용 낱말을 지우는 교정은
+            #   중복 오타인지 저자의 전문용어인지 규칙으로 판단할 수 없다(2026-07-30 보고).
+            #   인접 완전중복('그리고 그리고'→'그리고')만 명백한 오타로 보고 high 유지.
+            ai_list = ai_guards.demote_word_deletion(ai_list, logger=log)
         elif not opts.get("use_ai", True):
             log("  [AI] AI 분석 제외 모드 — Gemini 호출 없이 사전·규칙 검사만 수행합니다.")
         self.progress.emit(70, "AI 분석 완료" if opts.get("use_ai", True)
@@ -805,6 +830,14 @@ class ProofreadingWorker(QThread):
                 _ud_exc = frozenset()
             excepted = 0
             skipped_freq = 0
+            # 저자 선언 약칭('(이하 가나다원)')도 검수 카드에서 뺀다 — 미등재라도 저자가
+            #   정의한 표기다. 빈출 가드가 대개 함께 잡지만, 선언만 하고 2회 이하만
+            #   쓰인 약칭은 빈출 가드를 통과하므로 여기서 명시적으로 막는다.
+            try:
+                _abbrevs = ai_guards.author_defined_abbreviations(text)
+            except Exception:
+                _abbrevs = frozenset()
+            skipped_abbrev = 0
             # 빈도 가드 — 문서에서 여러 번 반복되는 미등재어는 작가 의도 용어
             #   (외래어·전문용어·고유명사·브랜드명)일 확률이 압도적이다(사용자 보고
             #   #2: '바이오' 16회). 진짜 오탈자는 보통 1~2회에 그치고, 빈출어는 AI가
@@ -828,6 +861,10 @@ class ProofreadingWorker(QThread):
                 _fbase = _freq_strip(clean) or clean
                 if clean and max(text.count(clean), text.count(_fbase)) >= _FREQ_INTENTIONAL:
                     skipped_freq += 1
+                    continue
+                # 저자가 '(이하 …)'로 선언한 약칭 → 저자 표기이므로 카드 제외
+                if _abbrevs and (clean in _abbrevs or _fbase in _abbrevs):
+                    skipped_abbrev += 1
                     continue
                 # 따옴표로 영문과 붙은 한글 오타(예: 캐나가"Say)는 혼합 토큰이라 필터가
                 #   통째로 제외했다 → **따옴표가 섞인 경우에만** 한글 런만 떼어 검사·표시한다.
@@ -872,6 +909,9 @@ class ProofreadingWorker(QThread):
             if skipped_freq:
                 log(f"  → 빈출 미등재어 {skipped_freq}건 검수 카드 제외 "
                     f"(반복 {_FREQ_INTENTIONAL}회+ = 작가 의도 용어로 판단)")
+            if skipped_abbrev:
+                log(f"  → 저자 선언 약칭 {skipped_abbrev}건 검수 카드 제외 "
+                    f"('(이하 …)' 정의 표기)")
             if net:
                 merged.extend(net)
                 det_review.append(("사전안전망", len(net)))
@@ -1297,19 +1337,16 @@ class ProofreadingWorker(QThread):
                 except Exception:
                     _jp_exc = frozenset()
                 jd = _jp.resolve(merged, text, logger=log, exception_set=_jp_exc)
-                if jd.get("conflicts"):
-                    parts = []
-                    if jd["preserved"]:
-                        parts.append(f"정당한 구분 유지 {jd['preserved']}쌍")
-                    if jd["harmonized"]:
-                        parts.append(f"자동 정합 {jd['harmonized']}건")
-                    if jd["grouped"]:
-                        parts.append(f"사용자 결정 그룹 {jd['grouped']}개")
-                    log(f"  → 이음매 정합: 중첩 충돌 {jd['conflicts']}쌍 — "
-                        + " · ".join(parts))
-                if jd.get("recovered"):
-                    log(f"  → 이음매 보완: 3조각 이상 띄어쓴 다수 표기 "
-                        f"{jd['recovered']}건 카드화(기존 2분할 탐색 사각)")
+                # 화면에는 **한 줄로만** 낸다(사용자 지정 2026-07-30). 개별 판정
+                #   (미탐 보완/방향 정정/이음매 정합/이음매 그룹)은 위 resolve가 원문
+                #   로그로 남기고 activity_panel._DROP이 표시에서 걸러낸다 — 진단은
+                #   보존하고 화면만 정리하는 이 저장소의 표준 방식이다.
+                #   n = 실제로 카드를 만들거나 고친 판정 수(보존은 무연산이라 제외).
+                n = (jd.get("recovered", 0) + jd.get("redirected", 0)
+                     + jd.get("dropped", 0) + jd.get("harmonized", 0)
+                     + jd.get("grouped", 0))
+                if n:
+                    log(f"  [보완] 용어간 이음매 정합성 판정 {n}건 추가")
             except Exception as e:
                 log(f"  [이음매 정합] 스킵: {e}")
 

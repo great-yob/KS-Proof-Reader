@@ -186,12 +186,17 @@ class HwpEditor:
         `last_note_lines`에는 **각주·글상자에서 실려 온 라인 인덱스**가 담긴다 —
         추출 순서·오프셋은 그대로 두고 분류 정보만 덧붙인 것이다(왜 재배열하지
         않는지는 hwp_bridge_worker._classify_note_lines 주석). 못 구하면 빈 목록.
+
+        ⚠ `last_note_lines`는 이름과 달리 **컨트롤 텍스트 전부**(각주·미주·글상자·표·
+        목차·머리말)다. **실제 각주만** 필요한 곳(미리보기 `[각주]` 표지)은 반드시
+        `last_footnote_lines`를 쓸 것 — 그쪽은 `fn`/`en` ctrl로 확정한 부분집합이다.
         """
         result = self._send_cmd({"cmd": "get_text"})
         if not result.get("ok"):
             raise RuntimeError(f"텍스트 추출 실패: {result.get('error')}")
         self.last_page_count = result.get("page_count")
         self.last_note_lines = result.get("note_lines") or []
+        self.last_footnote_lines = result.get("footnote_lines") or []
         return result.get("text", "")
 
     # 취소 반응성을 위한 배치 크기 — 브리지 apply는 단일 명령이 끝날 때까지

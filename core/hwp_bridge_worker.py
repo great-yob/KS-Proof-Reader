@@ -59,6 +59,17 @@ def _clean(s: str) -> str:
     s = _INVISIBLE_RE.sub("", s)
     return s.strip()
 
+
+def _ws_strip(s: str) -> str:
+    """공백을 전부 없앤 비교용 표현(각주 라인 ↔ 문단 텍스트 포함 관계 판정에 쓴다).
+
+    같은 글자라도 추출 경로에 따라 공백·개행이 다르게 붙으므로(스캔은 경계 개행을
+    넣고 saveblock은 넣지 않는다) 공백을 무시해야 포함 관계가 성립한다.
+    """
+    if not s:
+        return ""
+    return re.sub(r"\s+", "", s)
+
 # 부모(64비트)와 JSON을 주고받기 전에 stdio를 UTF-8로 고정.
 # 한국 Windows에서 32비트 Python의 기본 인코딩은 CP949라
 # 한국어가 포함된 JSON을 그대로 쓰면 부모 쪽 utf-8 디코더가 깨진다.
@@ -506,8 +517,10 @@ class HwpBridge:
             page_count = int(self.hwp.PageCount)
         except Exception:
             pass
+        note_lines = self._classify_note_lines(text)
         return {"text": text,
-                "note_lines": self._classify_note_lines(text),
+                "note_lines": note_lines,
+                "footnote_lines": self._classify_footnote_lines(text, note_lines),
                 "page_count": page_count}
 
     # ── 각주·글상자 라인 식별 ────────────────────────────────────────────────
@@ -566,6 +579,150 @@ class HwpBridge:
             if s and s not in body:
                 out.append(i)
         return out
+
+    # ── 각주 라인만 골라내기 ──────────────────────────────────────────────────
+    #   ⚠ 위 `note_lines`는 이름과 달리 **각주가 아니라 '본문 전용 스캔에 없는 모든 줄'**
+    #   이다 — 각주·미주는 물론 글상자·표·목차·머리말·꼬리말이 전부 섞인다(실측 이 파일
+    #   1,719줄 / 각주는 3개뿐). 미리보기 `[각주]` 표지를 그걸로 그리면 조판부호가 붙은
+    #   모든 항목에 표지가 달린다(사용자 보고 2026-07-30). 표지는 **실제 각주에만** 붙어야
+    #   하므로 각주를 따로 식별한다.
+    #
+    #   ★식별 근거 = ctrl 인벤토리(실측 `CtrlID`: fn=각주, en=미주, gso=글상자, tbl=표,
+    #   head/foot=머리말·꼬리말, pghd/atno/nwno=번호류). `fn`/`en` ctrl의
+    #   `GetAnchorPos(0)`가 **본문 리스트(List=0)의 문단 번호**를 주므로, 그 문단만
+    #   선택해 텍스트를 읽고(SelectText+GetTextFile("TEXT","saveblock") — 각주 본문이
+    #   인라인으로 함께 나온다) 추출 라인이 그 안에 들어 있는지로 판정한다.
+    #
+    #   ⚠ **앵커의 `Pos`(문단 내 오프셋)로 자르면 안 된다**(실측 실패): HWP의 Pos는
+    #   조판부호까지 세는 좌표라 추출 텍스트 오프셋과 어긋난다(3개 중 1개가 각주 번호
+    #   뒤 8자를 넘겨 잡아 본문 라인을 못 찾았다). 그래서 오프셋 대신 **포함 관계**로
+    #   판정한다 — 좌표계 불일치에 영향받지 않는다.
+    #
+    #   ⚠ `InitScan`의 문단 범위(spara/epara) 인자는 **무시된다**(실측: 어떤 인자 순서로
+    #   넣어도 문서 전체 268,034자가 나온다). 리스트 id 브루트포스(`SetPos(lid,0,0)` +
+    #   `InitScan(0x00,0x00)`)도 1글자만 돌려준다. 두 경로 모두 재시도 금지.
+    _FN_MAX_PARAS = 400          # 각주가 이보다 많으면 COM 왕복 비용이 커져 중단(표지 생략)
+    _FN_RUN_WINDOW = 40          # 한 문단의 각주 본문들이 흩어질 수 있는 최대 줄 간격
+
+    def _classify_footnote_lines(self, text, note_lines):
+        """`note_lines` 중 **실제 각주·미주 본문**인 라인 인덱스만 돌려준다.
+
+        실패하면 빈 목록 — 표지가 안 붙을 뿐이라 안전한 실패다(과표시가 훨씬 나쁘다).
+        """
+        if not text or not note_lines:
+            return []
+        try:
+            paras = self._footnote_anchor_paras()
+        except Exception:
+            return []
+        if not paras or len(paras) > self._FN_MAX_PARAS:
+            return []
+
+        lines = text.split('\n')
+        want = set(note_lines)
+        # ⚠ 후보를 `note_lines`로만 잡으면 각주를 절반 이상 놓친다(실측 99개 중 21개만
+        #   탐지). `_classify_note_lines`는 '본문 전용 스캔에 없는 줄'을 컨트롤로 보는데,
+        #   **참고문헌 목록에 같은 인용이 그대로 실린 각주**는 본문에도 존재하므로 본문으로
+        #   분류돼 버린다(실측: 각주 314줄 = 참고문헌 3080줄, 글자까지 동일). 그런 줄은
+        #   추출 텍스트에 **두 번 이상** 나타난다는 특징이 있으므로 후보에 함께 넣는다.
+        #   문단 텍스트 포함 + 직전 본문 라인 확인이라는 2중 검증이 뒤에 있으므로,
+        #   후보를 넓혀도 오탐 방향으로는 열리지 않는다.
+        dup = set()
+        seen = {}
+        for ln in lines:
+            s = _ws_strip(ln)
+            if len(s) < 6:
+                continue
+            seen[s] = seen.get(s, 0) + 1
+            if seen[s] > 1:
+                dup.add(s)
+        cands = []               # (라인 idx, 정규화 텍스트, 직전 본문 라인 정규화 꼬리)
+        prev_body = -1
+        for i, ln in enumerate(lines):
+            if not ln.strip():
+                continue
+            s = _ws_strip(ln)
+            if i in want or s in dup:
+                prev_s = _ws_strip(lines[prev_body]) if prev_body >= 0 else ""
+                # ⚠ 중복 인용으로 후보가 된 줄은 **참고문헌 목록 자체**일 수도 있다(실측
+                #   오탐 4건: 각주 2개가 걸린 문단의 두 인용이 참고문헌에서도 나란히 있어
+                #   '직전 줄 꼬리도 같은 문단에 있음' 확인을 통과했다). 참고문헌에서는
+                #   직전 줄이 **또 다른 인용(=중복 후보)**이고, 진짜 각주 자리에서는 직전
+                #   줄이 평범한 본문 산문이다 — 그 차이로 가른다.
+                ok = prev_s and len(s) >= 6 and (i in want or prev_s not in dup)
+                if ok:
+                    cands.append((i, s, prev_s[-12:]))
+            if i not in want:
+                prev_body = i
+        if not cands:
+            return []
+
+        # ★문단은 오름차순이고 각주 본문도 문서 순서대로 실려 오므로 **순서를 보존하는
+        #   단조 배정**을 한다(문단 pk의 각주 라인 > 문단 pk-1의 각주 라인). 이것이
+        #   참고문헌 오탐을 끊는 결정적 제약이다 — 참고문헌의 인용은 그 각주가 달린
+        #   문단보다 **수천 줄 뒤**에 있어서, 앞선 문단이 이미 진짜 각주 라인을 집어간
+        #   뒤에는 배정 대상이 되지 못한다(실측: 남아 있던 오탐 3건이 0건으로).
+        #   한 문단에 각주가 여럿이면 그 본문들은 서로 붙어 있으므로 첫 매치로부터
+        #   _FN_RUN_WINDOW 줄 안쪽만 같은 문단의 것으로 인정한다.
+        out = set()
+        last = -1
+        try:
+            self.hwp.HAction.Run("Cancel")
+        except Exception:
+            pass
+        for p in paras:
+            try:
+                self.hwp.SelectText(p, 0, p, -1)
+                ptext = _ws_strip(self.hwp.GetTextFile("TEXT", "saveblock"))
+            except Exception:
+                continue
+            finally:
+                try:
+                    self.hwp.HAction.Run("Cancel")
+                except Exception:
+                    pass
+            if len(ptext) < 10:
+                continue
+            picked = []
+            for i, s, tail in cands:
+                if i <= last or s not in ptext:
+                    continue
+                # 직전 본문 라인도 같은 문단이어야 한다 — 같은 문단에 각주와 글상자가
+                #   함께 걸린 경우 글상자 텍스트가 오탐되는 것을 막는 2차 확인.
+                if not tail or tail not in ptext:
+                    continue
+                if picked and i - picked[0] > self._FN_RUN_WINDOW:
+                    break
+                picked.append(i)
+            if picked:
+                out.update(picked)
+                last = picked[-1]
+        try:
+            self.hwp.HAction.Run("Cancel")
+            self.hwp.HAction.Run("MoveDocBegin")
+        except Exception:
+            pass
+        return sorted(out)
+
+    def _footnote_anchor_paras(self):
+        """`fn`/`en` ctrl이 걸린 **본문 문단 번호** 목록(오름차순·중복 제거)."""
+        paras = set()
+        ctrl = self.hwp.HeadCtrl
+        n = 0
+        while ctrl is not None and n < 20000:
+            n += 1
+            try:
+                if str(ctrl.CtrlID) in ("fn", "en"):
+                    aps = ctrl.GetAnchorPos(0)
+                    if aps.Item("List") == 0:
+                        paras.add(int(aps.Item("Para")))
+            except Exception:
+                pass
+            try:
+                ctrl = ctrl.Next
+            except Exception:
+                break
+        return sorted(paras)
 
     def verify(self, originals):
         """각 원문 문자열이 문서에서 '찾기'로 도달 가능한지 검증 (치환 없음 — 문서 무변경).

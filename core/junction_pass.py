@@ -194,11 +194,12 @@ def resolve(corrections: list, text: str, *, logger=None,
     """이음매 정합 패스. corrections를 **제자리에서** 손보고 진단 dict를 돌려준다.
 
     반환 키: preserved(정당한 구분 쌍) / harmonized(자동 정합 카드) /
-             grouped(이음매 그룹 수) / recovered(미탐 보완 카드) / conflicts(총 충돌 쌍)
+             grouped(이음매 그룹 수) / recovered(미탐 보완 카드) / conflicts(총 충돌 쌍) /
+             redirected(방향 정정 카드) / dropped(방향 오판으로 제거한 카드)
     """
     log = logger or (lambda *_a, **_k: None)
     diag = {"conflicts": 0, "preserved": 0, "harmonized": 0,
-            "grouped": 0, "recovered": 0}
+            "grouped": 0, "recovered": 0, "redirected": 0, "dropped": 0}
     from core import morph as _morph
     if not text or not _morph.available():
         return diag
@@ -262,6 +263,7 @@ def resolve(corrections: list, text: str, *, logger=None,
         if winner == c.original:
             # 문서 다수 표기가 곧 원문 — 이 카드는 방향이 거꾸로다. 고칠 것이 없다.
             dead_ids.add(id(c))
+            diag["dropped"] += 1
             log(f"      · 방향 오판 카드 제거 '{c.original}'→'{c.corrected}' "
                 f"(문서 다수 표기가 원문 그대로 {n_maj}회)")
             continue
@@ -269,6 +271,7 @@ def resolve(corrections: list, text: str, *, logger=None,
         c.corrected = winner
         c.reason = (f"띄어쓰기 일관성 → 다수 표기로 통일\n"
                     f"— {winner}({n_maj}) : 그 외({n_min})")
+        diag["redirected"] += 1
         log(f"      · 방향 정정 '{c.original}' → '{winner}' (기존 '{old}', "
             f"문서 분포 {n_maj}:{n_min})")
     if dead_ids:

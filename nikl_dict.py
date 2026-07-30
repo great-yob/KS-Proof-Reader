@@ -680,7 +680,13 @@ class KoreanDictValidator:
             if not res["exists"]:
                 # 형태소 분석: 등재어의 활용형/복합형이면 미등재가 아니다
                 #   (예: "겪고"→"겪다", "먹었습니다"→"먹다"는 의심 대상에서 제외)
-                if morph_mod is not None and morph_mod.is_known_form(clean, _exists_for_morph):
+                #   ⚠ `single_char_tail_ok=False` — '등재어 + 1글자 명사' 분해는 구제하지
+                #   않는다. 1글자 내용 형태소는 사전 조회에서 빠지므로(morph 주석 참조)
+                #   `재산관`('재산과'의 오타)이 `재산+관`으로 쪼개져 **미등재인데도 정상**이
+                #   됐다(사용자 보고 2026-07-30). 이 게이트는 '의심어 후보'만 만들고 실제
+                #   카드화는 뒤의 is_likely_typo·빈출 가드·API 폴백이 다시 걸러낸다.
+                if morph_mod is not None and morph_mod.is_known_form(
+                        clean, _exists_for_morph, single_char_tail_ok=False):
                     continue
                 # 어느 사전에도 없음 — 오탈자 또는 신조어 외래어 가능성
                 key = f"{actual}::missing"
