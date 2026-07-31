@@ -88,6 +88,12 @@ class ProofreadingWorker(QThread):
             #   ⚠ 아래 NFC 정규화는 개행을 가감하지 않으므로 라인 인덱스가 유지된다.
             note_lines = getattr(editor, "last_note_lines", None) or []
             footnote_lines = getattr(editor, "last_footnote_lines", None) or []
+            # 강제 줄 나눔 복원 — 한/글 텍스트 추출이 버리는 조판부호를 되살린 건수.
+            #   0이 아니면 추출 텍스트가(따라서 교정 결과도) 달라지므로 사유를 남긴다.
+            _lb = getattr(editor, "last_linebreaks", 0) or 0
+            if _lb:
+                log(f"  → 강제 줄 나눔 {_lb}곳 복원 (줄이 나뉜 자리에서 어절이 붙어 "
+                    f"추출되던 문제 — 없는 낱말 오탐·오교정 방지)")
         finally:
             try:
                 editor.close()
@@ -811,6 +817,10 @@ class ProofreadingWorker(QThread):
         #     카드로 노출한다. 사전 탐지가 기본 베이스이므로, AI가 미묘한 오타
         #     (예: '상담채녈')를 놓쳐도 반드시 사용자 눈에 띈다. 자동수정이 아니라
         #     (original==corrected) → HWP 미수정, 검토 카드·정오표용.
+        # 'AI가 이미 교정함'으로 눌러 둔 카드 보관소 — [9.6]에서 되살릴 수 있게 남긴다.
+        #   ⚠ 여기 담기는 건 **다른 모든 관문을 통과한** 완성된 카드다(억제 사유가
+        #   오직 covered 하나인 것). 그래야 [9.6]이 판정 로직을 복제하지 않는다.
+        held_flags = []
         if dict_flags and not self._stop.is_set():
             # 윤문(ai_polish)은 original이 문장 전체라 한 문장 내 모든 어휘를
             # '처리됨'으로 덮어 안전망을 과하게 억제한다 → 단어 단위 교정만 집계.
@@ -830,6 +840,7 @@ class ProofreadingWorker(QThread):
                 _ud_exc = frozenset()
             excepted = 0
             skipped_freq = 0
+            skipped_covered = 0
             # 저자 선언 약칭('(이하 가나다원)')도 검수 카드에서 뺀다 — 미등재라도 저자가
             #   정의한 표기다. 빈출 가드가 대개 함께 잡지만, 선언만 하고 2회 이하만
             #   쓰인 약칭은 빈출 가드를 통과하므로 여기서 명시적으로 막는다.
@@ -854,9 +865,14 @@ class ProofreadingWorker(QThread):
             except Exception:
                 _freq_strip = lambda w: w
             for word, clean, reason in dict_flags:
-                # AI가 이 어휘를 이미 교정 대상으로 다뤘으면(부분 포함 포함) 스킵
-                if any(clean in cov or cov in clean for cov in covered):
-                    continue
+                # AI가 이 어휘를 이미 교정 대상으로 다뤘으면(부분 포함 포함) 카드를 누른다.
+                #   ⚠ 여기서 `continue`로 **버리면 안 된다** — 근거가 된 AI 교정이
+                #   [8](조사 변형 정리)·[9.5](본문·문서 대조)에서 **나중에 드롭될 수 있고**,
+                #   그러면 그 낱말은 AI 카드도 사전 카드도 없이 통째로 사라진다
+                #   (실측 2026-07-31: '재산관'·'더서울미디어'가 이렇게 소멸. 어느 낱말이
+                #   사라지는지가 AI 실행마다 달라 재현조차 어려웠다). 판정은 끝까지 하고
+                #   보관만 해 두었다가 [9.6]에서 커버가 풀렸는지 다시 본다.
+                _covered_now = any(clean in cov or cov in clean for cov in covered)
                 # 문서에서 반복되는 미등재어 → 작가 의도 용어로 보고 카드 제외
                 _fbase = _freq_strip(clean) or clean
                 if clean and max(text.count(clean), text.count(_fbase)) >= _FREQ_INTENTIONAL:
@@ -884,8 +900,17 @@ class ProofreadingWorker(QThread):
                 if not _fw_real:
                     try:
                         from core import morph as _mchk
+                        # ⚠ `single_char_tail_ok=False` — **스크리닝 게이트
+                        #   (nikl_dict.extract_suspicious_words)와 반드시 같은 엄격도**여야
+                        #   한다. 이 재확인이 더 관대하면 스크리닝이 내린 판정을 조용히
+                        #   뒤집어, 어느 로그에도 남지 않고 카드가 사라진다. 실제로 그랬다:
+                        #   '등재어 + 1글자 명사' 사각을 스크리닝에서 막았는데(2026-07-30)
+                        #   여기서 기본값(관대)으로 다시 구제해 `재산관`('재산과'의 오타)이
+                        #   여전히 미탐됐다(사용자 재보고 2026-07-31). 이 호출은 검수 카드
+                        #   생성 여부를 정하는 **게이트**이지 가드·재검증 경로가 아니다.
                         _fw_real = _mchk.available() and _mchk.is_known_form(
-                            _fw_nfc, lambda x: lookup_word(x)["exists"])
+                            _fw_nfc, lambda x: lookup_word(x)["exists"],
+                            single_char_tail_ok=False)
                     except Exception:
                         _fw_real = False
                 if _fw_real:
@@ -905,13 +930,35 @@ class ProofreadingWorker(QThread):
                 if len(re.sub(r"[^가-힣]", "", flag_word)) < 2 or not is_likely_typo(flag_word):
                     skipped_noise += 1
                     continue
-                net.append(_make_flag(flag_word, reason))
+                if _covered_now:
+                    skipped_covered += 1
+                    held_flags.append((clean, _make_flag(flag_word, reason)))
+                else:
+                    net.append(_make_flag(flag_word, reason))
             if skipped_freq:
                 log(f"  → 빈출 미등재어 {skipped_freq}건 검수 카드 제외 "
                     f"(반복 {_FREQ_INTENTIONAL}회+ = 작가 의도 용어로 판단)")
             if skipped_abbrev:
                 log(f"  → 저자 선언 약칭 {skipped_abbrev}건 검수 카드 제외 "
                     f"('(이하 …)' 정의 표기)")
+            # ⚠ **나머지 억제 사유도 반드시 남긴다.** 집계만 하고 로그가 없으면 미등재어가
+            #   어느 단계에서 사라졌는지 사후 추적이 불가능하다 — `재산관` 미탐
+            #   (2026-07-31)이 정확히 이 구멍이었다. 스크리닝은 통과했는데 여기
+            #   skipped_noise로 조용히 빠져, 로그·집계 어디에도 흔적이 없었다.
+            #   억제 자체는 정상 동작이므로 사유별 '건수'만 한 줄로 남긴다.
+            #   화면엔 합계만 나가고(_RULES) 사유별 내역은 원문 로그에 남는다 —
+            #   '진단은 보존, 화면만 정리'라는 이 저장소의 표준 방식.
+            if skipped_covered or skipped_noise or excepted:
+                _sup = []
+                if skipped_covered:
+                    _sup.append(f"AI가 이미 교정 {skipped_covered}")
+                if skipped_noise:
+                    _sup.append(f"등재어·정상복합어·인명 판정 {skipped_noise}")
+                if excepted:
+                    _sup.append(f"조직 예외 {excepted}")
+                log(f"  → 미등재어 검수 카드 억제 "
+                    f"{skipped_covered + skipped_noise + excepted}건 "
+                    f"({' · '.join(_sup)})")
             if net:
                 merged.extend(net)
                 det_review.append(("사전안전망", len(net)))
@@ -1362,6 +1409,21 @@ class ProofreadingWorker(QThread):
         #         찾기/치환은 그 경계를 넘지 못함 — 실측 2026-07-03). 브리지 verify(RepeatFind,
         #         치환 없음·문서 무변경)로 걸러낸다. RepeatFind 도달 범위는 apply 1차 경로와
         #         동일(본문·표·글상자·각주 실측)이라 '검증 통과=적용 가능'이 성립한다.
+        # (a-0) ★교정문에 개행이 든 교정 제거 — **문서 구조를 바꿔 버리는 유일한 경로**다.
+        #   브리지 apply/verify는 매칭 직전에 `\n`을 **`\r`(문단 나눔)** 으로 바꾼다. 원문 쪽
+        #   개행은 verify가 같은 변환으로 검증해 못 찾으면 자동 드롭되지만(아래 (b)),
+        #   **교정문 쪽 개행은 아무도 검증하지 않아** InsertText가 문단 나눔을 문서에 심는다.
+        #   ⚠ 특히 강제 줄 나눔 복원 이후로는 추출 텍스트의 개행이 늘어(162곳) AI가 이를
+        #   교정문에 되돌려 담을 여지가 커졌다 — 실측 현재 0건이지만 구조적으로 무방비라
+        #   막아 둔다(원본 문서를 훼손하는 종류의 실패는 사후 복구가 불가능하다).
+        if merged and not self._stop.is_set():
+            _nl = [c for c in merged if "\n" in (c.corrected or "")]
+            if _nl:
+                _nl_ids = {id(c) for c in _nl}
+                merged = [c for c in merged if id(c) not in _nl_ids]
+                log(f"  → 교정문에 줄바꿈이 든 교정 {len(_nl)}건 제외 "
+                    "(적용 시 문서에 문단 나눔이 삽입돼 원고 구조가 바뀜)")
+
         if merged and not self._stop.is_set():
             ghosts = [c for c in merged
                       if c.original != c.corrected and c.original not in text]
@@ -1398,6 +1460,43 @@ class ProofreadingWorker(QThread):
                             log(f"      · '{o}'")
                 except Exception as e:
                     log(f"  [문서 대조] 검증 건너뜀: {e}")
+
+        # [9.6] 사전 안전망 재개방 — [6]에서 'AI가 이미 교정함'(covered)으로 눌러 둔
+        #     미등재어 중, **그 근거가 사라진** 것을 되살린다.
+        #     [6]의 covered는 그 시점의 merged로 계산하는데, 그 뒤 [8](조사 변형 정리)과
+        #     [9.5](본문·문서 대조)가 교정을 **드롭한다**. 근거가 드롭되면 그 낱말은
+        #     AI 카드도 없고 사전 카드도 눌린 채라 **결과에서 통째로 증발**한다
+        #     (실측: '재산관' 오타가 AI 켠 실행에서만 사라졌다 — [9.5]가 6건을 드롭한 뒤였다).
+        #     ⚠ 이 패스는 [9.5] **뒤**여야 한다(드롭이 다 끝난 뒤의 covered를 봐야 함).
+        #     되살린 카드는 original==corrected라 문서 대조 대상이 아니므로 순서상 안전하다.
+        if held_flags and not self._stop.is_set():
+            covered_final = set()
+            for c in merged:
+                if c.source == "ai_polish":
+                    continue
+                covered_final.update(re.findall(r"[가-힣]+", c.original))
+            _exist_orig = {c.original for c in merged}   # [7] 백스톱 등과 카드 중복 방지
+            revived = [card for clean, card in held_flags
+                       if not any(clean in cov or cov in clean for cov in covered_final)
+                       and card.original not in _exist_orig]
+            if revived:
+                merged.extend(revived)
+                det_review.append(("사전안전망(재개방)", len(revived)))
+                log(f"  → 안전망 재개방 {len(revived)}건 — AI 교정이 뒤에서 제외돼 "
+                    f"근거가 사라진 미등재어를 검수 카드로 복구")
+
+        # ⚠ **취소 재확인 — 부분 결과를 '정상 완료'로 내보내지 않는다.**
+        #   [4]~[9.5]의 각 계층은 `self._stop`이 서면 개별적으로 **조용히 건너뛴다**.
+        #   여기서 막지 않으면 사전 재검증([5])·문서 대조 검증([9.5])·이음매 정합([9.2])이
+        #   통째로 빠진 목록이 완료 화면까지 올라가고, 취소했다는 표시도 남지 않는다.
+        #   특히 위험한 조합 2가지:
+        #     · `nikl_dict.validate`는 취소되면 **남은 항목을 재검증 없이 그대로 통과**시킨다
+        #       → low로 강등됐어야 할 교정이 high로 남는다.
+        #     · `auto_apply`면 그 high 교정이 검수 화면 없이 곧바로 문서에 적용된다.
+        #   AI 직후(위 [3] 끝)에도 같은 검사가 있으나 그 뒤 구간엔 없었다(2026-07-31 감사).
+        if self._stop.is_set():
+            self.error.emit("사용자에 의해 취소되었습니다.")
+            return
 
         # 검증 구간 종료 → 결과 집계 구간 시작(활동 로그 단계 경계 마커).
         log("[사전+결정론규칙 검증 완료]")

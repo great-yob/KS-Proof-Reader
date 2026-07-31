@@ -510,6 +510,9 @@ class HwpBridge:
                 buf += text
         self.hwp.ReleaseScan()
         text = buf.replace('\r', '\n').strip()
+        # ★ 강제 줄 나눔(Shift+Enter) 복원 — **반드시 아래 라인 분류보다 앞**에서.
+        #   note_lines/footnote_lines는 '라인 인덱스'라 개행을 나중에 넣으면 전부 어긋난다.
+        text = self._restore_linebreaks(text)
         # 문서 총 페이지 수 — 교정 현장 단위(하루 80~100쪽)라 결과 보고서의
         #   대표 수치로 쓴다. 버전에 따라 없을 수 있어 실패 시 None(표시 생략).
         page_count = None
@@ -521,7 +524,148 @@ class HwpBridge:
         return {"text": text,
                 "note_lines": note_lines,
                 "footnote_lines": self._classify_footnote_lines(text, note_lines),
+                # 복원 건수는 **화면 로그로 올린다** — 이 값이 0이 아니면 추출 텍스트가
+                #   달라지고 그에 따라 교정 결과도 달라진다. 이유가 보이지 않으면
+                #   사용자는 원인 모를 변동으로 받아들인다(브리지 stderr는 배관으로 숨겨진다).
+                "linebreaks": getattr(self, "_lb_restored", 0),
                 "page_count": page_count}
+
+    # ── 강제 줄 나눔(Shift+Enter) 복원 ───────────────────────────────────────
+    #   ⚠ **한/글의 텍스트 계열 추출은 강제 줄 나눔을 통째로 버린다**(실측 2026-07-31,
+    #   32비트 COM 직접 확인): `GetText`는 해당 문단을 **한 청크(state=2)** 로 주고 제어문자는
+    #   문단 끝 `\r\n`뿐이며, `GetTextFile("TEXT","")`(문서 전체)도, `SelectText`+saveblock
+    #   (문단 블록)도 똑같이 붙여서 준다. 즉 state 4/5 경계 처리로는 원리적으로 못 잡는다.
+    #   그 결과 문서에서 줄이 나뉘어 있던 어절이 **붙어서** 추출된다:
+    #     '임 덕 선 부연구위원'⏎'최 혜 지 전문연구원'⏎'이 인 수 연구원'⏎'윤 선 우 변호사'
+    #       → '…부연구위원최 혜 지 전문연구원이 인 수 연구원윤 선 우 변호사'
+    #   피해는 셋이다 — ① 없는 낱말('연구원윤'·'감면단')이 검수 카드로 뜨고, ② AI가 붙은
+    #   어절을 보고 오교정을 만들며, ③ 원문이 줄나눔을 넘으면 찾기/치환이 그 경계를 못 넘어
+    #   **적용이 실패**한다(과거 '본문에 원문 없음' 부류와 같은 뿌리).
+    #
+    #   ★유일하게 정보가 남는 곳이 **구조 export**다: `GetTextFile("HWPML2X","")`의
+    #   `<LINEBREAK/>`. 실측 이 문서 163개(그중 어절을 실제로 붙이는 것 27개, 나머지는
+    #   이미 공백·부호가 있어 무해). 한/글 2010(8.5.8.1677)에서 동작 확인.
+    #
+    #   ⚠ **불변식: 개행을 '삽입'만 한다. 글자는 하나도 바꾸지 않는다.**(junction_pass와 같은
+    #   철학) 삽입 후 공백 제거 문자열이 원본과 다르면 **전체를 포기하고 원문을 쓴다** —
+    #   추출 텍스트가 조금이라도 훼손되면 적용 인덱스가 통째로 어긋나기 때문이다.
+    #   ⚠ 전역 정렬은 쓰지 않는다. 스캔 텍스트는 컨트롤 경계에서 개행을 끼워 넣고 각주를
+    #   본문 사이에 실어 오므로 HWPML2X의 문자열과 **전역으로는 일치하지 않는다**(실측:
+    #   단순 이어붙이기로 27개 중 6개가 표 안에서 불일치). 그래서 접합부 **국소 문맥**만
+    #   공백 무시로 대조한다.
+    _XML_ENT = (("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'), ("&apos;", "'"), ("&amp;", "&"))
+    _LB_CTX = (6, 10, 14, 18)      # 접합 문맥 길이 후보 — 짧은 것부터, 유일해질 때까지
+    # ⚠ 반드시 **이스케이프 표기**로 둘 것 — 사용자 정의 영역 문자를 소스에 직접 박으면
+    #   편집기·도구를 거치며 조용히 사라져 표시자가 빈 문자열이 된다(실제로 겪음).
+    _LB_MARK = "\uE000"      # 사용자 정의 영역 — 본문에 나올 수 없는 표시자
+
+    def _restore_linebreaks(self, text):
+        """강제 줄 나눔 자리에 개행을 삽입한 텍스트를 돌려준다(실패 시 원문 그대로).
+
+        `KS_HWP_NO_LINEBREAK_FIX=1`이면 통째로 끈다 — 현장에서 이 복원이 의심될 때
+        되돌려 볼 수 있는 탈출구이자, 개발 중 before/after 측정 스위치다.
+        """
+        self._lb_restored = 0
+        if not text or os.environ.get("KS_HWP_NO_LINEBREAK_FIX"):
+            return text
+        # ⚠ 이 호출은 **무출력으로 수 초 블록**한다(실측 6.1s / 본문 156K자·이미지 94개.
+        #   반환 문자열 16.5MB 중 본문 `<CHAR>`는 2.8%뿐이고 나머지는 문서에 박힌 이미지
+        #   바이너리다 — 즉 시간의 대부분은 한/글이 이미지를 직렬화하는 데 쓰인다).
+        #   브리지 유휴 타임아웃이 120초라 20배 여유가 있으나, 이미지가 극단적으로 많은
+        #   문서에선 여기서 멈춘 것처럼 보일 수 있다. 그때 어디서 멈췄는지 알 수 있도록
+        #   **호출 전에** 로그를 남긴다(무음 구간을 만들지 않는다는 이 저장소의 원칙).
+        _send_log("[줄나눔] 강제 줄 나눔 확인을 위해 문서 구조(HWPML2X) 읽는 중…")
+        try:
+            xml = self.hwp.GetTextFile("HWPML2X", "")
+        except Exception as exc:
+            _send_log(f"[줄나눔] HWPML2X 획득 실패: {exc} — 강제 줄 나눔 복원 건너뜀")
+            return text
+        if not xml or "<LINEBREAK/>" not in xml:
+            return text
+
+        # <CHAR> 안의 글자만 이어 붙이되 <LINEBREAK/> 자리에 표시자를 남긴다.
+        flat = []
+        for chunk in re.findall(r"<CHAR[^>]*>([\s\S]*?)</CHAR>", xml):
+            chunk = chunk.replace("<LINEBREAK/>", self._LB_MARK)
+            chunk = re.sub(r"<[^>]+>", "", chunk)      # 남은 태그 제거
+            flat.append(chunk)
+        flat = "".join(flat)
+        for ent, ch in self._XML_ENT:
+            flat = flat.replace(ent, ch)
+        flat = re.sub(r"&#(\d+);", lambda m: chr(int(m.group(1))), flat)
+        flat = re.sub(r"&#x([0-9A-Fa-f]+);", lambda m: chr(int(m.group(1), 16)), flat)
+
+        # 접합부 수집 — **줄 나눔은 전부 복원한다.**
+        #   ⚠ 처음엔 '앞뒤가 모두 낱말 글자일 때만'(어절이 붙는 경우만) 복원하고 나머지는
+        #   무해하다고 봤는데 **틀렸다**(사용자 보고 2026-07-31). 실측 163개 중 어절 접합은
+        #   27개뿐이고, **부호 접합 71개**(제목 '…조사 연구'⏎'- 전자문서…', 연구진
+        #   '…변호사(엘케이파트너스)'⏎'박 상 진 교수…', 표 셀 나열 ','⏎'목표 지향적…')와
+        #   **한쪽 공백 65개**가 남아 문서에서 나뉜 줄이 그대로 한 줄로 붙어 있었다.
+        #   '가짜 낱말이 생기느냐'와 '줄 구조가 보존되느냐'는 다른 문제다 — 후자는
+        #   미리보기 표시와 AI가 보는 문장 경계에 그대로 영향을 준다.
+        marks = []            # [(tail, head), …] — 표시자 하나당 한 항목
+        for m in re.finditer(re.escape(self._LB_MARK), flat):
+            i = m.start()
+            tail = flat[max(0, i - 40):i].replace(self._LB_MARK, "")
+            head = flat[i + 1:i + 41].replace(self._LB_MARK, "")
+            if tail and head:
+                marks.append((tail, head))
+
+        if not marks:
+            return text
+
+        # 국소 대조 — 문맥을 '공백 무시'로 찾는다(스캔 텍스트엔 컨트롤 경계 개행이 끼어 있다).
+        #   ⚠ **표시자 개수는 실제 대조에 쓰는 길이(ctx)로 묶어서 센다.** 40자 전체 문맥으로
+        #   묶으면 같은 문장이 문서에 두 번 나올 때(표지 제목 + 속표지 제목) 앞뒤 40자가
+        #   미세하게 달라 **별개 needle 2개(각 1개)** 로 갈리고, 본문 매치는 2곳이라
+        #   '개수 불일치'로 둘 다 건너뛴다(실측: 제목이 복원되지 않은 원인).
+        cuts, skipped = set(), 0
+        pending = list(range(len(marks)))
+        for ctx in self._LB_CTX:
+            counts = {}
+            for idx in pending:
+                key = (marks[idx][0][-ctx:], marks[idx][1][:ctx])
+                counts[key] = counts.get(key, 0) + 1
+            resolved = set()
+            for (t, h), n_mark in sorted(counts.items()):        # 정렬 = 결정성 보장
+                pat = re.compile(r"\s*".join(re.escape(c) for c in t)
+                                 + r"()" + r"\s*".join(re.escape(c) for c in h))
+                hits = list(pat.finditer(text))
+                # 유일하거나, 표시자 개수와 매치 수가 정확히 같을 때만 적용한다.
+                if hits and (len(hits) == 1 or len(hits) == n_mark):
+                    for mm in hits:
+                        cut = mm.start(1)
+                        # **이미 개행이 있을 때만** 건너뛴다. 공백은 건너뛸 이유가 아니다 —
+                        #   문서에서 줄이 나뉘어 있으면 앞에 공백이 있든 없든 나뉜 줄이다
+                        #   (공백까지 스킵 조건에 넣었더니 '한쪽 공백' 65곳이 통째로 빠졌다).
+                        if cut > 0 and text[cut - 1] != "\n" and text[cut:cut + 1] != "\n":
+                            cuts.add(cut)
+                    resolved.add((t, h))
+            if resolved:
+                pending = [i for i in pending
+                           if (marks[i][0][-ctx:], marks[i][1][:ctx]) not in resolved]
+            if not pending:
+                break
+        skipped = len(pending)
+
+        if not cuts:
+            if skipped:
+                _send_log(f"[줄나눔] 접합 {skipped}곳을 본문에서 특정하지 못해 건너뜀")
+            return text
+
+        out = list(text)
+        for cut in sorted(cuts, reverse=True):       # 뒤에서부터 = 앞 인덱스 불변
+            out.insert(cut, "\n")
+        new = "".join(out)
+
+        # ★불변식 — 개행 말고는 아무것도 달라지지 않았는가.
+        if new.replace("\n", "") != text.replace("\n", ""):
+            _send_log("[줄나눔] ⚠ 불변식 위반(글자 변경 감지) — 복원 전체를 취소하고 원문 사용")
+            return text
+        self._lb_restored = len(cuts)
+        _send_log(f"[줄나눔] 강제 줄 나눔 {len(cuts)}곳 복원"
+                  + (f" · 특정 실패 {skipped}곳" if skipped else ""))
+        return new
 
     # ── 각주·글상자 라인 식별 ────────────────────────────────────────────────
     #   위 스캔(option 0xff)은 각주·글상자 텍스트를 **본문 문장 한가운데**에 실어 오고,

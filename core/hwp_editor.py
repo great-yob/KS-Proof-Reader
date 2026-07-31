@@ -197,6 +197,9 @@ class HwpEditor:
         self.last_page_count = result.get("page_count")
         self.last_note_lines = result.get("note_lines") or []
         self.last_footnote_lines = result.get("footnote_lines") or []
+        # 강제 줄 나눔 복원 건수 — 0이 아니면 추출 텍스트가 달라졌다는 뜻이라
+        #   호출부(워커)가 화면 로그로 남긴다(사유 없는 결과 변동을 만들지 않기 위함).
+        self.last_linebreaks = result.get("linebreaks") or 0
         return result.get("text", "")
 
     # 취소 반응성을 위한 배치 크기 — 브리지 apply는 단일 명령이 끝날 때까지
