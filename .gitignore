@@ -63,3 +63,9 @@ data/*.db.bak
 data/*.pdf
 #   원본 디자인 파일(.ai) — 빌드는 assets/ 만 쓴다 (KS-Works-Utility와 동일 관례)
 소스/
+
+# ── Claude Code 로컬 설정/잠금 ──────────────────────────
+#   settings.local.json = 개인 권한 설정(공개 저장소에 올릴 것 없음)
+#   .release-autoapprove = 릴리스 중에만 존재하는 자동 승인 잠금
+.claude/settings.local.json
+.claude/.release-autoapprove
