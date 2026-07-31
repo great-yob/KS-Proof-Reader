@@ -188,6 +188,44 @@ def _pure_noun(word: str) -> bool:
     return bool(toks) and all(t.tag in ("NNG", "NNP") for t in toks)
 
 
+def _rewrites(x, y) -> bool:
+    """x의 교정이 y의 **교정 결과를 다시 잡아** 되돌리는가.
+
+    브리지 apply는 원문이 긴 항목부터 문서 전체를 부분문자열로 훑는다. 그래서 x의
+    `original`이 y의 `corrected` 안에 남아 있으면 x가 y의 결과를 덮어쓴다.
+
+    ⚠ 단, **원문에 공백이 없는 '분리' 교정**은 적용 단계에서 어절 경계 필터를 받는다
+    (`review_panel._mark_stem_boundary_skips` — 그 함수는 `" " in orig`이면 대상에서
+    빼므로 **공백 없는 원문에만** 걸린다). 그래서 '출산전후'는 '출산전후휴가' 속
+    조각으로는 치환되지 않는다 → 간섭이 아니다. 반대로 원문에 공백이 있으면 그 필터가
+    없어 부분문자열이 그대로 치환된다 → 실제 간섭이다.
+    이 구분이 '출산 전후 ↔ 출산전후휴가'(정당한 구분)와
+    '전자문서 지갑 ↔ 전자문서지갑 기능'(상호 무효화)을 가른다.
+    """
+    xo, yc = x["c"].original or "", y["c"].corrected or ""
+    if not xo or xo not in yc:
+        return False
+    if " " in xo:
+        return True                     # 경계 필터 없음 → 부분문자열 치환이 그대로 발생
+    for m in re.finditer(re.escape(xo), yc):
+        prev = yc[m.start() - 1] if m.start() else ""
+        nxt = yc[m.end()] if m.end() < len(yc) else ""
+        if not ("가" <= prev <= "힣") and not ("가" <= nxt <= "힣"):
+            return True                 # 독립 어절로 등장 → 실제로 치환된다
+    return False
+
+
+def _interferes(a, b) -> bool:
+    """두 카드가 **적용 후 서로의 결과를 덮어쓰는가** — '정당한 구분'의 전제 조건.
+
+    실측(사용자 보고 2026-07-31): '전자문서 지갑'→'전자문서지갑'(43:33, 자동 적용)과
+    '전자문서지갑 기능'→'전자문서 지갑 기능'(7:5, 검수 카드)이 '정당한 구분'으로 보존됐는데,
+    적용하면 `전자문서지갑 기능 → 전자문서 지갑 기능 → 전자문서지갑 기능`으로 되돌아가
+    **사용자가 수락한 교정이 12곳 전량 무효화**됐다.
+    """
+    return _rewrites(a, b) or _rewrites(b, a)
+
+
 def _pure_noun_form(form: str) -> bool:
     """이 표기가 **어절마다** 순수 명사인가."""
     parts = [p for p in (form or "").split() if p]
@@ -366,10 +404,26 @@ def resolve(corrections: list, text: str, *, logger=None,
     for a, b, d in pairs:
         sa, sb = a["st"], b["st"]
         if sa == "clear" and sb == "clear":
-            # 정당한 구분 — 양쪽 다 저자가 확립한 표기. 손대지 않는다.
-            diag["preserved"] += 1
-            log(f"      · 정당한 구분 유지 '{a['c'].original}' ↔ "
-                f"'{b['c'].original}' (양쪽 다 문서 내 다수 표기)")
+            # ⚠ **'정당한 구분'은 두 카드가 서로를 덮어쓰지 않을 때만 성립한다.**
+            #   한쪽의 원문이 다른 쪽의 **교정문 안에** 들어 있으면, 적용 단계에서
+            #   나중에 도는 카드가 앞 카드의 결과를 되돌린다(브리지는 원문이 긴 것부터
+            #   문서 전체를 훑는다). 실측(사용자 보고 2026-07-31):
+            #     '전자문서지갑 기능'→'전자문서 지갑 기능'(7:5, 검수 카드)
+            #     '전자문서 지갑'→'전자문서지갑'(43:33, 자동 적용)
+            #   → 사용자가 검수 카드를 수락해도 `전자문서지갑 기능 → 전자문서 지갑 기능
+            #     → 전자문서지갑 기능`으로 **완전히 되돌아간다**(12곳 전부).
+            #   '출산 전후' ↔ '출산전후휴가'가 정당한 구분인 건 짧은 쪽 원문(띄어쓴 형태)이
+            #   긴 쪽 표기(붙임형) 안에 없어 **서로 간섭하지 않기** 때문이다. 그 조건이
+            #   깨지면 '구분'이 아니라 그냥 충돌이므로 사용자 결정으로 넘긴다.
+            if not _interferes(a, b):
+                diag["preserved"] += 1
+                log(f"      · 정당한 구분 유지 '{a['c'].original}' ↔ "
+                    f"'{b['c'].original}' (양쪽 다 문서 내 다수 표기)")
+                continue
+            log(f"      · 상호 무효화 쌍 → 사용자 결정 '{a['c'].original}' ↔ "
+                f"'{b['c'].original}' (한쪽이 다른 쪽 교정 결과를 되돌림)")
+            adj[id(a["c"])].add(id(b["c"]))
+            adj[id(b["c"])].add(id(a["c"]))
             continue
         if sa == "clear" and sb == "none":
             _harmonize(b, a, d, log, diag)

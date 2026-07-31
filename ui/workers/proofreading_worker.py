@@ -1410,6 +1410,11 @@ class ProofreadingWorker(QThread):
                      + jd.get("grouped", 0))
                 if n:
                     log(f"  [보완] 용어간 이음매 정합성 판정 {n}건 추가")
+                # '정당한 구분 유지'는 카드를 만들지도 고치지도 않는 **보존** 판정이라
+                #   위 n에 들어가지 않는다. 그렇다고 개별 라인만 흘리면 화면이 지저분해져
+                #   같은 방식으로 한 줄에 접는다(사용자 지정 2026-07-31).
+                if jd.get("preserved"):
+                    log(f"  [보완] 정당한 구분 유지 {jd['preserved']}건 추가")
             except Exception as e:
                 log(f"  [이음매 정합] 스킵: {e}")
 
