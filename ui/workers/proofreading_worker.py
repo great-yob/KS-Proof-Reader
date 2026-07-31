@@ -1130,12 +1130,28 @@ class ProofreadingWorker(QThread):
                     # 동률(1:1 등)도 검수 카드로 표출(사용자 정책 결정 2026-07-02) — 방향은
                     #   사전 기반 규범 기본값(등재 복합어=붙임 / 미등재=띄어쓰기 원칙).
                     _cons_exists = (lambda w: _nd.lookup_word(w)["exists"]) if _dict_ok else None
+                    # ⚠ 이 카드만은 **공백을 지운 clean으로 AI 중복 판정을 하면 안 된다.**
+                    #   쟁점이 띄어쓰기 자체라 '개인 정보'와 '개인정보'의 clean이 같아지고,
+                    #   covered는 한글 '런'이라 공백이 없다 → AI가 **이미 붙어 있는** 다른
+                    #   등장('개인정보에 …'의 조사 교정)을 건드리기만 해도 문서 전체 통일
+                    #   카드가 통째로 사라졌다(사용자 보고 2026-07-31). 게다가 방향도 거꾸로였다:
+                    #   AI가 **소수형(띄어쓴 형태)** 을 실제로 고친 경우엔 런이 '개인'·'정보'로
+                    #   쪼개져 오히려 스킵되지 않았다. → 소수형 문자열을 AI 교정 원문에서
+                    #   **그대로** 찾아 실제로 겹칠 때만 스킵한다.
+                    _ai_origs = [c.original for c in merged
+                                 if c.source != "ai_polish" and c.original]
                     for minority, majority, n_min, n_maj in \
                             _morph.find_compound_spacing_consistency(text, exists_fn=_cons_exists):
                         if minority in existing:
                             continue
                         clean = re.sub(r"[^가-힣]", "", minority)
-                        if any(clean in cov for cov in covered):  # 어절⊆AI구간만 스킵(위 [7] 주석)
+                        # AI가 이 표기의 **모든 등장**을 이미 다뤘을 때만 스킵한다.
+                        #   일부만 건드린 경우(실측: 2곳 중 1곳 — AI가 인용된 뉴스 제목
+                        #   한 줄을 손봤을 뿐)에도 스킵하면, 남은 등장은 아무 카드도 못 받고
+                        #   **문서 전체 통일이라는 이 카드의 본래 일**도 함께 사라진다.
+                        _n_doc = text.count(minority)
+                        _n_ai = sum(o.count(minority) for o in _ai_origs)
+                        if _n_doc and _n_ai >= _n_doc:
                             continue
                         # 사내 통일 띄어쓰기 예외 → 다수표기 통일 제안에서도 제외(설계 E ⑦)
                         if _ud_sp_exc and clean in _ud_sp_exc:

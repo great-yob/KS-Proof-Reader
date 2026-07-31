@@ -188,6 +188,31 @@ def _pure_noun(word: str) -> bool:
     return bool(toks) and all(t.tag in ("NNG", "NNP") for t in toks)
 
 
+def _pure_noun_form(form: str) -> bool:
+    """이 표기가 **어절마다** 순수 명사인가."""
+    parts = [p for p in (form or "").split() if p]
+    return bool(parts) and all(_pure_noun(p) for p in parts)
+
+
+def _noun_group(counter) -> bool:
+    """이 낱말 무리가 명사 복합어인가 — **저자의 표기 중 하나라도** 순수 명사면 참.
+
+    ⚠ 붙인 문자열 하나만 `_pure_noun`에 넣으면 **kiwi 오분석에 무리 전체가 걸린다** —
+    실측 '이상거래탐지'·'이상거래' 둘 다 `이/MM + 상거래/NNG`로 오독된다(관형사 '이' +
+    '상거래'). 그 한 번의 오분석 때문에
+    `이상거래탐지(1) · 이상거래 탐지(10) · 이상 거래 탐지(3)` 전체가 게이트에서 탈락해
+    **소수 표기 3회가 카드도 교정도 없이 미탐**으로 남았다(사용자 보고 2026-07-31).
+    같은 오분석이 2분할 finder의 엉뚱한 '이 상거래탐지' 분할도 만들었다.
+    저자가 **띄어 쓴 형태**는 경계가 드러나 정상 분석된다('이상 거래 탐지' = 이상+거래+탐지,
+    전부 NNG). 즉 한 표기라도 순수 명사로 읽히면 그 무리는 명사 복합어로 본다.
+
+    ⚠ 이 완화가 '구(句)를 낱말로 취급'하는 ⑩ 294 노이즈로 번지지 않는 이유: 호출부가
+    **승자가 반드시 띄어쓴 형태**임을 따로 요구한다(`" " in winner`). 금지된 부류
+    ('학교 밖 청소년 지원'→'학교밖청소년지원')는 승자가 붙임형이라 거기서 막힌다.
+    """
+    return any(_pure_noun_form(f) for f in (counter or {}))
+
+
 # ── 본 패스 ───────────────────────────────────────────────────────────
 def resolve(corrections: list, text: str, *, logger=None,
             exception_set=frozenset()) -> dict:
@@ -217,34 +242,53 @@ def resolve(corrections: list, text: str, *, logger=None,
     #    '학교 밖 청소년 지원'→'학교밖청소년지원'(2:1)처럼 법률 용어를 붙이는 high
     #    카드까지 나왔다(실측). 이는 이 저장소가 실패로 기록한 '복합명사 결합 자동화'
     #    (⑩ 294건 노이즈 클래스) 부류이므로 재도입 금지.
-    have = {(c.original or "").replace(" ", "")
-            for c in corrections if _eligible(c)}
+    #    ⚠⚠ **패자가 여럿이면 전부 카드로 낸다**(사용자 보고 2026-07-31). 초기 구현은
+    #    붙임형(key) 하나만 냈고, 그나마 'key에 카드가 있으면' 낱말 전체를 건너뛰었다.
+    #    그래서 3형태 혼재 문서에서 **소수 표기 하나가 조용히 미탐**으로 남았다:
+    #    `이상거래탐지(1) · 이상거래 탐지(10) · 이상 거래 탐지(3)` 에서 1회짜리는
+    #    카드가 생겼는데 **3회짜리 '이상 거래 탐지'는 카드도 교정도 없이** 방치됐다.
+    #    2분할 finder는 '붙임형 base'에서만 후보를 만들므로 띄어 쓴 소수형을 원리적으로
+    #    못 본다 — 여기서 메우지 않으면 아무도 못 본다.
+    #    금지선은 그대로다: **승자가 반드시 띄어쓴 형태**여야 하므로(`" " in winner`)
+    #    '띄어 쓴 구를 붙여 한 낱말로 만드는' ⑩ 294 노이즈 부류는 여전히 생성되지 않는다.
+    #    여기서 하는 일은 **같은 낱말 안에서 공백 위치를 다수형에 맞추는 재배치**뿐이다.
+    have = {(c.original or "") for c in corrections if _eligible(c)}
     for key, counter in sorted(variants.items()):
-        if key in have or len(counter) < 2:
+        if len(counter) < 2:
             continue
         st, winner, n_maj, n_min = verdict(counter)
         if st != "clear" or not winner or " " not in winner:
             continue          # 약함·동률은 보류 / 승자가 붙임형이면 결합이라 대상 아님
-        # 기존 finder가 볼 수 있는 2분할 변이가 있으면 그쪽 카드가 이미 있어야 한다.
-        #   없다면(문서가 3조각으로만 쓰는 경우) 이 패스가 보완한다.
-        if any(f.count(" ") == 1 for f in counter):
+        if key in exception_set or not _noun_group(counter):
             continue
-        if key in exception_set or not _pure_noun(key):
-            continue
-        # 패자 중 **공백 없는 붙임형만** 카드로. 구 대 구 재배치는 만들지 않는다.
-        n = counter.get(key)
-        if not n:
-            continue
-        corrections.append(Correction(
-            original=key, corrected=winner,
-            reason=(f"띄어쓰기 일관성 → 다수 표기로 통일\n"
-                    f"— {winner}({n_maj}) : {key}({n})"),
-            source="spacing", color=HL_TYPO,
-            category="띄어쓰기", confidence="high",
-            consistency_flip=True,
-        ))
-        diag["recovered"] += 1
-        log(f"      · 미탐 보완 '{key}' → '{winner}' ({n_maj}:{n})")
+        # 2분할 변이가 있으면 기존 finder의 출력 공간 안이다(그쪽이 카드를 냈을 수도,
+        #   kiwi 오분석으로 못 냈을 수도 있다 — 카드는 내되 자동 적용은 하지 않는다).
+        _finder_visible = any(f.count(" ") == 1 for f in counter)
+        for form, n in sorted(counter.items()):
+            if form == winner or not n:
+                continue
+            if form in have:      # 이미 그 표기의 카드가 있으면 중복 생성 금지
+                continue
+            # ⚠ **자동 적용(high)은 기존에 검증된 모양에만 준다.** 이번 확장의 목적은
+            #   '미탐 제거'이지 자동 적용 확대가 아니다(사용자 지적 2026-07-31).
+            #   검증된 부류 = 원문이 **공백 없는 붙임형**이고 그 무리에 **2분할 변이가
+            #   없어** 기존 finder가 원리적으로 못 보던 경우(예: 기초연금수급자확인서 9:1).
+            #   그 밖은 전부 low — 띄어 쓴 표기의 공백 재배치도, finder가 볼 수 있었던
+            #   무리도, 사람이 카드로 한 번 보고 정한다.
+            joined_src = " " not in form and not _finder_visible
+            corrections.append(Correction(
+                original=form, corrected=winner,
+                reason=(("" if joined_src else "[검수] ")
+                        + f"띄어쓰기 일관성 → 다수 표기로 통일\n"
+                        f"— {winner}({n_maj}) : {form}({n})"),
+                source="spacing", color=HL_TYPO,
+                category="띄어쓰기",
+                confidence="high" if joined_src else "low",
+                consistency_flip=True,
+            ))
+            have.add(form)
+            diag["recovered"] += 1
+            log(f"      · 미탐 보완 '{form}' → '{winner}' ({n_maj}:{n})")
 
     # ①b 방향 정정 — 카드의 교정 방향이 **그 낱말 자체의 문서 전체 분포**와 어긋나면
     #     바로잡는다. 2분할 finder는 낱말을 한 지점에서만 쪼개 보므로 3조각 다수형을
@@ -269,8 +313,20 @@ def resolve(corrections: list, text: str, *, logger=None,
             continue
         old = c.corrected
         c.corrected = winner
+        # ⚠ 근거 문구에 **'그 외' 같은 뭉뚱그린 말을 쓰지 말 것**(사용자 보고 2026-07-31:
+        #   '이상거래 탐지(10) : 그 외(3)'). `verdict`의 n_min은 '나머지 전부'가 아니라
+        #   **2위 표기 하나의 개수**라 실제 문자열이 존재한다. 게다가 사용자가 보는 건
+        #   이 카드의 원문 표기이므로, 그 표기와 그 표기의 실제 등장 수를 보여주는 게
+        #   가장 정확하다(다른 일관성 카드의 '소수(n) : 다수(n)' 형식과도 일치).
+        _vc = variants.get(word) or Counter()
+        _loser_n = _vc.get(c.original, 0)
+        if _loser_n:
+            _loser, _loser_cnt = c.original, _loser_n
+        else:                       # 원문 표기가 분포에 없으면 2위 표기로 폴백
+            _ranked = _vc.most_common()
+            _loser, _loser_cnt = (_ranked[1] if len(_ranked) > 1 else (c.original, n_min))
         c.reason = (f"띄어쓰기 일관성 → 다수 표기로 통일\n"
-                    f"— {winner}({n_maj}) : 그 외({n_min})")
+                    f"— {winner}({n_maj}) : {_loser}({_loser_cnt})")
         diag["redirected"] += 1
         log(f"      · 방향 정정 '{c.original}' → '{winner}' (기존 '{old}', "
             f"문서 분포 {n_maj}:{n_min})")

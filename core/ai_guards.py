@@ -262,6 +262,69 @@ def is_compound_split_respacing(c) -> bool:
     return fired and j == len(c_toks)
 
 
+# ── ⑪-b 복합명사 **붙이기**(순수 재띄어쓰기) → 결정론 다수결에 위임 ──────────
+# ⑪이 **쪼개는 방향만** 위임하고 붙이는 방향은 그대로 통과시켜, '개인 정보'→'개인정보'가
+#   AI 카드(`맞춤법`·**high** = 자동 적용)로 나왔다(사용자 보고 2026-07-31). 같은 문서에서
+#   결정론 다수결은 이미 같은 후보를 **소수 2 : 다수 50**으로 들고 있었는데, 워커 [7]이
+#   `existing`(이미 있는 original)으로 중복 카드를 막는 탓에 결정론 카드가 자리를 뺏겼다.
+#   ⑪의 근거가 방향과 무관하다는 게 핵심이다 — AI는 다수/소수를 **세지 않으므로** 붙이는
+#   방향으로도 소수형 통일을 낼 수 있다. 게다가 결정론 카드는 `consistency_flip`(문서 전체
+#   표기 통일 팝업·저신뢰)인데 AI 카드는 자동 적용이라, **같은 판단이 방향에 따라 안전등급이
+#   갈리는** 모순이 있었다. → 붙이는 방향도 위임(드롭)한다.
+#
+#   ⚠ **조사·어미 붙이기는 정당한 맞춤법이라 반드시 통과시켜야 한다**('분야 보다도'→
+#   '분야보다도', '학교 에서'→'학교에서'). 의존명사 붙이기('할 수'→'할수')는 오히려 오류다.
+#   ⚠ 판정은 **조각을 따로 분석하지 말 것** — 문맥 없이 '보다도'만 넣으면 kiwi가 MAG(부사)로
+#   읽어 조사임을 놓친다(실측). **붙인 형태 전체**를 분석해야 '분야보다도'=NNG+JKB+JX로 드러난다.
+#   ⚠ 조건은 `morph.find_compound_spacing_consistency`가 **실제로 받을 수 있는 형태**와
+#   정확히 같게 맞춘다(순수 한글 · 길이 4~14 · 분석 결과가 NNG/NNP뿐). 더 넓게 위임하면
+#   결정론이 그 후보를 스킵해 **카드가 통째로 사라진다**(⑪의 '2차전지' 회귀와 같은 부류).
+_JOIN_MIN_LEN, _JOIN_MAX_LEN = 4, 14      # find_compound_spacing_consistency 기본값과 동일
+
+
+def _deterministic_takes_joined(joined: str) -> bool:
+    """붙임형이 결정론 다수결의 후보 조건(순수 한글 명사 덩어리·길이 4~14)을 만족하는가."""
+    if not (_JOIN_MIN_LEN <= len(joined) <= _JOIN_MAX_LEN):
+        return False
+    if not all("가" <= ch <= "힣" for ch in joined):
+        return False
+    try:
+        from . import morph as _m
+        kiwi = _m._get_kiwi()
+        if kiwi is None:
+            return False
+        toks = kiwi.analyze(joined)[0][0]
+    except Exception:
+        return False
+    return bool(toks) and all(t.tag in ("NNG", "NNP") for t in toks)
+
+
+def is_compound_join_respacing(c) -> bool:
+    """⑪-b 한글 명사 어절들을 공백 제거로 붙이는 join(글자 불변) → 결정론 다수결에 위임(드롭)."""
+    if c.source not in ("ai_typo", "ai_polish") or c.original == c.corrected:
+        return False
+    o, cr = c.original, c.corrected
+    if o.replace(" ", "") != cr.replace(" ", ""):      # 순수 재띄어쓰기(글자 불변)만
+        return False
+    o_toks, c_toks = o.split(), cr.split()
+    if len(c_toks) >= len(o_toks):                     # 붙이기(어절 수 감소) 방향만
+        return False
+    j, fired = 0, False
+    for ct in c_toks:
+        buf, n = "", 0
+        while j < len(o_toks) and len(buf) < len(ct):
+            buf += o_toks[j]
+            j += 1
+            n += 1
+        if buf != ct:                                  # 어절 경계 어긋남(재배치) → 대상 아님
+            return False
+        if n >= 2:                                     # 이 교정문 어절이 여러 어절을 합쳤다
+            if not _deterministic_takes_joined(ct):
+                return False                           # 결정론이 못 받는 형태 → AI 카드 보존
+            fired = True
+    return fired and j == len(o_toks)
+
+
 # ── ⑫ 쉼표(,) 가감 → 저자 문장부호 존중(드롭) ─────────────────────────────
 # '…적용되지 않아, 초기…'→'…적용되지 않아 초기…'처럼 AI가 **저자의 쉼표(,)만 넣거나 빼는** 교정을
 #   '불필요한 쉼표 삭제' 명분으로 제안하는 것. 쉼표는 절·열거의 호흡을 정하는 **저자·편집자 문장부호
@@ -514,6 +577,8 @@ _GUARDS = (
      "쌍점→가운뎃점 치환 AI 교정 {n}건 제외 (비율·대비·점수·시각 등 쌍점 의도 존중)"),
     ("compound_split_respacing", is_compound_split_respacing,
      "복합명사 분리 AI 교정 {n}건 제외 (띄어쓰기 일관성은 결정론 다수결이 담당)"),
+    ("compound_join_respacing", is_compound_join_respacing,
+     "복합명사 붙이기 AI 교정 {n}건 제외 (띄어쓰기 일관성은 결정론 다수결이 담당)"),
     ("comma_edit", is_comma_edit,
      "쉼표 가감 AI 교정 {n}건 제외 (쉼표는 저자·편집자 문장부호 판단 — 오탈자·띄어쓰기 아님)"),
     ("numeral_to_hangul", is_numeral_to_hangul,
