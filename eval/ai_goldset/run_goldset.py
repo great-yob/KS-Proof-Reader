@@ -500,7 +500,29 @@ def phase_a_grammar_demote():
         ("사용율", "사용률"),                    # 접미사 '철자'만 — form 비교면 오발화
         ("복지 지갑", "복지지갑"), ("이상거래탐지", "이상거래 탐지"),
         ("행상활동", "행상 활동"),
+        # ⚠ **오탈자가 형태소 분석을 깨뜨려 '문법 재구성'으로 오판되던 부류**
+        #   (사용자 보고 2026-07-31, 실파일 고독사 원고). kiwi가 분석 불가 조각에
+        #   영형태 지정사(이/VCP, t.len==0)를 끼워 넣어 태그 열이 달라졌다 —
+        #   즉 **오탈자일수록 강등되는 역설**. 교정 내용과 사유가 정면 모순이었다.
+        ("예를 드어", "예를 들어"),              # 드/NNG+이/VCP+어/EF ← 정상은 들/VV+어/EC
+        ("해소히고", "해소하고"),                # 히/NNG+이/VCP+고/EC ← 정상은 하/XSV+고/EC
+        ("들어가 드어", "들어가 들어"),          # 교정문이 불규칙(듣/VV-I) — 면제가 죽으면 안 됨
     ]
+    # '분석 실패' 판정 자체의 불변식 — 위 keep_cases는 결과만 보므로 여기서 신호를 직접 고정.
+    #   ⚠ 표면 문자열 비교(초기 구현)로 되돌리면 불규칙·축약이 전부 '실패'로 오검출된다.
+    broken_cases = [
+        ("드어", True), ("해소히고", True),          # 영형태 지정사 폴백 = 오탈자 신호
+        ("들어", False), ("해야", False), ("봐서", False), ("돼요", False),  # 불규칙·축약
+        ("아닌", False),                              # 자모 어미 ᆫ/ETM
+        ("문제다", False), ("고독사다", False),        # 정상 영형태 지정사(체언 + (이)다)
+        ("해소하고", False), ("캠페인", False),
+    ]
+    import nikl_dict as _nd
+    for w, exp in broken_cases:
+        got = ai_guards._analysis_broken(w, lambda x: _nd.lookup_word(x)["exists"])
+        if got != exp:
+            fails += 1
+            print(f"  ✗ FAIL [분석실패 판정] {w!r} 기대={exp} 실제={got}")
     for o, c in demote_cases:
         cor = Correction(original=o, corrected=c, reason="교정", source="ai_typo",
                          color=HL_TYPO, confidence="high")
@@ -545,7 +567,8 @@ def phase_a_grammar_demote():
         if got != expect:
             fails += 1
             print(f"  ✗ FAIL [낱말삭제] {o!r}→{c!r} 기대강등={expect} 실제={got}")
-    n = len(demote_cases) + len(keep_cases) + 1 + len(del_cases)
+    n = (len(demote_cases) + len(keep_cases) + len(broken_cases) + 1
+         + len(del_cases))
     print(f"  → {n - fails}/{n} 통과" + ("  ✅" if fails == 0 else "  ❌"))
     return fails
 

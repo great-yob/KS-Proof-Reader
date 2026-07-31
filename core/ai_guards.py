@@ -1662,9 +1662,31 @@ def drop_author_defined_abbrev_expansion(ai_list: list, document_text: str,
 _GRAM_TAG_PREFIX = ("J", "E")                          # 조사 · 어미(ETM/ETN 포함)
 _GRAM_TAG_EXACT = ("XSV", "XSA", "XSN", "VCP", "VCN")   # 파생접미사 · 지정사
 
+# ⚠⚠ **㉕의 대전제: 원문이 정상적인 한국어 표면형이어야 한다.**
+#   원문이 오탈자면 형태소 분석 자체가 실패하고, kiwi는 그때 **표면에 없는 형태소를
+#   지어내는 폴백**을 쓴다 — 분석 불가 조각을 NNG로 두고 지정사 '이/VCP'를 끼워 넣는다:
+#       '예를 드어'  → 예/NNG 를/JKO 드/NNG **이/VCP** 어/EF   (정상: 들/VV 어/EC)
+#       '해소히고'   → 해소/NNG 히/NNG **이/VCP** 고/EC        (정상: 하/XSV 고/EC)
+#   그러면 태그 열이 당연히 달라져 ③이 발동한다. 즉 **오탈자일수록 '문법 재구성'으로
+#   오판**되는 구조적 역설이었다(사용자 보고 2026-07-31: '예를 드어'→'예를 들어',
+#   '해소히고'→'해소하고'가 "오탈자·띄어쓰기 범위를 넘는 문법·표현 재구성"으로 강등 —
+#   교정 내용과 사유가 정면으로 모순). 오탈자 교정은 이 가드의 대상이 아니라
+#   **오탈자 계층의 정상 산출물**이므로 판정을 보류한다.
+#
+# 판별은 **토큰의 표면 길이(t.len)가 0인가**로 한다 — 분석기가 표면에 대응 글자 없이
+#   지어낸 형태소가 곧 폴백의 흔적이다(실측 span: '드어' = 드@0len1 · **이/VCP@1len0** ·
+#   어@1len1).
+# ⚠ '표면 문자열에 그 형태가 있는가'로 비교하면 안 된다(초기 구현의 오답) — 정상
+#   활용형이 대량 오검출된다: 불규칙('들어' = **듣**/VV-I + 어)·축약('해야' = **하**/VV +
+#   어야, '봐서' = 보/VV + 어서)은 표면에 어간 글자가 아예 없다. 이들은 t.len ≥ 1이라
+#   길이 기준에는 걸리지 않는다.
+# ⚠ len 0인데 **정상**인 유일한 부류가 영형태 지정사('문제다' = 문제 + (이) + 다)라,
+#   앞이 **2글자 이상 실재 체언**이면 정상으로 인정한다(실측: 문제다·연구다·결과다·
+#   고독사다 전부 이 모양). 그 자리가 1글자 조각이면('드'·'히') 분석 실패다.
+_ZERO_COPULA_HOST = ("NNG", "NNP", "NNB", "NR", "SN", "SL", "XSN")
 
-def _gram_tag_seq(s: str):
-    """문법 형태소의 **태그 열**. 형태소 분석이 안 되면 None(판정 보류)."""
+
+def _tokens(s: str):
     from core import morph as _m
     if not _m.available():
         return None
@@ -1672,19 +1694,62 @@ def _gram_tag_seq(s: str):
     if kiwi is None:
         return None
     try:
-        tokens = kiwi.analyze(s)[0][0]
+        return kiwi.analyze(s)[0][0]
     except Exception:
+        return None
+
+
+def _analysis_broken(s: str, exists_fn=None) -> bool:
+    """s의 형태소 분석이 '실패 폴백'인가(= 오탈자 신호). 분석 불가 시 False."""
+    tokens = _tokens(s)
+    if not tokens:
+        return False
+    for i, t in enumerate(tokens):
+        if getattr(t, "len", None) != 0:  # 표면 길이 미제공 시에도 판정 보류(안전)
+            continue
+        if t.tag == "VCP":                # 영형태 지정사만 정상일 수 있다
+            prev = tokens[i - 1] if i else None
+            if (prev is not None and prev.tag in _ZERO_COPULA_HOST
+                    and len(prev.form) >= 2
+                    and (exists_fn is None or bool(exists_fn(prev.form)))):
+                continue                  # '문제(이)다' — 서술격 조사 생략
+        return True
+    return False
+
+
+def _is_typo_repair(o: str, c: str, exists_fn=None) -> bool:
+    """'분석이 깨진 어절 → 정상 어절'로 고치는 오탈자 교정인가(어절 수 동일 전제).
+
+    바뀐 어절이 **전부** 그 모양이어야 한다. 하나라도 정상 어절을 건드렸다면
+    문법·표현 편집이 섞인 것이므로 면제하지 않는다(억제 방향으로 안전).
+    """
+    ow, cw = o.split(), c.split()
+    if len(ow) != len(cw):
+        return False
+    diff = [(a, b) for a, b in zip(ow, cw) if a != b]
+    if not diff:
+        return False
+    return all(_analysis_broken(a, exists_fn) and not _analysis_broken(b, exists_fn)
+               for a, b in diff)
+
+
+def _gram_tag_seq(s: str):
+    """문법 형태소의 **태그 열**. 형태소 분석이 안 되면 None(판정 보류)."""
+    tokens = _tokens(s)
+    if tokens is None:
         return None
     return [t.tag for t in tokens
             if t.tag.startswith(_GRAM_TAG_PREFIX) or t.tag in _GRAM_TAG_EXACT]
 
 
-def _is_grammar_restructuring(original: str, corrected: str) -> bool:
+def _is_grammar_restructuring(original: str, corrected: str, exists_fn=None) -> bool:
     o, c = (original or "").strip(), (corrected or "").strip()
     if not o or not c or o == c:
         return False
     if o.replace(" ", "") == c.replace(" ", ""):
         return False                      # ① 띄어쓰기만 — 면제
+    if _is_typo_repair(o, c, exists_fn):
+        return False                      # ①b 오탈자 교정 — 면제(위 주석)
     if len(o.split()) != len(c.split()):
         return True                       # ② 어절 수 변화
     a, b = _gram_tag_seq(o), _gram_tag_seq(c)
@@ -1693,15 +1758,17 @@ def _is_grammar_restructuring(original: str, corrected: str) -> bool:
     return a != b                         # ③ 문법 골격 변화
 
 
-def demote_grammar_restructuring(corrections: list, logger=None) -> list:
+def demote_grammar_restructuring(corrections: list, exists_fn=None,
+                                 logger=None) -> list:
     """㉕ 문법 골격·어절 구성을 바꾸는 AI 교정을 low로 강등한다(제자리 수정 후 반환).
 
-    오탈자(내용 형태소 철자)·띄어쓰기는 건드리지 않는다.
+    오탈자(내용 형태소 철자)·띄어쓰기는 건드리지 않는다. `exists_fn`(표제어 조회)은
+    영형태 지정사 예외를 정밀하게 만드는 **보강용**이라 없어도 동작한다(길이로 판정).
     """
     demoted = 0
     for c in corrections:
         if (c.source in ("ai_typo", "ai_polish") and c.confidence != "low"
-                and _is_grammar_restructuring(c.original, c.corrected)):
+                and _is_grammar_restructuring(c.original, c.corrected, exists_fn)):
             c.confidence = "low"
             if not (c.reason or "").startswith("[검수]"):
                 c.reason = ("[검수] " + (c.reason or "")

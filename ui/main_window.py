@@ -459,7 +459,9 @@ class MainWindow(QMainWindow):
         #   '수락 X / Y곳' 숫자(Y=등장)가 분석의 '교정 N건'(N=항목)과 왜 다른지 설명.
         _, _, occ_total = self.review_panel.get_counts()
         if occ_total and occ_total != detected:
-            self.activity.log(f"  · 본문 {occ_total}곳에 해당 (반복 등장 포함)")
+            # ⚠ 선두 불릿(·)을 쓰지 말 것 — 활동 패널은 불릿 라인을 '개별 항목 상세'로
+            #   보고 화면에서 숨긴다(activity_panel._ITEM_RE). 이건 집계 라인이다.
+            self.activity.log(f"  → 본문 {occ_total}곳에 해당 (반복 등장 포함)")
 
         self.running_panel.set_title("분석 완료")
         self.running_panel.set_detail("아래 버튼을 눌러 교정 제안 검토를 시작하세요.", tone="text_success")

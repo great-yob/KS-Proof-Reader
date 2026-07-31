@@ -387,7 +387,9 @@ class ProofreadingWorker(QThread):
             #   '결제 기능은', '방향이 전제로 되어야'→'방향을 전제로 해야', 2026-07-30 보고).
             #   ⚠ 사유 문구가 아니라 **구조**로 판정한다(상세는 ai_guards ㉕ 주석).
             #   Case A 변형이 confidence를 복사하므로 반드시 [4.5] 일관성 전파 앞.
-            ai_list = ai_guards.demote_grammar_restructuring(ai_list, logger=log)
+            #   exists_fn: 오탈자 교정 면제의 '영형태 지정사' 예외를 사전으로 정밀화한다.
+            ai_list = ai_guards.demote_grammar_restructuring(
+                ai_list, lambda w: lookup_word(w)["exists"], logger=log)
             # 낱말 삭제 강등 — '인증위험 기반'→'위험 기반'처럼 내용 낱말을 지우는 교정은
             #   중복 오타인지 저자의 전문용어인지 규칙으로 판단할 수 없다(2026-07-30 보고).
             #   인접 완전중복('그리고 그리고'→'그리고')만 명백한 오타로 보고 high 유지.
@@ -498,7 +500,9 @@ class ProofreadingWorker(QThread):
                             std = std_norm.get(key) or std_eomun.get(key)
                             if std and std != norm:
                                 conflicts += 1
-                                log(f"  [사내 용어] 충돌 — '{key}': 사내 '{norm}' vs "
+                                # 개별 충돌은 불릿 상세로만 — 화면에는 아래 집계
+                                #   '사내 용어 충돌 n건'만 나간다(로그 표기 규약).
+                                log(f"      · 사내 용어 충돌 '{key}': 사내 '{norm}' vs "
                                     f"국가 표준 '{std}' → 국가 표준 우선")
                                 break
                             josa = w[len(key):] if w.startswith(key) else ""
@@ -1401,10 +1405,12 @@ class ProofreadingWorker(QThread):
                     _jp_exc = frozenset()
                 jd = _jp.resolve(merged, text, logger=log, exception_set=_jp_exc)
                 # 화면에는 **한 줄로만** 낸다(사용자 지정 2026-07-30). 개별 판정
-                #   (미탐 보완/방향 정정/이음매 정합/이음매 그룹)은 위 resolve가 원문
-                #   로그로 남기고 activity_panel._DROP이 표시에서 걸러낸다 — 진단은
-                #   보존하고 화면만 정리하는 이 저장소의 표준 방식이다.
+                #   (미탐 보완/방향 정정/이음매 정합/이음매 그룹/상호 무효화 쌍)은 위
+                #   resolve가 `· ` 불릿 상세로 원문 로그에 남기고 activity_panel._ITEM_RE가
+                #   표시에서 걸러낸다 — 진단은 보존하고 화면만 정리하는 표준 방식이다.
                 #   n = 실제로 카드를 만들거나 고친 판정 수(보존은 무연산이라 제외).
+                #   ⚠ jd["mutual"](상호 무효화 쌍)은 더하지 않는다 — 그 쌍은 예외 없이
+                #     이음매 그룹으로 묶여 grouped에 이미 반영된다(더하면 이중 계상).
                 n = (jd.get("recovered", 0) + jd.get("redirected", 0)
                      + jd.get("dropped", 0) + jd.get("harmonized", 0)
                      + jd.get("grouped", 0))

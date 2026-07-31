@@ -258,11 +258,14 @@ def resolve(corrections: list, text: str, *, logger=None,
 
     반환 키: preserved(정당한 구분 쌍) / harmonized(자동 정합 카드) /
              grouped(이음매 그룹 수) / recovered(미탐 보완 카드) / conflicts(총 충돌 쌍) /
-             redirected(방향 정정 카드) / dropped(방향 오판으로 제거한 카드)
+             redirected(방향 정정 카드) / dropped(방향 오판으로 제거한 카드) /
+             mutual(상호 무효화 쌍 — 전부 이음매 그룹으로 넘어가므로 grouped의 부분집합.
+                    워커 요약 n에 **따로 더하지 말 것**: 같은 판정을 두 번 세게 된다)
     """
     log = logger or (lambda *_a, **_k: None)
     diag = {"conflicts": 0, "preserved": 0, "harmonized": 0,
-            "grouped": 0, "recovered": 0, "redirected": 0, "dropped": 0}
+            "grouped": 0, "recovered": 0, "redirected": 0, "dropped": 0,
+            "mutual": 0}
     from core import morph as _morph
     if not text or not _morph.available():
         return diag
@@ -420,6 +423,7 @@ def resolve(corrections: list, text: str, *, logger=None,
                 log(f"      · 정당한 구분 유지 '{a['c'].original}' ↔ "
                     f"'{b['c'].original}' (양쪽 다 문서 내 다수 표기)")
                 continue
+            diag["mutual"] += 1
             log(f"      · 상호 무효화 쌍 → 사용자 결정 '{a['c'].original}' ↔ "
                 f"'{b['c'].original}' (한쪽이 다른 쪽 교정 결과를 되돌림)")
             adj[id(a["c"])].add(id(b["c"]))
