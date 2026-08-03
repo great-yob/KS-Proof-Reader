@@ -128,6 +128,39 @@ def is_urlish(word: str) -> bool:
     return bool(word) and bool(_URLISH.search(word))
 
 
+# ── 제로폭·비가시 문자 어절 보호 ───────────────────────────────────────────
+# 실측(2026-08-03, 사회보장 AI 가이드라인 .hwp): '적용된다.'가 **'적용된 다.'** 로 쪼개지는
+#   카드가 나왔다(사용자 보고). 원인은 형태소 분석이 아니라 **원고에 박힌 U+200B(제로폭
+#   공백)** 다 — 실제 어절은 `적용된<U+200B>다.` 이고, kiwi는 그 제로폭 문자를 **NNG(명사)**
+#   로 태깅한다(`[적용/NNG, 되/XSV, ᆫ/ETM, <U+200B>/NNG, 이/VCP, 다/EF]`). 그래서
+#   '관형형어미(ETM) + 명사' 규칙이 **유령 명사** 앞에서 발동해 어미 '-ㄴ다'를 갈라 놨다.
+#   ⚠ 화면에서도 로그에서도 **보이지 않는 글자**라 카드만 보면 원인을 알 수 없다
+#   (`적용된다`와 `적용된<U+200B>다`는 눈으로 구별 불가) — 이 문서에 13개가 박혀 있었다.
+#   ⚠ 제거로 고칠 수 없다: 제로폭을 지우면 글자가 바뀌어 '공백만 삽입' 불변식이 깨지고,
+#   `original`이 문서 실제 문자열과 달라져 적용 단계에서 조용히 실패한다
+#   ([[hwp-gettext-boundary-verify]] '본문에 원문 없음' 부류). 그래서 **어절째 건너뛴다** —
+#   `is_urlish`와 같은 처리(그 어절의 띄어쓰기는 미탐으로 남기고, 틀린 카드를 내지 않는다).
+#   ⚠ 이 집합은 **반드시 ordinal(0x200B)로** 적을 것 — 문자를 리터럴로 넣으면 소스에서도
+#   보이지 않아 유지보수가 불가능하고, 편집 중에 조용히 사라지거나 늘어난다(실제로 겪음).
+_ZERO_WIDTH = frozenset((
+    0x200B,           # ZERO WIDTH SPACE ← 실측된 원인
+    0x200C, 0x200D,   # ZWNJ / ZWJ
+    0x2060, 0xFEFF,   # WORD JOINER / ZERO WIDTH NO-BREAK SPACE(BOM)
+    0x00AD,           # SOFT HYPHEN
+    0x180E,           # MONGOLIAN VOWEL SEPARATOR
+    0x200E, 0x200F,   # LRM / RLM
+))
+
+
+def has_zero_width(word: str) -> bool:
+    """어절에 제로폭·비가시 문자가 섞였는가 — 띄어쓰기 제안에서 통째로 제외한다.
+
+    kiwi가 이런 문자를 NNG로 읽어 **유령 명사**가 생기고, 그 앞뒤로 엉뚱한 띄어쓰기
+    경계가 만들어진다(`적용된<U+200B>다.`→'적용된 다.', `할<U+200B>수`도 같은 모양).
+    """
+    return bool(word) and any(ord(ch) in _ZERO_WIDTH for ch in word)
+
+
 def strip_josa(word: str):
     """어절 끝의 조사(J*)와 계사(이다/아니다 VCP·VCN + 그 어미)만 잘라낸 base 반환.
 
@@ -601,7 +634,7 @@ def find_spacing_suggestions(text: str, min_len: int = 2) -> list:
         seen.add(w)
         if not _re.search(r"[가-힣]", w):
             continue
-        if is_urlish(w):        # URL·경로에 공백을 넣으면 링크가 깨진다(is_urlish 주석)
+        if is_urlish(w) or has_zero_width(w):        # URL·경로에 공백을 넣으면 링크가 깨진다(is_urlish 주석)
             continue
         try:
             words.append((w, kiwi.analyze(w)[0][0]))
@@ -745,7 +778,8 @@ def find_dependent_noun_spacing(text: str) -> list:
         return []
     out, seen = [], set()
     for w in text.split():
-        if w in seen or not _re.search(r"[가-힣]", w) or is_urlish(w):
+        if (w in seen or not _re.search(r"[가-힣]", w)
+                or is_urlish(w) or has_zero_width(w)):
             continue
         seen.add(w)
         try:
@@ -835,7 +869,7 @@ def find_symbol_noun_spacing(text: str) -> list:
         qroles = None    # 줄에 따옴표 후보가 실제로 나올 때만 계산(지연)
         for wm in re.finditer(r"\S+", line):
             w = wm.group()
-            if is_urlish(w):     # URL의 ')' 등을 '닫는 기호'로 보고 띄우면 링크가 깨진다
+            if is_urlish(w) or has_zero_width(w):     # URL의 ')' 등을 '닫는 기호'로 보고 띄우면 링크가 깨진다
                 continue
             if w in seen or not any((ch in _CLOSE_SYM or ch in _QUOTE_SYM) for ch in w):
                 continue
@@ -923,7 +957,8 @@ def find_auxiliary_verb_spacing(text: str) -> list:
         return []
     out, seen = [], set()
     for w in text.split():
-        if w in seen or not _re.search(r"[가-힣]", w) or is_urlish(w):
+        if (w in seen or not _re.search(r"[가-힣]", w)
+                or is_urlish(w) or has_zero_width(w)):
             continue
         seen.add(w)
         try:
@@ -972,7 +1007,8 @@ def find_aux_connective_spacing(text: str) -> list:
         return []
     out, seen = [], set()
     for w in text.split():
-        if w in seen or not _re.search(r"[가-힣]", w) or is_urlish(w):
+        if (w in seen or not _re.search(r"[가-힣]", w)
+                or is_urlish(w) or has_zero_width(w)):
             continue
         seen.add(w)
         try:
@@ -1028,6 +1064,8 @@ def find_eojida_join(text: str) -> list:
             if (not A or not B or not ("가" <= A[-1] <= "힣")
                     or not ("가" <= B[0] <= "힣")):
                 continue
+            if has_zero_width(A) or has_zero_width(B):
+                continue          # 유령 명사가 용언 경계 판정을 흔든다(has_zero_width 주석)
             if A[-1] not in "아어여" or B[0] not in _JI_HEAD:
                 continue
             try:

@@ -296,6 +296,63 @@ def phase_a_doc_dict():
             fails += 1
             print(f"  ✗ FAIL [병기명칭] {o!r}→{c!r} 기대제외={expect_drop} 실제={dropped}")
 
+    # ㉗ demote_registered_term_substitution: 저자가 고른 등재 용어를 같은 계열의 다른 등재
+    #   용어로 '통일'하는 AI 교정을 low 강등(★실보고 2026-08-03: '지방정부'→'지방자치단체',
+    #   사유 "글로서리 규칙에 따른 용어 통일", `표준어`·high·7곳). [K]는 '지'·'방' 공유 음절
+    #   때문에 오탈자로 간주해 면제했다. ⚠ **드롭이 아니라 강등** — 같은 모양의 정당한
+    #   규범표기 교정이 norm_map 12,750쌍 중 387쌍이라 드롭하면 그 부류가 조용히 죽는다.
+    _TDICT = {"지방정부", "지방자치단체", "중앙정부", "성평등가족부", "여성가족부",
+              "컨텐츠", "콘텐츠", "역활", "역할", "세수그릇", "세숫그릇", "줄장미", "덩굴장미"}
+    t_exists = lambda w: w in _TDICT
+    ts_cases = [
+        # (원문, 교정, 기대_강등)
+        ("지방정부", "지방자치단체", True),      # ★보고 — 공통 접두 '지방' + 자모거리 8
+        ("지방정부는", "지방자치단체는", True),   # 조사형 카드도 base로 판정
+        ("성평등가족부", "여성가족부", True),     # 공통 접미 '가족부' + 거리 7
+        ("중앙정부", "지방정부", False),          # 거리 3 < 4 → 보존(임계값 경계)
+        ("컨텐츠", "콘텐츠", False),              # 외래어 표기 교정(거리 1) → 보존
+        ("역활", "역할", False),                  # 오탈자(거리 1) → 보존
+        ("세수그릇", "세숫그릇", False),          # 사이시옷(거리 1) → 보존
+        ("지방정부", "지방정부론", False),        # 부분문자열 = 확장([R] 소관) → 보존
+        ("지방정부", "지방행정기관", False),      # 원문만 등재(교정문 미등재) → 보존
+        ("지방정부", "지방 정부", False),         # 띄어쓰기(순한글 단일어절 아님) → 보존
+    ]
+    for o, c, expect in ts_cases:
+        cor = Correction(original=o, corrected=c, reason="r", source="ai_typo",
+                         color=HL_TYPO, confidence="high")
+        ai_guards.demote_registered_term_substitution([cor], t_exists)
+        got = (cor.confidence == "low")
+        if got != expect:
+            fails += 1
+            print(f"  ✗ FAIL [㉗용어치환] {o!r}→{c!r} 기대강등={expect} 실제={got}")
+    #   강등이지 드롭이 아님을 명시적으로 고정한다.
+    _cor = Correction(original="지방정부", corrected="지방자치단체", reason="r",
+                      source="ai_typo", color=HL_TYPO, confidence="high")
+    _out = ai_guards.demote_registered_term_substitution([_cor], t_exists)
+    if len(_out) != 1 or "[검수]" not in _cor.reason:
+        fails += 1
+        print("  ✗ FAIL [㉗용어치환] 강등이 아니라 드롭됐거나 [검수] 표기가 없음")
+
+    # ★가드 강등이 뒤 단계에서 되올려지지 않는가(실보고 2026-08-03 후속) —
+    #   ㉗이 low로 내린 카드를 `reconcile_variant_confidence`가 **high로 되돌려** 놨다.
+    #   `replace()`가 reason은 그대로 두고 confidence만 바꾸는 탓에, 화면엔 '[검수] …'
+    #   사유가 붙은 채 **자동 적용되는 high 카드**가 떠서 가드가 안 먹은 것처럼 보였다.
+    #   ⚠ 반대로 validate()發 강등(reason 무마커)은 계속 통일돼야 한다(이 함수의 본래 목적).
+    from core.consistency_pass import reconcile_variant_confidence as _rvc
+    rvc_cases = [
+        ("가드 강등 유지", "[검수] 용어 치환 — 확인 필요", "low"),
+        ("validate 강등은 통일", "일본 지명 표기", "high"),
+    ]
+    for name, reason, want in rvc_cases:
+        pair = [Correction(original="지방정부", corrected="지방자치단체", reason=reason,
+                           source="ai_typo", color=HL_TYPO, confidence="low"),
+                Correction(original="지방자치단쳬", corrected="지방자치단체", reason="오탈자",
+                           source="ai_typo", color=HL_TYPO, confidence="high")]
+        got = _rvc(pair)[0].confidence
+        if got != want:
+            fails += 1
+            print(f"  ✗ FAIL [신뢰도통일] {name}: 기대 {want} 실제 {got}")
+
     # drop_word_substitution_paraphrase: 문맥 윤문의 '단어 교체'(하에→아래) 차단 —
     #   조사 추가·오탈자·최소대립쌍은 보존. 실 사전이 필요해 _WDICT로 등재 여부 모사.
     _WDICT = {"하", "아래", "위험", "리스크", "몇일", "며칠", "역활", "역할",
@@ -412,7 +469,8 @@ def phase_a_doc_dict():
         print("  ✗ FAIL [각주절단] note_lines 없을 때 무회귀 실패")
 
     n = (len(exp_cases) + len(hd_cases) + len(dm_cases) + len(ws_cases) + len(pj_cases)
-         + len(gn_cases) + len(cv_cases) + len(fr_cases) + 1)
+         + len(gn_cases) + len(cv_cases) + len(fr_cases) + len(ts_cases)
+         + len(rvc_cases) + 1 + 1)
     print(f"  → {n - fails}/{n} 통과" + ("  ✅" if fails == 0 else "  ❌"))
     return fails
 
@@ -1088,9 +1146,84 @@ def phase_g_junction():
         fails += 1
         print(f"  ✗ FAIL [G-6 URL] finder가 URL 어절 카드를 냄: {leaked[:3]}")
 
+    # ── G-8 제로폭 문자 어절 보호 ──────────────────────────────────
+    #   ★실보고 2026-08-03: 멀젠한 '적용된다.'가 '적용된 다.'로 쪠개졌다. 원인은 원고에 박힐
+    #   U+200B(제로폭 공백) — 실제 어절은 `적용된<U+200B>다.` 이고 kiwi가 그 문자를 NNG로
+    #   태깅해 '관형형어미 + 명사' 규칙이 **유령 명사** 앞에서 발동했다. 눈에 보이지 않아
+    #   카드만으로는 원인을 알 수 없는 부류라 회귀 게이트로 고정한다.
+    #   ⚠ 테스트 데이터도 **ordinal로** 만든다 — 리터럴로 적으면 소스에서 안 보여 유지보수 불가.
+    _ZWSP, _BOM = chr(0x200B), chr(0xFEFF)
+    zw_doc = ("이는 공·사 부문 모두에 적용된" + _ZWSP + "다. "
+              "그러므로 할" + _ZWSP + "수 있다. 정상 문장은 적용된다. 할 수 있다.")
+    zw_leaked = []
+    for f in (_morph.find_spacing_suggestions, _morph.find_symbol_noun_spacing,
+              _morph.find_dependent_noun_spacing, _morph.find_auxiliary_verb_spacing,
+              _morph.find_aux_connective_spacing, _morph.find_eojida_join):
+        for o, c in f(zw_doc):
+            if _morph.has_zero_width(o) or _morph.has_zero_width(c):
+                zw_leaked.append((f.__name__, o, c))
+    if zw_leaked:
+        fails += 1
+        print(f"  ✗ FAIL [G-8 제로폭] finder가 제로폭 어절 카드를 냄: {zw_leaked[:3]}")
+    #   ⚠ 제로폭을 **지우는** 카드도 내서는 안 된다 — original이 문서 실제 문자열과
+    #   달라져 적용 단계에서 조용히 실패한다('본문에 원문 없음' 부류).
+    for o, _c in _morph.find_spacing_suggestions(zw_doc):
+        if o not in zw_doc:
+            fails += 1
+            print(f"  ✗ FAIL [G-8 제로폭] 문서에 없는 원문 카드: {o!r}")
+    zw_cases = [("적용된" + _ZWSP + "다.", True), ("적용된다.", False),
+                ("할" + _ZWSP + "수", True), ("할 수", False),
+                (_BOM + "머리말", True), ("머리말", False)]
+    for w, want in zw_cases:
+        if _morph.has_zero_width(w) != want:
+            fails += 1
+            print(f"  ✗ FAIL [G-8 제로폭] has_zero_width({w!r}) != {want}")
+
+    # ── G-7 어절 꼬리 조각이 낱말의 머리가 되지 않는가 ─────────────────────────
+    #   한글 런은 어절이 아니다 — 앞이 영문·숫자·한자면 그 런은 어절의 **꼬리 조각**이다.
+    #   'EU AI Act의 주요내용'의 런은 ['의','주요내용']이라, 막지 않으면 조사 '의'가 낱말의
+    #   머리로 승격돼 `의주요내용`이라는 없는 낱말이 서고 '의 주요내용'→'의 주요 내용'
+    #   카드가 사용자에게 나갔다(사용자 보고 2026-08-03).
+    #   ⚠ 그렇다고 '앞이 공백일 때만'으로 막으면 안 된다 — 이 저장소는 괄호·가운뎃점을
+    #   낱말 경계로 세는 것이 원칙이라 '(현금)수급자 확인서'의 근거가 함께 날아간다
+    #   (실측 실파일D: 잡음 5건과 함께 정당한 카드 6건 소실). 그래서 부호 뒤는 그 런이
+    #   **어절의 조사 꼬리**일 때만 거부한다 — 아래 두 '부호 뒤' 케이스가 그 경계선이다.
+    frag = [
+        ("영문+조사", "EU AI Act의 주요 내용\nEU AI Act의 주요내용", "의주요내용", False),
+        ("영문+조사2", "EU AI Act의 위험 기반\nEU AI Act의 위험기반", "의위험기반", False),
+        ("숫자+꼬리", "2024년 주요 내용\n2024년 주요내용", "년주요내용", False),
+        ("숫자+단위", "3대 윤리 원칙\n3대 윤리원칙", "대윤리원칙", False),
+        ("부호 뒤 조사", "｢AI 추진법｣의 주요 내용\n｢AI 추진법｣의 주요내용",
+         "의주요내용", False),
+        ("본 낱말 보존", "EU AI Act의 주요 내용\nEU AI Act의 주요내용", "주요내용", True),
+        ("문두", "주요 내용 정리\n주요 내용 요약", "주요내용정리", True),
+        ("부호 뒤 명사", "급여(현금)수급자 확인서와 급여(현금)수급자 확인서를",
+         "수급자확인서", True),
+        ("따옴표 뒤", "‘수급자 확인서’와 ‘수급자 확인서’를", "수급자확인서", True),
+        ("가운뎃점 뒤", "보조금·수급자 확인서 및 보조금·수급자 확인서를",
+         "수급자확인서", True),
+        ("각주번호 뒤따름", "주요 내용1) 정리\n주요 내용2) 요약", "주요내용", True),
+    ]
+    for name, doc, key, want in frag:
+        if (key in _jp.build_variants(doc)) != want:
+            fails += 1
+            print(f"  ✗ FAIL [G-7 꼬리조각] {name}: {key!r} "
+                  f"{'가 사라짐' if want else '가 생성됨'}")
+    #   실제 카드로도 새지 않는가 — 원문이 조사로 시작하는 띄어쓰기 카드는 있을 수 없다.
+    doc_frag = ("EU AI Act의 주요 내용 " * 6 + "EU AI Act의 주요내용 " * 3)
+    _cards = []
+    _jp.resolve(_cards, doc_frag)
+    _bad = [c.original for c in _cards
+            if (c.original or " ").split(" ")[0] in ("의", "은", "는", "이", "가",
+                                                     "을", "를", "와", "과", "로")]
+    if _bad:
+        fails += 1
+        print(f"  ✗ FAIL [G-7 꼬리조각] 조사로 시작하는 카드 생성: {_bad[:3]}")
+
     print(f"  G-1 보존 · G-2 정합/그룹 · G-3 불변식 {len(inv)}항목 · "
           f"G-4 전파 {len(sims)}케이스 · G-5 조사·기호 {len(josa)}케이스 · "
-          f"G-6 URL {len(urlish)}판정+누출검사 완료")
+          f"G-6 URL {len(urlish)}판정+누출검사 · G-7 꼬리조각 {len(frag)}케이스 · "
+          f"G-8 제로폭 {len(zw_cases)}판정+누출검사 완료")
     print(f"  → Phase G {'✅ 통과' if fails == 0 else f'❌ {fails}건 실패'}")
     return fails
 

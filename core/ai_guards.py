@@ -1266,6 +1266,98 @@ def demote_org_name_substitution(corrections: list, logger=None) -> list:
 
 
 # ══════════════════════════════════════════════════════════
+# ▌㉗ 등재 복합용어 치환 강등 — 저자가 고른 전문용어를 '통일' 명분으로 바꾸기
+# ══════════════════════════════════════════════════════════
+# '지방정부'→'지방자치단체'(사유 "글로서리 규칙에 따른 용어 통일", `표준어`·**high**, 7곳)
+# — 사용자 보고 2026-08-03. 둘 다 우리말샘 등재어이고 뜻이 겹치지만 **다른 용어**다
+# (지방정부=정치학 용어 / 지방자치단체=법률 용어). 문서가 '지방자치단체' 16회·'지방정부' 7회를
+# 함께 쓴다는 이유로 AI가 다수형에 맞춰 '통일'해 버렸다.
+#   ⚠ **어휘 통일은 교정 스코프가 아니다.** 이 저장소는 ⑪에서 이미 같은 결론을 냈다 —
+#   '일관성 통일'은 문서 빈도를 세는 **결정론의 일**이고, AI는 다수/소수를 세지 않는다.
+#   ⑪은 띄어쓰기라 결정론에 위임할 수 있었지만, **글자가 바뀌는 어휘 치환은 위임할 곳이
+#   없다** — 저자가 고른 용어이므로 애초에 고칠 대상이 아니다.
+#
+# 기존 그물이 전부 사각(실측): [K]단어교체는 `_shares_syllable`('지'·'방' 공유)에서
+# **오탈자로 간주해 면제**하고, [U]병기 앵커는 라틴 괄호가 없어, [T]음절 재배열은 멀티셋이
+# 달라, [V]관용·관례와 ㉓문맥상은 사유에 그 낱말이 없어, 기관명 강등은 `_ORG_SUFFIX`가
+# 양쪽 공통이 아니라('부'≠'체') 전부 미발동 → high로 통과했다.
+#
+# **판정은 구조로 한다**(사유 문구는 AI 자유서술이라 신뢰 불가):
+#   · 양쪽 다 **단일 순한글 낱말**이고 조사 뗀 base가 서로 부분문자열이 아님.
+#   · **공통 접두 또는 접미가 2음절 이상** — 같은 계열의 복합어를 갈아끼운 모양
+#     ('지방'정부/'지방'자치단체, 성평등'가족부'/여성'가족부').
+#   · **자모거리 ≥ 4** — 오탈자·표기 교정('컨텐츠→콘텐츠' 1, '역활→역할' 1, '세수그릇→
+#     세숫그릇' 1, '지역사회협령망→지역사회협력망' 1)은 전부 이 아래라 보존된다.
+#   · **양쪽 다 등재어** — 원문이 미등재면 진짜 오탈자일 수 있으므로 건드리지 않는다.
+#
+# ⚠ **드롭이 아니라 low 강등**(실측 근거). norm_map 12,750쌍(전부 정당한 규범표기 교정)에
+# 이 판정을 걸어 보면 **387쌍이 걸린다**('고다치즈→하우다치즈'·'줄장미→덩굴장미' 등 정당한
+# 순화). 드롭하면 그 부류를 조용히 죽인다. low면 자동 적용에서만 빠지고 카드는 그대로
+# 남아 편집자가 정한다 — [S]헤지·[V]관용·기관명 강등과 같은 선택이다.
+# ⚠ 임계값을 낮추지 말 것: 접사 2음절·거리 4가 기준선이며, 거리를 3으로 내리면 같은
+# 표본의 오탐이 387→2,979쌍으로 늘고 '중앙정부→지방정부'(거리 3)까지 걸린다(실측).
+_TERM_MIN_AFFIX = 2      # 공통 접두/접미 음절 수
+_TERM_MIN_DIST = 4       # 자모 편집거리(이 미만은 오탈자·표기 교정으로 보고 보존)
+
+
+def _shared_affix(a: str, b: str) -> int:
+    """a·b의 공통 접두 음절 수와 공통 접미 음절 수 중 **큰 값**.
+
+    접두·접미를 함께 세지 않는 이유: '겉이→같이'처럼 1음절 접미만 겹치는 쌍까지
+    합산으로 통과시키면 정당한 규범표기 교정이 걸린다(실측).
+    """
+    n = min(len(a), len(b))
+    p = 0
+    while p < n and a[p] == b[p]:
+        p += 1
+    s = 0
+    while s < n - p and a[-1 - s] == b[-1 - s]:
+        s += 1
+    return max(p, s)
+
+
+def _is_registered_term_substitution(c, exists_fn) -> bool:
+    """c가 '등재 용어를 같은 계열의 다른 등재 용어로 갈아끼우는' 어휘 치환인가?"""
+    if c.source not in ("ai_typo", "ai_polish") or not c.original or not c.corrected:
+        return False
+    o, cr = c.original.strip(), c.corrected.strip()
+    if o == cr or not re.fullmatch(r"[가-힣]+", o) or not re.fullmatch(r"[가-힣]+", cr):
+        return False
+    ob, cb = _strip_josa(o), _strip_josa(cr)
+    if not ob or not cb or ob == cb or ob in cb or cb in ob:
+        return False       # 부분문자열 = 조사·병기 가감([R]·확장 가드 소관)
+    if _shared_affix(ob, cb) < _TERM_MIN_AFFIX:
+        return False       # 계열이 다르면 유의어 치환([K] 소관)
+    if _jamo_distance(ob, cb) < _TERM_MIN_DIST:
+        return False       # 근소 차이 = 오탈자·표기 교정 → 보존
+    try:
+        return bool(exists_fn(ob) and exists_fn(cb))
+    except Exception:
+        return False
+
+
+def demote_registered_term_substitution(corrections: list, exists_fn, logger=None) -> list:
+    """등재 용어를 다른 등재 용어로 바꾸는 AI 교정을 low로 강등한다(제자리 수정 후 반환).
+
+    저자가 고른 전문용어('지방정부')를 문서 다수형('지방자치단체')에 맞춰 '통일'하는 것은
+    표기 교정이 아니라 **어휘 선택 개입**이다. 방향 판단은 편집자 몫이므로 자동 적용만 막는다.
+    [S]헤지·[V]관용·기관명 강등과 동일 메커니즘·동일 단계(원시 ai_list 1회 → Case A 전파분까지 일관).
+    """
+    demoted = 0
+    for c in corrections:
+        if c.confidence != "low" and _is_registered_term_substitution(c, exists_fn):
+            c.confidence = "low"
+            if not (c.reason or "").startswith("[검수]"):
+                c.reason = ("[검수] " + (c.reason or "")
+                            + " (사전에 있는 용어를 다른 용어로 치환 — 저자의 용어 선택 확인 필요)")
+            demoted += 1
+    if logger and demoted:
+        logger(f"  → 등재 용어 치환 AI 교정 {demoted}건 검수 카드로 강등 "
+               "(저자가 고른 용어 — 자동 적용 제외)")
+    return corrections
+
+
+# ══════════════════════════════════════════════════════════
 # ▌사전이 필요한 가드 — 외래어 순화(paraphrase) 강등
 # ══════════════════════════════════════════════════════════
 def _edit_distance(a: str, b: str) -> int:

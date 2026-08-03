@@ -382,6 +382,12 @@ class ProofreadingWorker(QThread):
             #   옛 명칭으로 되돌린다('성평등가족부장관'→'여성가족부장관', 2026-07-21 보고).
             #   기관명 치환은 표기 교정이 아니라 사실 편집 → 자동 적용 금지, 편집자 검수.
             ai_list = ai_guards.demote_org_name_substitution(ai_list, logger=log)
+            # ㉗ 등재 용어 치환 강등 — AI가 저자의 전문용어를 문서 다수형에 맞춰 '통일'한다
+            #   ('지방정부'→'지방자치단체', 사유 "글로서리 규칙에 따른 용어 통일", 2026-08-03
+            #   보고). 어휘 통일은 결정론이 못 대신하고 저자 권한이라 자동 적용만 막는다.
+            #   ⚠ 드롭 아님 — 정당한 규범표기 교정 387쌍이 같은 모양이라(ai_guards ㉗ 주석).
+            ai_list = ai_guards.demote_registered_term_substitution(
+                ai_list, lambda w: lookup_word(w)["exists"], logger=log)
             # 문법·표현 재구성 강등 — 조사·어미·어절 구성을 바꾸는 교정은 오탈자·띄어쓰기
             #   경계를 넘은 편집 판단이라 high(자동 적용)로 두면 안 된다('결제하는 기능은'→
             #   '결제 기능은', '방향이 전제로 되어야'→'방향을 전제로 해야', 2026-07-30 보고).

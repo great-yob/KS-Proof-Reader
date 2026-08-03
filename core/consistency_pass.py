@@ -479,6 +479,17 @@ def drop_redundant_josa_variants(corrections: list, logger=None) -> list:
     return kept
 
 
+def _guard_demoted(c) -> bool:
+    """이 카드가 **가드에 의해 명시적으로 검수 강등된 것**인가.
+
+    ai_guards의 강등 가드는 전부 reason 앞에 `[검수] `를 붙인다([S]헤지·[V]관용·㉓문맥상·
+    기관명·㉕문법재구성·낱말삭제·㉗용어치환). 결정론 저신뢰 카드(띄어쓰기 백스톱 등)도
+    같은 표기를 쓴다 — 둘 다 '사람이 보고 정하라'는 뜻이므로 함께 보호한다.
+    반대로 `validate()`의 신뢰도 강등은 reason을 건드리지 않아 이 검사에 걸리지 않는다.
+    """
+    return (getattr(c, "reason", "") or "").lstrip().startswith("[검수]")
+
+
 def reconcile_variant_confidence(corrections: list, logger=None) -> list:
     """같은 단어의 조사 변형들이 **일관된 confidence**를 갖도록 통일.
 
@@ -490,6 +501,19 @@ def reconcile_variant_confidence(corrections: list, logger=None) -> list:
     base(조사 제거한 corrected)가 같은 그룹에서 하나라도 high면 모두 high로 통일한다.
     조사만 다른 같은 단어이므로 confidence·color는 단어 단위 속성이어야 한다.
     윤문·사전 검수 플래그는 대상에서 제외.
+
+    ⚠ **가드가 명시적으로 강등한 카드(`[검수]` 접두)는 절대 되올리지 않는다**(2026-08-03
+    사용자 보고). ㉗ 용어 치환 강등이 `지방정부`→`지방자치단체`를 low로 내렸는데, 같은
+    그룹(corrected base `지방자치단체`)에 high 형제가 하나 있자 이 함수가 **high로 되돌려
+    놨다**. `replace()`가 confidence만 바꾸고 reason은 그대로 두는 탓에 화면에는
+    "[검수] … 저자의 용어 선택 확인 필요"라는 사유가 붙은 채 **자동 적용되는 high 카드**가
+    떠서, 사용자에게는 가드가 아예 동작하지 않은 것처럼 보였다.
+    이 함수가 원래 고치려던 것은 **validate()가 kiwi 분석 차이로 갈라 놓은 신뢰도**인데,
+    validate()는 reason을 건드리지 않으므로(`replace(item, color=…, confidence="low")`)
+    `[검수]` 유무로 두 부류가 정확히 갈린다:
+      · validate發 강등(마커 없음)  → 통일 대상. '홋카이도현/홋카이도현의' 본래 목적.
+      · 가드發 강등(`[검수]` 마커) → **정책 결정**이므로 통일에서 제외.
+    ⚠ 새 강등 가드를 만들 땐 반드시 reason에 `[검수]`를 붙일 것 — 그게 이 보호막의 열쇠다.
     """
     if not corrections:
         return corrections
@@ -503,7 +527,7 @@ def reconcile_variant_confidence(corrections: list, logger=None) -> list:
             groups[base].append(i)
 
     out = list(corrections)
-    promoted = 0
+    promoted = kept_low = 0
     for base, idxs in groups.items():
         if len(idxs) < 2:
             continue
@@ -513,8 +537,13 @@ def reconcile_variant_confidence(corrections: list, logger=None) -> list:
         ref_color = out[highs[0]].color
         for i in idxs:
             if out[i].confidence != "high":
+                if _guard_demoted(out[i]):
+                    kept_low += 1
+                    continue        # 가드 강등은 정책 결정 — 되올리지 않는다(위 주석)
                 out[i] = replace(out[i], confidence="high", color=ref_color)
                 promoted += 1
     if logger and promoted:
         logger(f"  → 일관성: 조사 변형 신뢰도 통일 {promoted}건 (bare/조사형 불일치 보정)")
+    if logger and kept_low:
+        logger(f"  → 일관성: 가드 강등 카드 {kept_low}건은 검수 유지 (신뢰도 통일 제외)")
     return out

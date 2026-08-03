@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter, defaultdict
+from functools import lru_cache
 
 from core.models import Correction, HL_TYPO
 
@@ -65,6 +66,53 @@ MAX_PARTS = 4
 _HANGUL_RUN = re.compile(r"[가-힣]+")
 
 
+@lru_cache(maxsize=8192)
+def _josa_tail_at(eojeol: str) -> int:
+    """어절에서 **조사 꼬리가 시작하는 문자 인덱스**(조사가 없으면 len)."""
+    from core import morph as _morph
+    base = _morph.strip_josa(eojeol)
+    return len(base) if base else 0
+
+
+def _starts_word(text: str, s: int, e: int) -> bool:
+    """이 한글 런이 **낱말의 머리**로 쓰일 수 있는가 — 띄어쓴 변이 시퀀스의 시작 자격.
+
+    ⚠ **한글 런은 어절이 아니다.** 앞에 공백이 없으면 그 런은 더 큰 어절의 **조각**이고,
+    조각을 낱말의 머리로 삼으면 **문서에 없는 낱말**이 만들어진다(사용자 보고 2026-08-03:
+    'EU AI Act의 주요내용'의 런은 ['의','주요내용'] → 키 `의주요내용` → 검수 카드
+    '의 주요내용' → '의 주요 내용'. '의 위험기반'·'의 대응상황'도 같은 원인).
+
+    다만 **모든 조각을 막으면 정당한 근거가 함께 날아간다** — 이 저장소는 괄호·가운뎃점을
+    낱말 경계로 세는 것이 원칙이고(morph 확장⑤: 공백 토큰으로 세면 '보조금·핵심인재'가
+    한 낱말이 돼 과소 카운트), '급여(현금)수급자 확인서'의 '수급자'는 멀쩡한 낱말이다.
+    실측(실파일D 18.2만 자, 앞을 공백으로만 제한): 잡음 5건과 함께 **정당한 카드 6건이
+    소실**됐다('복지민원서비스'→'복지 민원 서비스' high 포함). 그래서 조각의 정체를 가른다:
+
+      · 앞이 **영문·숫자·한자**(isalnum)     → 항상 거부. 그 어절의 몸통이 비한글이므로
+        한글 조각은 조사('Act의')든 단위 의존명사('3대'·'2024년')든 낱말의 머리가 아니다.
+      · 앞이 **부호**(괄호·가운뎃점·따옴표)  → 그 런이 어절의 **조사 꼬리**일 때만 거부.
+        '｢AI 추진법｣의 주요 내용'의 '의'는 거부, '(현금)수급자'의 '수급자'는 통과.
+      · 앞이 **공백·문두**                    → 통과.
+
+    실측 결과 잡음 5건이 정확히 제거되고 정당한 카드 손실은 0이었다.
+    ⚠ 런의 **뒤쪽**은 일부러 보지 않는다 — 꼬리 조각은 없는 낱말을 만들지 못하고
+    ('주요 내용AI'가 세는 표기도 어차피 '주요 내용') 등장 수만 스칠 뿐인데, 각주 번호가
+    붙은 '주요 내용1)' 같은 정당한 근거까지 함께 날아간다.
+    """
+    if not s:
+        return True
+    prev = text[s - 1]
+    if prev.isspace():
+        return True
+    if prev.isalnum():          # 런이 최대 매칭이라 앞 글자는 한글이 아니다
+        return False
+    js = s
+    while js and not text[js - 1].isspace():
+        js -= 1
+    #   어절 끝의 부호(쉼표 등)가 strip_josa를 방해하지 않도록 런 끝까지만 본다.
+    return s - js < _josa_tail_at(text[js:e])
+
+
 # ── 낱말 변이 표 ───────────────────────────────────────────────────────
 def build_variants(text: str, *, min_len: int = MIN_LEN, max_len: int = MAX_LEN,
                    max_parts: int = MAX_PARTS) -> dict:
@@ -74,6 +122,8 @@ def build_variants(text: str, *, min_len: int = MIN_LEN, max_len: int = MAX_LEN,
     괄호가 낱말을 이어붙여 과소 카운트된다 — morph 확장⑤와 같은 이유).
     띄어쓴형은 **단일 공백으로 이어진 연속 한글 어절** 2~max_parts개를 이어 본다.
     마지막 조각의 조사는 strip_josa로 떼며, 이 함수는 내부 공백을 보존한다(실측).
+    ⚠ 시퀀스의 **첫 런은 `_starts_word`를 통과해야 한다** — 한글 런은 어절이 아니라서
+    'Act의'의 '의' 같은 꼬리 조각이 낱말의 머리가 되면 없는 낱말이 만들어진다.
     """
     from core import morph as _morph
     if not text or not _morph.available():
@@ -91,6 +141,8 @@ def build_variants(text: str, *, min_len: int = MIN_LEN, max_len: int = MAX_LEN,
     # 2) 띄어쓴형 — 단일 공백으로 이어진 연속 한글 어절 시퀀스에서 부분 시퀀스 추출.
     toks = [(m.group(), m.start(), m.end()) for m in _HANGUL_RUN.finditer(text)]
     for i in range(len(toks)):
+        if not _starts_word(text, toks[i][1], toks[i][2]):
+            continue
         for k in range(2, max_parts + 1):
             if i + k > len(toks):
                 break
@@ -172,7 +224,10 @@ def _eligible(c) -> bool:
                 and getattr(c, "source", "") in ("spacing", "punct")
                 # URL·경로 어절은 공백 삽입 자체가 값을 파괴한다 — finder 쪽에서도
                 #   막지만(morph.is_urlish), 다른 경로로 들어온 카드까지 여기서 차단한다.
-                and not _morph.is_urlish(o))
+                and not _morph.is_urlish(o)
+                # 제로폭 문자가 섞인 어절은 kiwi가 유령 명사로 읽어 이음매 좌표 자체가
+                #   어긋난다 — 같은 이유로 여기서도 2중 차단(morph.has_zero_width 주석).
+                and not _morph.has_zero_width(o))
 
 
 def _pure_noun(word: str) -> bool:
