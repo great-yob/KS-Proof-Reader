@@ -1231,7 +1231,7 @@ def find_compound_spacing_consistency(text: str, *, min_len: int = 4, max_len: i
         if min_len <= len(base) <= max_len:
             joined[base] += c
 
-    out = []
+    out, cand = [], []
     for base, n_joined in joined.items():
         try:
             tokens = kiwi.analyze(base)[0][0]
@@ -1265,20 +1265,42 @@ def find_compound_spacing_consistency(text: str, *, min_len: int = 4, max_len: i
                 best_n, best_sp = n, f"{left} {right}"
         if not best_sp:
             continue
-        n_spaced = best_n
+        cand.append((base, best_sp, n_joined, best_n))
+
+    # 3) **가족(머리낱말) 다수** 집계 — 동률 낱말의 방향을 정할 때 규범 기본값보다 먼저 본다.
+    #    가족 = 마지막 성분이 같은 복합명사들('수익모델·사업모델·복합모델' → 가족 '모델').
+    #    ⚠ 투표권은 **자기 다수가 뚜렷한 낱말에만** 준다(동률 낱말끼리는 서로 못 정한다).
+    fam_vote = Counter()
+    for base, best_sp, n_j, n_s in cand:
+        if n_j == n_s:
+            continue
+        fam_vote[(best_sp.split(" ")[-1], "joined" if n_j > n_s else "spaced")] += 1
+
+    for base, best_sp, n_joined, n_spaced in cand:
         if n_joined == n_spaced:
             if exists_fn is None:
                 continue   # 동률 → 제외(기존 동작 유지 — 호출부가 옵트인)
-            # 동률 — 다수결 불가. 규범 기본 방향: 사전 등재 복합어(한 단어)면 붙임,
-            #   아니면 띄어쓰기 원칙(맞춤법 제2항). 호출부가 저신뢰 검수 카드로 노출.
-            try:
-                joined_registered = bool(exists_fn(base))
-            except Exception:
-                continue
-            if joined_registered:
-                out.append((best_sp, base, n_spaced, n_joined))   # 등재 복합어 → 붙임 방향
+            # 동률 — 자기 다수결이 불가하다. 계층 **낱말 자신의 다수 > 가족의 다수 >
+            #   규범 기본값**으로 방향을 정한다(2026-08-03 사용자 결정 — junction_pass의
+            #   '낱말 > 이음매 > 규범' 계층에 가족 한 층을 끼운 것).
+            #   ⚠ 왜 필요한가: 예전엔 동률을 **낱말별로** 규범 기본값으로 정해서, 같은
+            #   가족의 다른 낱말이 어느 방향이든 무시했다 → 규칙 스스로 계열 충돌을
+            #   만들어냈다(실원고 5종 실측: 방향 충돌 가족 57개 중 **16개**가 이 원인).
+            #   ⚠ 자기 다수가 있는 낱말은 절대 건드리지 않는다 — '산학협력'(51:10 붙임,
+            #   산학협력법 용어)이 '국제 협력'(3:1 띄움)에 끌려가 깨지는 일은 없다.
+            head = best_sp.split(" ")[-1]
+            n_fj, n_fs = fam_vote[(head, "joined")], fam_vote[(head, "spaced")]
+            if n_fj != n_fs:
+                joined_wins = n_fj > n_fs                       # 가족의 다수
             else:
-                out.append((base, best_sp, n_joined, n_spaced))   # 미등재 → 띄어쓰기 원칙 방향
+                try:
+                    joined_wins = bool(exists_fn(base))          # 규범 기본값
+                except Exception:
+                    continue
+            if joined_wins:
+                out.append((best_sp, base, n_spaced, n_joined))   # 붙임 방향
+            else:
+                out.append((base, best_sp, n_joined, n_spaced))   # 띄어쓰기 방향
         elif n_joined > n_spaced:
             out.append((best_sp, base, n_spaced, n_joined))   # 소수(띄어쓴)→다수(붙인)
         else:

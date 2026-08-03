@@ -1161,6 +1161,7 @@ class ProofreadingWorker(QThread):
                     #   **그대로** 찾아 실제로 겹칠 때만 스킵한다.
                     _ai_origs = [c.original for c in merged
                                  if c.source != "ai_polish" and c.original]
+                    from core import consistency_family as _cf
                     for minority, majority, n_min, n_maj in \
                             _morph.find_compound_spacing_consistency(text, exists_fn=_cons_exists):
                         if minority in existing:
@@ -1196,6 +1197,10 @@ class ProofreadingWorker(QThread):
                             # 통일 방향은 편집 선택 — 검수 패널이 '반대 표기로
                             #   통일'(다수→소수 역방향) 액션을 제공할 수 있게 표시.
                             consistency_flip=True,
+                            # 가족(머리낱말) 정합 근거 — '표기 일관성 제안' 단계가 쓴다.
+                            #   소수/다수 축 → 붙임/띄어쓴 축 변환은 단일 출처에 맡긴다.
+                            spacing_family=_cf.evidence_of(
+                                minority, majority, n_min, n_maj),
                         ))
                         existing.add(minority)
                         consistency_n += 1
@@ -1570,6 +1575,7 @@ class ProofreadingWorker(QThread):
                 "category":  c.category,
                 "confidence": c.confidence,
                 "consistency_flip": c.consistency_flip,   # 검수 패널 '반대 표기로 통일'
+                "spacing_family": list(c.spacing_family),  # 검수 패널 '표기 일관성 제안' 가족 근거
                 "junction_group": c.junction_group,       # 검수 패널 이음매 그룹 전파
                 "status":    "pending",
             }

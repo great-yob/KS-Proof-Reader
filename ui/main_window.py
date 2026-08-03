@@ -91,6 +91,10 @@ class MainWindow(QMainWindow):
         self._extracted_text = ""
         self._page_count = None
         self._footnote_lines = []   # **실제 각주** 라인 인덱스(미리보기 [각주] 표지용)
+        # 표기 일관성 단계를 이미 거쳤는가 — 한 문서에 한 번만 끼운다(통일 후 다시 갈리면
+        #   그건 사용자가 방금 내린 결정이므로 되묻지 않는다).
+        self._consistency_done = False
+        self._consistency_logged = False
         self._result = {}
         self._worker = None
         self._apply_worker = None
@@ -255,6 +259,7 @@ class MainWindow(QMainWindow):
         self.setup_panel.options_changed.connect(self._refresh_setup_footer)
 
         self.review_panel.counts_changed.connect(self._on_review_counts)
+        self.review_panel.consistency_counts_changed.connect(self._on_consistency_counts)
 
         self.footer.primary_clicked.connect(self._on_primary)
         self.footer.cancel_clicked.connect(self._on_cancel)
@@ -356,7 +361,14 @@ class MainWindow(QMainWindow):
         elif self._phase == "running":
             self._show_phase("review")
         elif self._phase == "review":
-            self._start_apply()
+            # 검토 단계 안의 3단 전환: 교정 검토 → (표기 일관성 검토 → 적용) → 교정 적용.
+            if self.review_panel.in_consistency_mode():
+                self._apply_consistency()
+            elif not self._consistency_done and self._count_review()[0] == 0 \
+                    and self.review_panel.consistency_families():
+                self._enter_consistency()
+            else:
+                self._start_apply()
         elif self._phase == "result":
             self._reset()
 
@@ -365,6 +377,8 @@ class MainWindow(QMainWindow):
         if not self._file_path or not self.setup_panel.scopes_selected():
             return
         self._options = self.setup_panel.get_options()
+        self._consistency_done = False     # 새 분석 = 표기 일관성 단계도 다시
+        self._consistency_logged = False
 
         self.running_panel.set_title("교정 분석 중")
         self.running_panel.set_detail("잠시만 기다려주세요…")
@@ -471,16 +485,81 @@ class MainWindow(QMainWindow):
 
     # ── 검토 카운트 → 푸터/레일 ──────────────────
     def _on_review_counts(self, pending: int, accepted: int, total: int):
-        if self._phase != "review":
+        if self._phase != "review" or self.review_panel.in_consistency_mode():
             return
         # 용어 통일: 검토 단계는 '수락'(완료 단계의 '적용'과 구분). 카드=본문 등장이라 '곳'.
         #   ⚠ 'AI 분석 제외' 모드에서도 결정론 교정은 실제 적용되므로 라벨은 공통이다.
         #   순수 검수(치환 0건) 여부는 ApplyWorker가 동적으로 판단해 처리한다.
         self.rail.set_step_result("review", f"수락 : {accepted} / {total}")
         self.footer.set_status(f"사용자 검토 중 — 수락 : {accepted} / {total}항목 · 대기 : {pending}항목")
+        # 모든 카드를 결정했고 **복합명사 계열 표기가 갈렸으면** 적용 앞에 '표기 일관성
+        #   검토' 단계를 한 번 끼운다(사용자 결정 2026-08-03). 낱말별 다수결은 서로 독립이라
+        #   '수익 모델'은 띄우고 '사업모델'은 붙이는 결과가 나올 수 있고, 그대로 나가면
+        #   교정본을 사람이 다시 대조해야 한다 — core/consistency_family.py 헤더 참조.
+        if pending == 0 and not self._consistency_done and total > 0:
+            fams = self.review_panel.consistency_families()
+            n_fam = len(fams)
+            # ⚠ 0건일 때도 **한 번은 로그를 남긴다** — 버튼이 안 나오는 이유가 '검사할 게
+            #   없어서'인지 '결함인지' 화면에서 구분이 안 됐다(사용자 보고 2026-08-03).
+            #   화면 로그 규약: [태그] + n건, 개별 예시 금지.
+            if not self._consistency_logged:
+                self._consistency_logged = True
+                self.activity.log(
+                    f"[표기 일관성] 복합명사 계열 검사 — 표기 갈린 계열 {n_fam}건")
+            if n_fam:
+                self.footer.set_status(
+                    f"검토 완료 — 수락 : {accepted} / {total}항목 · "
+                    f"표기가 갈린 복합명사 계열 {n_fam}건")
+                self.footer.set_primary(f"표기 일관성 검토 ({n_fam}건)",
+                                        variant="success_solid", enabled=True,
+                                        visible=True, show_reset=True)
+                return
         # 대기 항목이 있어도 버튼은 활성 — 누르면 _start_apply가 미선택을 막고 에러 팝업.
         self.footer.set_primary(f"✓  교정 적용 ({accepted}항목)", variant="action_pink",
                                 enabled=total > 0, visible=True, show_reset=True)
+
+    # ── 표기 일관성 단계 ─────────────────────────
+    def _on_consistency_counts(self, pending: int, accepted: int, total: int):
+        if not self.review_panel.in_consistency_mode():
+            return
+        self.rail.set_step_result("review", f"표기 일관성 {accepted} / {total}")
+        self.footer.set_status(
+            f"표기 일관성 검토 중 — 통일 : {accepted} / {total}계열 · 대기 : {pending}계열")
+        self.footer.set_primary(f"✓  표기 일관성 적용 ({accepted}항목)", variant="action_pink",
+                                enabled=True, visible=True, show_reset=True)
+
+    def _enter_consistency(self):
+        """'교정 제안' 그리드를 '표기 일관성 제안'으로 전환."""
+        n = self.review_panel.enter_consistency_mode()
+        if not n:                      # 그 사이 충돌이 사라졌다 → 곧장 적용 단계로
+            self._consistency_done = True
+            self._on_review_counts(*self._count_review())
+            return
+        self.footer.set_idle("표기 일관성 검토 중")
+        self.activity.log(f"[표기 일관성] 표기가 갈린 복합명사 계열 {n}건을 확인합니다")
+        self._on_consistency_counts(*self.review_panel.get_consistency_counts())
+
+    def _apply_consistency(self):
+        """선택한 계열을 통일하고 '교정 제안' 그리드로 복귀."""
+        pending, accepted, total = self.review_panel.get_consistency_counts()
+        if pending > 0:
+            self._warn_popup(
+                "검토가 끝나지 않았습니다",
+                f"모든 표기 일관성 제안을 '통일' 또는 '그대로 두기'로 선택해야 합니다.\n"
+                f"아직 결정하지 않은 항목이 {pending}건 남아 있습니다.")
+            return
+        n = self.review_panel.apply_consistency()
+        self._consistency_done = True
+        self.activity.log(f"[표기 일관성] 계열 {accepted}건 통일 — 교정 {n}건 방향 조정")
+        # ⚠ 겹치는 교정이 있으면 통일이 **일부 적용되지 않는다**(실측 실파일E 24계열 중 1건):
+        #   '산업 분류'→'산업분류'가 이미 그 구간을 차지해 '분류 체계'→'분류체계'의 등장이
+        #   shadowed 되는 부류. 구조적 한계라 자동 해소는 불가 — 조용히 삼키지 말고 알린다.
+        left = len(self.review_panel.consistency_families())
+        if left:
+            self.activity.log(
+                f"[표기 일관성] 겹치는 교정 때문에 통일하지 못한 계열 {left}건 — 교정본 확인 권장")
+        self.footer.set_idle("교정 제안 검토 중")
+        self._on_review_counts(*self._count_review())
 
     def _warn_popup(self, title: str, message: str):
         """경고 에러 팝업(모달)."""
@@ -798,6 +877,10 @@ class MainWindow(QMainWindow):
         self._extracted_text = ""
         self._page_count = None
         self._footnote_lines = []   # **실제 각주** 라인 인덱스(미리보기 [각주] 표지용)
+        # 표기 일관성 단계를 이미 거쳤는가 — 한 문서에 한 번만 끼운다(통일 후 다시 갈리면
+        #   그건 사용자가 방금 내린 결정이므로 되묻지 않는다).
+        self._consistency_done = False
+        self._consistency_logged = False
         self._result = {}
         self.file_panel.set_file("")
         self.activity.clear()

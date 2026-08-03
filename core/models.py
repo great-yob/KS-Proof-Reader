@@ -130,6 +130,11 @@ class Correction:
     #   생성처: 워커 [7] find_compound_spacing_consistency 소비부만. ⚠ 규범 교정
     #   (norm_map·eomun 등)에 켜지 말 것 — 비표준 표기로의 통일을 조장하게 된다.
     consistency_flip: bool = False
+    # 복합명사 '머리낱말 가족' 정합 근거 — (머리낱말, 붙임 등장 수, 띄어쓴 등장 수).
+    #   예) '수익 모델'/'수익모델' 카드 → ("모델", 1, 2). 검수 패널의 '표기 일관성 제안'
+    #   단계가 이걸로 가족을 묶고 근거를 표시한다(core/consistency_family.py).
+    #   ⚠ consistency_flip 카드에만 채운다 — 비면 그 카드는 가족 정합 대상이 아니다.
+    spacing_family: tuple = ()
     # 이음매(junction) 그룹 id — 같은 띄어쓰기 이음매를 서로 반대로 결정하는 카드들이
     #   묶인다(빈 문자열이면 무관). 낱말 단위 이진 카드로는 다중 이음매 낱말의
     #   '거절'이 정의되지 않으므로(예: '수당수급자확인서'는 이음매 2개 = 상태 4가지),

@@ -527,6 +527,8 @@ class LightConfirmDialog(QDialog):
 
 class ReviewPanel(QWidget):
     counts_changed = Signal(int, int, int)   # pending, accepted, total (고유 단어 기준)
+    # '표기 일관성 제안' 단계의 카운트(대기, 수락, 전체) — 가족 카드 기준.
+    consistency_counts_changed = Signal(int, int, int)
 
     # ── 카드 점진 로딩 튜닝 (2026-07-21 실측 기반) ────────────────────────
     #   카드 1장 = 생성 4.1ms + 삽입·레이아웃 ~4ms, 그리고 **배치 1회마다 ~30ms
@@ -562,6 +564,13 @@ class ReviewPanel(QWidget):
         self._occ_pos = {}        # uid → self._occ 내 인덱스
         self._active_occ_id = None
         self._flip_cache = {}     # (original, corrected) → _flip_info 결과
+        # '표기 일관성 제안' 단계 — 교정 카드 그리드를 **가족 카드**로 갈아 끼운 상태.
+        #   _batch_flip은 가족 수락을 한꺼번에 반영하는 동안 카드/미리보기 갱신을 멈추는
+        #   가드다(가족 하나가 낱말 여러 개를 뒤집으므로 낱말마다 다시 그리면 프리즈).
+        self._fam_mode = False
+        self._families = []
+        self._fam_cards = []
+        self._batch_flip = False
         # 미리보기 재렌더 병합 타이머(_refresh_preview(defer=True) 참조) — _refresh_preview가
         #   무조건 참조하므로 UI보다 먼저 만든다.
         self._preview_timer = QTimer(self)
@@ -701,10 +710,12 @@ class ReviewPanel(QWidget):
         _icon = QLabel("✦")
         _icon.setStyleSheet("font-size: 14px; color: #7B5CFF; background: transparent;")
         title_row.addWidget(_icon)
-        title_row.addWidget(_GradientTextLabel(
+        # '표기 일관성 제안' 단계에서 같은 자리를 다른 제목으로 쓴다(_set_grid_title).
+        self._grid_title = _GradientTextLabel(
             "교정 제안",
             stops=[(0.0, "#A88BFF"), (0.5, "#5BB3FF"), (1.0, "#3DD9D6")],
-        ))
+        )
+        title_row.addWidget(self._grid_title)
         bar.addLayout(title_row)
         bar.addStretch()
         bar_w = QFrame()
@@ -868,6 +879,8 @@ class ReviewPanel(QWidget):
 
     def _on_scroll(self, value):
         self._note_interaction()
+        if self._fam_mode:
+            return          # 가족 카드는 전량 즉시 생성 — 점진 로딩 대상이 아니다
         sb = self._card_scroll.verticalScrollBar()
         # 바닥에 닿기 전(80%)에 미리 보충 — 프리페치가 못 따라온 경우의 안전망.
         if sb.maximum() > 0 and value >= sb.maximum() * 0.8:
@@ -892,6 +905,9 @@ class ReviewPanel(QWidget):
             self._prefetch_timer.stop()
 
     def _prefetch_tick(self):
+        if self._fam_mode:
+            self._prefetch_timer.stop()
+            return
         if self._loaded_card_count >= len(self._occ):
             self._prefetch_timer.stop()
             return
@@ -1339,7 +1355,12 @@ class ReviewPanel(QWidget):
         _style_card 한 번에 인스턴스 setStyleSheet가 3회(카드+버튼2) 붙어 수백 장을
         무조건 훑으면 그 자체가 프리즈가 된다(카드 생성 4.1ms 중 2.7ms가 setStyleSheet).
         그래서 마지막으로 그린 값(_styled)과 비교해 바뀐 카드만 갱신한다.
+
+        ⚠ 가족 일괄 뒤집기 중(_batch_flip)에는 아무것도 하지 않는다 — 가족 하나가 낱말
+          여러 개를 뒤집으므로 낱말마다 훑으면 그 자체가 프리즈다. 끝난 뒤 한 번 재구성한다.
         """
+        if self._batch_flip:
+            return
         active = self._active_occ_id
         for cd in self._cards:
             key = (cd._occ["status"], cd.property("occ_id") == active)
@@ -1877,7 +1898,12 @@ class ReviewPanel(QWidget):
 
         prev_last_uid: 재정렬 전 '마지막으로 훑은 등장'의 uid. 새 등장이 그 앞에 끼어들면
         로드 경계(_loaded_card_count)가 밀리므로 uid로 다시 찾는다.
+
+        ⚠ 가족 일괄 뒤집기 중(_batch_flip)에는 건너뛴다 — 그 구간엔 카드가 아예 없고,
+          끝난 뒤 _rebuild_cards가 한 번에 만든다(_restyle_dirty와 같은 이유).
         """
+        if self._batch_flip:
+            return
         boundary = (self._occ_pos.get(prev_last_uid, -1) + 1) if prev_last_uid is not None else 0
         boundary = max(boundary, 0)
         self._loaded_card_count = boundary
@@ -1988,6 +2014,9 @@ class ReviewPanel(QWidget):
                 "confidence": "low",
                 "status": "accepted",
                 "consistency_flip": True,   # 반대 카드에서 재뒤집기(원방향 복귀) 허용
+                # 가족 근거는 문서 등장 수라 방향을 뒤집어도 그대로다 — 물려주지 않으면
+                #   사용자가 통일 방향을 바꾼 낱말이 '표기 일관성 제안' 단계에서 사라진다.
+                "spacing_family": list(c.get("spacing_family") or ()),
             }
             self._corrections.append(rev)
             rev_ci = len(self._corrections) - 1
@@ -2034,6 +2063,285 @@ class ReviewPanel(QWidget):
         self._refresh_preview(defer=True)
         self._emit_counts()
         return grew
+
+    # ══════════════════════════════════════════════
+    # 표기 일관성 제안(복합명사 가족 정합) 단계
+    # ══════════════════════════════════════════════
+    # 교정 카드를 전부 결정하고 나면, 같은 부류의 복합명사가 서로 반대로 끝나 있을 수 있다
+    #   ('수익 모델'은 띄우고 '사업모델'은 붙임 — 사용자 보고 2026-08-03). 판정은 자동화가
+    #   불가능하므로(core/consistency_family.py 헤더 참조) **같은 그리드를 가족 카드로 갈아
+    #   끼워 한 계열을 한 번에 결정**하게 한다. 결정 후 원래 교정 그리드로 돌아온다.
+    _FAM_STOPS = [(0.0, "#FFC46B"), (0.5, "#FF8FB1"), (1.0, "#A88BFF")]
+    _CARD_STOPS = [(0.0, "#A88BFF"), (0.5, "#5BB3FF"), (1.0, "#3DD9D6")]
+
+    def _set_grid_title(self, text: str, stops):
+        self._grid_title.setText(text)
+        self._grid_title._stops = stops
+        self._grid_title.updateGeometry()
+        self._grid_title.update()
+
+    def consistency_families(self) -> list:
+        """현재 수락 상태 기준 **가족 방향 충돌** 목록(계산만 — 상태를 바꾸지 않는다)."""
+        from core import consistency_family as _cf
+        return _cf.find_conflicts(self._corrections)
+
+    def in_consistency_mode(self) -> bool:
+        return self._fam_mode
+
+    def enter_consistency_mode(self) -> int:
+        """그리드를 '표기 일관성 제안'으로 전환. 충돌이 없으면 0을 반환하고 전환하지 않는다."""
+        fams = self.consistency_families()
+        if not fams:
+            return 0
+        for f in fams:
+            f["status"] = "pending"
+            f["choice"] = f["proposal"]
+        self._families = fams
+        self._fam_mode = True
+        self._prefetch_timer.stop()
+        self._set_grid_title("표기 일관성 제안", self._FAM_STOPS)
+        self._chips_box.setVisible(False)          # 교정 카드용 집계 칩은 이 단계와 무관
+        self._build_family_cards()
+        self._card_scroll.verticalScrollBar().setValue(0)
+        self._emit_family_counts()
+        return len(fams)
+
+    def _build_family_cards(self):
+        """가족 카드를 전량 새로 만든다 — 많아야 수십 장이라 점진 로딩이 필요 없다
+        (실측 최대 30장/문서). 교정 카드용 _rebuild_cards와는 경로가 다르다."""
+        self._cards = []
+        self._fam_cards = []
+        self._loaded_card_count = 0
+        self._new_scroll_content()
+        for i, f in enumerate(self._families):
+            c = self._create_family_card(f, i)
+            self._scroll_layout.insertWidget(self._scroll_layout.count() - 1, c)
+            self._fam_cards.append(c)
+
+    def exit_consistency_mode(self):
+        """원래 '교정 제안' 그리드로 복귀."""
+        if not self._fam_mode:
+            return
+        self._fam_mode = False
+        self._families = []
+        self._fam_cards = []
+        self._set_grid_title("교정 제안", self._CARD_STOPS)
+        self._chips_box.setVisible(True)
+        self._rebuild_cards()
+        self._emit_counts()
+
+    def get_consistency_counts(self):
+        """(대기, 수락, 전체) — 가족 카드 기준."""
+        pending = sum(1 for f in self._families if f["status"] == "pending")
+        accepted = sum(1 for f in self._families if f["status"] == "accepted")
+        return pending, accepted, len(self._families)
+
+    def _emit_family_counts(self):
+        self.consistency_counts_changed.emit(*self.get_consistency_counts())
+
+    def apply_consistency(self) -> int:
+        """수락된 가족을 선택 방향으로 통일하고 교정 그리드로 복귀. 뒤집은 낱말 수 반환.
+
+        실제 뒤집기는 기존 `_apply_flip`(그룹 거절 + 반대 교정 합성·수락)을 그대로 쓴다 —
+        일관성 카드의 '반대 표기로 통일'과 같은 연산이라 새 경로를 만들지 않는다.
+        ⚠ 가족 하나가 낱말 여러 개를 뒤집으므로 낱말마다 카드·미리보기를 다시 그리면
+          프리즈가 된다 → `_batch_flip` 가드로 묶고 끝난 뒤 한 번만 재구성한다.
+        """
+        from core import consistency_family as _cf
+        jobs = []
+        for f in self._families:
+            if f["status"] != "accepted":
+                continue
+            for m in f["members"]:
+                act = _cf.action_for(m, f["choice"])
+                if act:
+                    jobs.append(act)
+        # 그리드를 먼저 교정 카드 모드로 되돌린다 — _apply_flip이 만지는 카드 목록이
+        #   가족 카드면 안 되므로, 카드 없는 상태에서 데이터만 바꾸고 마지막에 재구성한다.
+        self._fam_mode = False
+        self._families = []
+        self._fam_cards = []
+        self._cards = []
+        self._loaded_card_count = 0
+        self._new_scroll_content()
+        self._batch_flip = True
+        try:
+            for act, ci, orig, corr in jobs:
+                if not (0 <= ci < len(self._corrections)):
+                    continue
+                if act == "flip":
+                    self._apply_flip(self._corrections[ci], ci, orig, corr)
+                else:                       # "accept" — 거절해 둔 카드를 그 방향으로 되살림
+                    self._apply_unify_forward(ci, orig, corr)
+        finally:
+            self._batch_flip = False
+        self._set_grid_title("교정 제안", self._CARD_STOPS)
+        self._chips_box.setVisible(True)
+        self._rebuild_cards()
+        self._refresh_preview()
+        self._emit_counts()
+        return len(jobs)
+
+    # ── 가족 카드 ──────────────────────────────────
+    def _fam_dir_label(self, direction: str) -> str:
+        return "띄어쓰기" if direction == "spaced" else "붙여쓰기"
+
+    def _create_family_card(self, fam: dict, idx: int) -> QFrame:
+        from core import consistency_family as _cfam
+        pal = current_palette()
+        card = QFrame()
+        card.setObjectName(f"famcard_{idx}")
+        card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        cl = QVBoxLayout(card)
+        cl.setSpacing(10)
+        cl.setContentsMargins(14, 12, 14, 14)
+
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        chip = label("표기 일관성")
+        chip.setStyleSheet(_pill_qss(pal, "review"))
+        top.addWidget(chip)
+        head_lbl = label(f"‘…{fam['head']}’ 계열 {len(fam['members'])}종")
+        head_lbl.setStyleSheet(
+            f"color: {pal['text_muted']}; font-size: 11px; border: none; background: transparent;")
+        top.addWidget(head_lbl)
+        top.addStretch()
+        accept_btn = IconButton("check", size=15, role="text_dim")
+        reject_btn = IconButton("x", size=15, role="text_dim")
+        accept_btn.setToolTip("선택한 표기로 이 계열 전체를 통일합니다.")
+        reject_btn.setToolTip("통일하지 않고 지금 결정을 그대로 둡니다(정당한 구분).")
+        accept_btn.clicked.connect(
+            lambda _e, f=fam, c=card: self._set_family_status(f, c, "accepted"))
+        reject_btn.clicked.connect(
+            lambda _e, f=fam, c=card: self._set_family_status(f, c, "rejected"))
+        top.addWidget(accept_btn)
+        top.addWidget(reject_btn)
+        cl.addLayout(top)
+
+        # 방향 토글 — 통일 방향은 옳고 그름이 아니라 **편집 선택**이라 사용자가 뒤집을 수 있어야
+        #   한다(기본값은 가족 다수). '산학협력'처럼 붙임이 옳은 계열은 이 토글로 지킨다.
+        seg = QHBoxLayout()
+        seg.setSpacing(6)
+        card._dir_btns = {}
+        for d in ("spaced", "joined"):
+            b = QPushButton(self._fam_dir_label(d))
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(lambda _e, f=fam, c=card, dd=d: self._set_family_choice(f, c, dd))
+            card._dir_btns[d] = b
+            seg.addWidget(b)
+        seg.addStretch()
+        cl.addLayout(seg)
+
+        inner = QFrame()
+        inner.setObjectName(f"faminner_{idx}")
+        inner.setStyleSheet(
+            f"QFrame#faminner_{idx} {{ background: {pal['surface']}; "
+            f"border: 1px solid {pal['border']}; border-radius: 6px; }}")
+        il = QVBoxLayout(inner)
+        il.setContentsMargins(12, 10, 12, 10)
+        il.setSpacing(6)
+        card._member_rows = []
+        for k, m in enumerate(fam["members"]):
+            if k:
+                ln = QFrame()
+                ln.setFixedHeight(1)
+                ln.setStyleSheet(f"background: {pal['border']}; border: none;")
+                il.addWidget(ln)
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            cur = label(_soft_breakable(_cfam.current_label(m)))
+            cur.setTextFormat(Qt.PlainText)
+            cur.setWordWrap(True)
+            cur.setStyleSheet(
+                f"border: none; color: {pal['text_sub']}; background: transparent;")
+            arrow = label("→")
+            arrow.setStyleSheet(
+                f"color: {pal['text_muted']}; border: none; background: transparent;")
+            nxt = label("")
+            nxt.setTextFormat(Qt.PlainText)
+            nxt.setWordWrap(True)
+            row.addWidget(cur, 1)
+            row.addWidget(arrow)
+            row.addWidget(nxt, 1)
+            il.addLayout(row)
+            card._member_rows.append((m, nxt))
+        cl.addWidget(inner)
+
+        ev = sub_label(
+            f"계열 등장 — 붙임 {fam['n_joined']}회 : 띄어쓰기 {fam['n_spaced']}회", wrap=True)
+        ev.setStyleSheet(
+            f"color: {pal['text_muted']}; border: none; background: transparent; font-size: 12px;")
+        cl.addWidget(ev)
+
+        card._fam = fam
+        card._accept_btn = accept_btn
+        card._reject_btn = reject_btn
+        self._style_family_card(card)
+        return card
+
+    def _set_family_choice(self, fam: dict, card: QFrame, direction: str):
+        fam["choice"] = direction
+        self._style_family_card(card)
+
+    def _set_family_status(self, fam: dict, card: QFrame, status: str):
+        fam["status"] = "pending" if fam["status"] == status else status
+        self._style_family_card(card)
+        self._emit_family_counts()
+
+    def _style_family_card(self, card: QFrame):
+        from core import consistency_family as _cf
+        pal = current_palette()
+        fam = card._fam
+        st, choice = fam["status"], fam["choice"]
+        acc, rej = st == "accepted", st == "rejected"
+
+        def set_btn(btn, is_on, on_bg):
+            if is_on:
+                btn.setStyleSheet(
+                    f"QPushButton {{ background: {on_bg}; border: none; border-radius: 8px; "
+                    f"padding: 4px 9px; min-width: 18px; min-height: 16px; }}")
+                btn.set_icon_role("accent_fg")
+            else:
+                btn.setStyleSheet(
+                    f"QPushButton {{ background: {pal['surface']}; border: 1px solid "
+                    f"{pal['border_strong']}; border-radius: 8px; padding: 4px 9px; "
+                    f"min-width: 18px; min-height: 16px; }}")
+                btn.set_icon_role("text_dim")
+
+        set_btn(card._accept_btn, acc, pal["success"])
+        set_btn(card._reject_btn, rej, pal["error"])
+
+        for d, b in card._dir_btns.items():
+            on = d == choice
+            b.setStyleSheet(
+                f"QPushButton {{ padding: 4px 12px; border-radius: 12px; font-size: 11px; "
+                f"font-weight: {'700' if on else '400'}; "
+                f"color: {pal['accent_fg'] if on else pal['text_muted']}; "
+                f"background: {pal['accent'] if on else pal['surface']}; "
+                f"border: 1px solid {pal['accent'] if on else pal['border_strong']}; }}")
+
+        for m, lbl in card._member_rows:
+            target = _cf.unified_form(m, choice)
+            if _cf.action_for(m, choice) is None:
+                lbl.setText("그대로")
+                lbl.setStyleSheet(
+                    f"border: none; color: {pal['text_muted']}; background: transparent;")
+            else:
+                lbl.setText(_soft_breakable(target))
+                lbl.setStyleSheet(
+                    f"border: none; color: {pal['text']}; font-weight: bold; "
+                    f"background: transparent;")
+
+        bg, border = pal["surface"], pal["border"]
+        if acc:
+            bg, border = pal["success_bg"], pal["success"]
+        elif rej:
+            bg, border = pal["error_bg"], pal["error"]
+        else:
+            border = pal.get("warning_border", pal["warning"])
+        card.setStyleSheet(
+            f"QFrame#{card.objectName()} {{ background: {bg}; border: 1px solid {border}; "
+            f"border-radius: 8px; }}")
 
     # ══════════════════════════════════════════════
     # 미리보기
@@ -2543,6 +2851,12 @@ class ReviewPanel(QWidget):
         self._emit_counts()
 
     def refresh_theme(self):
+        if self._fam_mode:
+            # 가족 카드는 점진 로딩 대상이 아니라 _rebuild_cards가 못 다룬다 — 통째로 다시 만든다.
+            self._build_family_cards()
+            self._refresh_preview()
+            self._apply_card_theme()
+            return
         self._rebuild_cards()
         self._refresh_preview()
         self._apply_card_theme()

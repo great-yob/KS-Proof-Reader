@@ -1339,6 +1339,70 @@ def phase_d_rules():
                   f"실제={got}")
     print(f"  D-3 발화: {n_pos}케이스 완료")
 
+    # D-3b 부호·단위 띄어쓰기 **앵커 최소화** — 같은 교정이 카드 N장으로 갈리지 않는가.
+    #   계기(2026-08-03 사용자 보고): 'OECD.AI' 한 교정이 주변 글자에 따라 'OECD.AI,'·
+    #   '추진한다(OECD.AI,'·'OECD.AI.(n.d.c),' 등 **12장**으로 갈렸다(실파일E 268K자,
+    #   그 문서 문장부호 카드 20장 중 12장). 앵커를 삽입 지점 양옆 낱말 런으로 좁혀 1장(반복 14)으로.
+    #   ⚠ 안전 복귀 2케이스가 핵심 — 좁힌 문자열이 규칙 밖 자리(URL 안)에도 있으면 토큰
+    #     앵커로 되돌려야 한다. 깨지면 URL을 쪼개는 교정이 나간다.
+    from core import spacing_rules as _sr2
+    n_anc = 0
+    for label, text, fn, expect in (
+        ("동일 교정 1장 통합",   # ⚠ 좌측이 소문자여야 규칙이 발동한다(D-3c 참조 — 보고 원본
+                              #    'OECD.AI'는 이제 모양 가드가 통째로 억제하므로 표본으로 못 쓴다)
+         "정책이다(oecd.AI, n.d.a). 직결되며(oecd.AI, n.d.c), oecd.AI 또한 발표했다. oecd.AI.(n.d.c), “A”",
+         "punct", [("oecd.AI", "oecd. AI")]),
+        ("한글 문장 경계 앵커 유지", "결과다.그러므로 진행한다.",
+         "punct", [("결과다.그러므로", "결과다. 그러므로")]),
+        ("괄호·쉼표만 벗김", "이는 사실이다(life.Let us go), 그리고 끝.",
+         "punct", [("life.Let", "life. Let")]),
+        ("교차 스크립트 인용 앞말 보존", "그는 캐나가\"Say it 라고 했다.",
+         "punct", [("캐나가\"Say", "캐나가 \"Say")]),
+        ("★안전 복귀 — URL 안 등장", "자료는 oecd.AI, n.d.c 참고. 주소는 https://www.oecd.AI/data 이다.",
+         "punct", [("oecd.AI,", "oecd. AI,")]),
+        ("단위 부호 벗김", "예산은 13.6억원이고 끝났다.",
+         "unit", [("13.6억원이고", "13.6억 원이고")]),
+        ("★안전 복귀 — 앵커가 다른 앵커의 접두", "예산은 13.6억원이고, 추가로 13.6억원(추정)이 든다.",
+         "unit", [("13.6억원이고", "13.6억 원이고"), ("13.6억원(추정)이", "13.6억 원(추정)이")]),
+    ):
+        n_anc += 1
+        got = (_sr2.find_punct_spacing(text) if fn == "punct"
+               else _sr2.find_unit_spacing(text))
+        if got != expect:
+            fails += 1
+            print(f"  ✗ FAIL [D-3b 앵커] {label}: 기대={expect} 실제={got}")
+        for o, f in got:                       # 불변식 — 글자 불변·공백만 삽입·본문 탐색 가능
+            if (o.replace(" ", "") != f.replace(" ", "")
+                    or f.count(" ") <= o.count(" ") or o not in text):
+                fails += 1
+                print(f"  ✗ FAIL [D-3b 불변식] {label}: {o!r} → {f!r}")
+    print(f"  D-3b 앵커 최소화: {n_anc}케이스 완료")
+
+    # D-3c 라틴 약칭·도메인 **모양 가드**(spacing_rules._is_abbrev_dot ③) — 예외 목록을
+    #   열거하지 않고 '마침표 왼쪽 라틴 낱말에 대문자가 있으면 문장 종결이 아니다'로 판정한다
+    #   (사용자 결정 2026-08-03). 실원고 5종 774K자의 문장부호 오탐 3건이 전부 이 형상이었다.
+    #   ⚠ 무발화 케이스를 지우지 말 것 — 지우면 도메인·학위·법인 약칭 오교정이 되살아난다.
+    #   ⚠ 발화 케이스도 지우지 말 것 — 가드가 라틴 문장 경계를 통째로 죽이는 퇴화를 잡는다.
+    n_shape = 0
+    for label, text, expect in (
+        ("무발화 학위 약칭  Ph.D",   "산학 공동 Ph.D. 및 글로벌 펠로우십을 제도화한다.",   []),
+        ("무발화 기관 약칭  OECD.AI", "정책 기조를 보이며(OECD.AI, n.d.a), 이는 변화다.",  []),
+        ("무발화 법인 약칭  Inc.",    "스리랑카 기업 WSO2 Inc.이 개발한 미들웨어다.",      []),
+        ("무발화 대문자 약칭 U.S.",   "그는 U.S.News 기사를 인용했다.",                  []),
+        ("★발화 소문자 영문 문장 경계", "이는 사실이다(life.Let us go), 그리고 끝.",
+         [("life.Let", "life. Let")]),
+        ("★발화 한글 문장 경계",       "제시하였다.그러나 한계가 있다.",
+         [("제시하였다.그러나", "제시하였다. 그러나")]),
+        ("★발화 한글 뒤 영문 문장",    "중요한 점이다.AI 기술은 빠르다.",
+         [("점이다.AI", "점이다. AI")]),
+    ):
+        n_shape += 1
+        got = _sr2.find_punct_spacing(text)
+        if got != expect:
+            fails += 1
+            print(f"  ✗ FAIL [D-3c 모양가드] {label}: 기대={expect} 실제={got}")
+    print(f"  D-3c 라틴 약칭 모양 가드: {n_shape}케이스 완료")
+
     # D-4 규범표기 용언 활용형 동형이의 가드 — 워커 [5.7]/[5.8]과 동일 판정 함수를 게이트
     import nikl_dict as _nd
     norm_ok = False
@@ -1392,6 +1456,86 @@ def phase_d_rules():
                 print(f"  ✗ FAIL [D-6 등장경계] {orig!r}⊂{run!r}: 기대 "
                       f"{'유지' if expect_keep else '제외'} 실제={got} — {label}")
         print(f"  D-6 규범표기 등장 경계: {n_oc}케이스 완료")
+
+        # D-7 복합명사 **머리낱말 가족** 정합(2026-08-03 사용자 보고 — '수익 모델' ↔ '사업모델').
+        #   ⓐ 동률의 '가족 우선' 타이브레이크(morph): 자기 다수가 없는 낱말만 가족을 따르고,
+        #      자기 다수가 뚜렷한 낱말은 **절대** 안 끌려간다('산학협력' 51:10을 지키는 불변식).
+        #   ⓑ 가족 충돌 산출(core/consistency_family): 수락된 카드만·방향이 갈릴 때만.
+        from core import consistency_family as _cfam
+        n_fam = 0
+
+        def _fam_card(o, c, st="accepted"):
+            return {"original": o, "corrected": c, "status": st,
+                    "consistency_flip": True,
+                    "spacing_family": list(_cfam.evidence_of(o, c, 1, 2))}
+
+        # ⓐ 타이브레이크 — '가 나'/'가나'가 1:1 동률이고 같은 가족의 '다나'가 붙임 다수면 붙임.
+        _tb_text = ("정책 자료 정리는 정책자료 정리와 같다. 정책 자료 목록과 정책자료 목록. "
+                    "기술자료 정리, 기술자료 목록, 기술자료 검토, 기술 자료 검토.")
+        try:
+            _tb = _mp.find_compound_spacing_consistency(
+                _tb_text, exists_fn=lambda w: False)
+        except Exception as e:
+            _tb = f"<예외 {e}>"
+        n_fam += 1
+        _tb_hit = [(a, b) for a, b in [(x[0], x[1]) for x in _tb]] if isinstance(_tb, list) else _tb
+        if not isinstance(_tb, list) or not any(
+                m == "정책 자료" and j == "정책자료" for m, j, *_ in _tb):
+            fails += 1
+            print(f"  ✗ FAIL [D-7 가족 타이브레이크] 동률 '정책자료'가 가족('자료') 다수="
+                  f"붙임을 따라가야 한다 — 실제={_tb_hit}")
+
+        # ⓑ 충돌 산출 — 단위는 **카드가 아니라 낱말(base)**. ★거절 카드도 반드시 포함한다
+        #   (거절 = 앱이 아무것도 안 바꿈 = 문서에 두 표기가 그대로 남음. 사용자 지적
+        #   2026-08-03 "거절 카드를 빼면 정당한 비교가 불가능하다"). 지우지 말 것.
+        for label, cards, expect_heads in (
+            ("방향 갈림 → 충돌",
+             [_fam_card("수익모델", "수익 모델"), _fam_card("사업 모델", "사업모델")], ["모델"]),
+            ("방향 같음 → 충돌 아님",
+             [_fam_card("수익모델", "수익 모델"), _fam_card("사업모델", "사업 모델")], []),
+            ("★거절 카드도 포함(혼재로 남음)",
+             [_fam_card("수익모델", "수익 모델"),
+              _fam_card("사업모델", "사업 모델", "rejected")], ["모델"]),
+            ("★전부 거절 → 전부 혼재 = 충돌",
+             [_fam_card("수익모델", "수익 모델", "rejected"),
+              _fam_card("사업모델", "사업 모델", "rejected")], ["모델"]),
+            # 검수 중 '반대 표기로 통일'을 고르면 원 카드는 거절되고 반대 교정이 합성·수락된다.
+            #   낱말 단위로 안 보면 그 거절 카드가 '혼재'로 잡혀 방금 정리한 낱말이 다시 올라온다.
+            ("★뒤집기 잔재는 혼재 아님(같은 낱말의 거절+수락 쌍)",
+             [_fam_card("수익모델", "수익 모델", "rejected"),
+              _fam_card("수익 모델", "수익모델"),      # 합성된 반대 교정(수락) → 붙임 확정
+              _fam_card("사업 모델", "사업모델")], []),  # 같은 붙임 방향 → 충돌 아님
+            ("낱말 하나뿐인 계열 → 대상 아님",
+             [_fam_card("수익모델", "수익 모델", "rejected")], []),
+            ("머리낱말 다름 → 무관",
+             [_fam_card("수익모델", "수익 모델"), _fam_card("사업 전략", "사업전략")], []),
+        ):
+            n_fam += 1
+            got = [f["head"] for f in _cfam.find_conflicts(cards)]
+            if got != expect_heads:
+                fails += 1
+                print(f"  ✗ FAIL [D-7 가족 충돌] {label}: 기대={expect_heads} 실제={got}")
+
+        # ⓒ 통일 결과 불변식 — 글자 불변(공백만 가감) + 대상은 '그 방향이 아닌 낱말'뿐 +
+        #   거절(혼재) 낱말은 어느 방향이든 반드시 손대야 한다(그대로 두면 혼재가 남는다).
+        n_fam += 1
+        _cards = [_fam_card("수익모델", "수익 모델"),
+                  _fam_card("사업모델", "사업 모델", "rejected")]
+        _f = _cfam.find_conflicts(_cards)[0]
+        for _d in ("spaced", "joined"):
+            tg = _cfam.targets_for(_f, _d)
+            if any(m["direction"] == _d for m in tg):
+                fails += 1
+                print(f"  ✗ FAIL [D-7 통일 대상] {_d}: 이미 그 방향인 낱말이 대상에 들어갔다")
+            if not any(m["direction"] == _cfam.MIXED for m in tg):
+                fails += 1
+                print(f"  ✗ FAIL [D-7 혼재 누락] {_d}: 거절(혼재) 낱말이 대상에서 빠졌다")
+            for m in _f["members"]:
+                u = _cfam.unified_form(m, _d)
+                if u.replace(" ", "") != m["joined"]:
+                    fails += 1
+                    print(f"  ✗ FAIL [D-7 글자 불변] {m['base']!r} → {u!r}")
+        print(f"  D-7 복합명사 가족 정합: {n_fam}케이스 완료")
 
     print(f"  → Phase D {'✅ 통과' if fails == 0 else f'❌ {fails}건 실패'}")
     return fails
