@@ -1733,6 +1733,87 @@ def _is_typo_repair(o: str, c: str, exists_fn=None) -> bool:
                for a, b in diff)
 
 
+# ══════════════════════════════════════════════════════════
+# ▌오탈자 교정 판정 — **구조 비교 가드 전체의 단일 carve-out**
+# ══════════════════════════════════════════════════════════
+# ⚠⚠ **한 가드에서만 막으면 다음 가드가 같은 것을 잡는다.** ㉕에서 '해소히고'→'해소하고'를
+#   면제하자 ㉖(낱말 삭제)이 같은 카드를 잡았다(사용자 재보고 2026-07-31): 깨진 분석이 만든
+#   **유령 내용 형태소**('히'/NNG)가 교정 후 사라진 것을 '낱말 삭제'로 읽었기 때문이다.
+#   원인은 하나다 — **오탈자는 형태소 분해 자체를 바꾸므로, 형태소 구조를 비교하는 가드는
+#   전부 오탈자에 오발동한다.** 그래서 판정을 여기 한 곳에 두고 ㉕·㉖가 함께 쓴다.
+#   새로 구조 비교 가드를 만들면 **반드시 이 함수를 carve-out으로 통과시킬 것.**
+#
+# 실측 분리 신호(사용자 보고 카드 4종 vs 유지해야 할 재구성 7종) — **공백 제거 편집거리**:
+#     오탈자 : 상담채녈을→상담 채널을 1 · 자속될→지속될 1 · 해소히고→해소하고 1 · 드어→들어 1
+#     재구성 : 결제하는…2 · 카드 신청이…2 · 방향이 전제로…3 · 문제가 아닌…2 ·
+#              보관을 원칙으로…3 · 인증위험…2 · LH 주택공사의…4
+#   낱말을 넣거나 빼거나 구조를 바꾸면 글자가 2자 이상 움직인다 — 한 글자만 다르면 철자다.
+# ⚠ 거리 1만으로는 부족하다: **조사 교체**('방향이'→'방향을')도 거리 1이다. 그래서 바뀐
+#   글자가 원문·교정문 **어느 쪽에서든 조사/어미(J*/E*) 안에 있으면 제외**한다.
+#   반대로 '하'(XSV) 같은 파생접미사 자리는 제외하지 않는다 — '해소히고'가 그 자리이고,
+#   태가 바뀌는 '연구하고'→'연구되고'류는 태그 열이 같아(XSV→XSV) ㉕가 애초에 발동하지 않는다.
+# ⚠ 이건 **금지된 '거리 기반 추측 치환'이 아니다** — 치환을 만들지 않고, AI가 이미 낸 교정을
+#   강등할지 말지만 정한다. 방향도 억제 완화가 아니라 **오발동 제거**다.
+
+
+def _strip_spaces(s: str):
+    """공백 제거 문자열 + '제거 후 인덱스 → 원본 인덱스' 표."""
+    buf, idx = [], []
+    for i, ch in enumerate(s):
+        if not ch.isspace():
+            buf.append(ch)
+            idx.append(i)
+    return "".join(buf), idx
+
+
+def _single_edit(a: str, b: str):
+    """편집거리가 정확히 1이면 (a쪽 위치, b쪽 위치), 아니면 None."""
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1 or (la == lb == 0):
+        return None
+    i = 0
+    while i < min(la, lb) and a[i] == b[i]:
+        i += 1
+    if la == lb:
+        if i == la:
+            return None                          # 두 문자열이 같다
+        return (i, i) if a[i + 1:] == b[i + 1:] else None   # 치환 1
+    if la > lb:                                   # a에서 한 글자 삭제
+        return (i, min(i, lb - 1)) if a[i + 1:] == b[i:] else None
+    return (min(i, la - 1), i) if a[i:] == b[i + 1:] else None
+
+
+def _tag_at(s: str, idx: int):
+    """문자 위치 idx를 덮는 형태소의 태그(영형태 토큰은 건너뛴다)."""
+    for t in (_tokens(s) or ()):
+        st, ln = getattr(t, "start", None), getattr(t, "len", None)
+        if st is None or not ln:
+            continue
+        if st <= idx < st + ln:
+            return t.tag
+    return None
+
+
+def is_spelling_repair(o: str, c: str, exists_fn=None) -> bool:
+    """이 교정이 '철자 수정'인가 — 구조 비교 가드가 손대면 안 되는 부류.
+
+    (A) 공백 제거 편집거리 1 + 바뀐 글자가 조사/어미 자리가 아님, 또는
+    (B) 바뀐 어절이 전부 '분석 깨짐 → 정상'(거리가 2 이상인 오탈자를 위한 보조 경로).
+    """
+    o, c = (o or "").strip(), (c or "").strip()
+    if not o or not c or o == c:
+        return False
+    so, mo = _strip_spaces(o)
+    sc, mc = _strip_spaces(c)
+    pos = _single_edit(so, sc)
+    if pos is not None:
+        io, ic = mo[pos[0]], mc[pos[1]]
+        to, tc = _tag_at(o, io), _tag_at(c, ic)
+        if not any((t or "").startswith(("J", "E")) for t in (to, tc)):
+            return True
+    return _is_typo_repair(o, c, exists_fn)
+
+
 def _gram_tag_seq(s: str):
     """문법 형태소의 **태그 열**. 형태소 분석이 안 되면 None(판정 보류)."""
     tokens = _tokens(s)
@@ -1748,8 +1829,8 @@ def _is_grammar_restructuring(original: str, corrected: str, exists_fn=None) -> 
         return False
     if o.replace(" ", "") == c.replace(" ", ""):
         return False                      # ① 띄어쓰기만 — 면제
-    if _is_typo_repair(o, c, exists_fn):
-        return False                      # ①b 오탈자 교정 — 면제(위 주석)
+    if is_spelling_repair(o, c, exists_fn):
+        return False                      # ①b 철자 수정 — 면제(공용 carve-out)
     if len(o.split()) != len(c.split()):
         return True                       # ② 어절 수 변화
     a, b = _gram_tag_seq(o), _gram_tag_seq(c)
@@ -1835,11 +1916,18 @@ def _deleted_indices(src: list, dst: list):
     return dels
 
 
-def _is_undecidable_word_deletion(original: str, corrected: str) -> bool:
+def _is_undecidable_word_deletion(original: str, corrected: str,
+                                  exists_fn=None) -> bool:
     o, c = (original or "").strip(), (corrected or "").strip()
     if not o or not c or o == c:
         return False
     if o.replace(" ", "") == c.replace(" ", ""):
+        return False
+    if is_spelling_repair(o, c, exists_fn):
+        # ⚠ **철자 수정은 '삭제'가 아니다.** 오탈자는 형태소 분해를 바꾸므로 깨진 원문이
+        #   유령 내용 형태소를 만들고('해소히고' = 해소 + **히**), 교정 후 그것이 사라진
+        #   모양이 이 가드에는 낱말 삭제로 보인다(사용자 재보고 2026-07-31 — ㉕만 고치자
+        #   같은 카드를 여기서 잡았다). 판정은 ㉕와 **같은 함수**를 쓴다.
         return False
     of, cf = _content_morph_forms(o), _content_morph_forms(c)
     if of is None or cf is None or not cf or len(cf) >= len(of):
@@ -1855,15 +1943,16 @@ def _is_undecidable_word_deletion(original: str, corrected: str) -> bool:
     return False                       # 전부 인접 완전중복 → 명백한 중복 오타
 
 
-def demote_word_deletion(corrections: list, logger=None) -> list:
+def demote_word_deletion(corrections: list, exists_fn=None, logger=None) -> list:
     """㉖ 내용 낱말을 지우는 AI 교정을 low로 강등한다(제자리 수정 후 반환).
 
     인접 완전중복 삭제('그리고 그리고'→'그리고')는 명백한 오타이므로 제외한다.
+    철자 수정도 제외한다(`is_spelling_repair` — ㉕와 공용 carve-out).
     """
     demoted = 0
     for c in corrections:
         if (c.source in ("ai_typo", "ai_polish") and c.confidence != "low"
-                and _is_undecidable_word_deletion(c.original, c.corrected)):
+                and _is_undecidable_word_deletion(c.original, c.corrected, exists_fn)):
             c.confidence = "low"
             if not (c.reason or "").startswith("[검수]"):
                 c.reason = ("[검수] " + (c.reason or "")

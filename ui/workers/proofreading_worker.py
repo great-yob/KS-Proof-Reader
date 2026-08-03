@@ -393,7 +393,9 @@ class ProofreadingWorker(QThread):
             # 낱말 삭제 강등 — '인증위험 기반'→'위험 기반'처럼 내용 낱말을 지우는 교정은
             #   중복 오타인지 저자의 전문용어인지 규칙으로 판단할 수 없다(2026-07-30 보고).
             #   인접 완전중복('그리고 그리고'→'그리고')만 명백한 오타로 보고 high 유지.
-            ai_list = ai_guards.demote_word_deletion(ai_list, logger=log)
+            #   exists_fn: ㉕와 공용인 철자 수정 carve-out(is_spelling_repair)에 쓰인다.
+            ai_list = ai_guards.demote_word_deletion(
+                ai_list, lambda w: lookup_word(w)["exists"], logger=log)
         elif not opts.get("use_ai", True):
             log("  [AI] AI 분석 제외 모드 — Gemini 호출 없이 사전·규칙 검사만 수행합니다.")
         self.progress.emit(70, "AI 분석 완료" if opts.get("use_ai", True)

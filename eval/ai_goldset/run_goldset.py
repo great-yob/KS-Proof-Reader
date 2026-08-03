@@ -507,6 +507,9 @@ def phase_a_grammar_demote():
         ("예를 드어", "예를 들어"),              # 드/NNG+이/VCP+어/EF ← 정상은 들/VV+어/EC
         ("해소히고", "해소하고"),                # 히/NNG+이/VCP+고/EC ← 정상은 하/XSV+고/EC
         ("들어가 드어", "들어가 들어"),          # 교정문이 불규칙(듣/VV-I) — 면제가 죽으면 안 됨
+        # 재보고 2026-07-31 — 분석이 '깨지지' 않고 **재분절**되는 오탈자(len0 신호로는 못 잡음)
+        ("상담채녈을", "상담 채널을"),           # 상담채녈/NNG → 상담/채널 2형태소 + 띄어쓰기
+        ("자속될", "지속될"),                   # 자/IC+속되/VA → 지속/NNG+되/XSV (품사가 통째로 바뀜)
     ]
     # '분석 실패' 판정 자체의 불변식 — 위 keep_cases는 결과만 보므로 여기서 신호를 직접 고정.
     #   ⚠ 표면 문자열 비교(초기 구현)로 되돌리면 불규칙·축약이 전부 '실패'로 오검출된다.
@@ -518,11 +521,40 @@ def phase_a_grammar_demote():
         ("해소하고", False), ("캠페인", False),
     ]
     import nikl_dict as _nd
+    _ex = lambda x: _nd.lookup_word(x)["exists"]
     for w, exp in broken_cases:
-        got = ai_guards._analysis_broken(w, lambda x: _nd.lookup_word(x)["exists"])
+        got = ai_guards._analysis_broken(w, _ex)
         if got != exp:
             fails += 1
             print(f"  ✗ FAIL [분석실패 판정] {w!r} 기대={exp} 실제={got}")
+
+    # ★철자 수정 carve-out은 ㉕·㉖ **공용 단일 출처**다(재보고 2026-07-31: ㉕만 고치자
+    #   같은 카드를 ㉖가 잡았다). 아래 두 축을 함께 고정한다 —
+    #   (a) 오탈자는 **두 가드 모두** 통과, (b) 거리 1이어도 조사·어미 교체는 면제 금지.
+    repair_cases = [
+        ("상담채녈을", "상담 채널을", True), ("자속될", "지속될", True),
+        ("해소히고", "해소하고", True),      ("예를 드어", "예를 들어", True),
+        ("괌심을", "관심을", True),          ("켐페인의", "캠페인의", True),
+        ("방향이", "방향을", False),         # 조사 교체 — 거리 1이지만 철자 수정 아님
+        ("제도가", "제도를", False),
+        ("하였다", "하겠다", False),         # 어미 교체
+        ("결제하는 기능은", "결제 기능은", False),
+        ("카드 신청이 되면", "카드가 신청되면", False),
+        ("인증위험 기반 인증의", "위험 기반 인증의", False),
+    ]
+    for o, c, exp in repair_cases:
+        if ai_guards.is_spelling_repair(o, c, _ex) != exp:
+            fails += 1
+            print(f"  ✗ FAIL [철자수정 판정] {o!r}→{c!r} 기대={exp}")
+    # ㉖도 같은 carve-out을 쓰는지 — 오탈자를 '낱말 삭제'로 강등하면 안 된다
+    for o, c in [("해소히고", "해소하고"), ("상담채녈을", "상담 채널을"),
+                 ("예를 드어", "예를 들어")]:
+        cor = Correction(original=o, corrected=c, reason="교정", source="ai_typo",
+                         color=HL_TYPO, confidence="high")
+        ai_guards.demote_word_deletion([cor], _ex)
+        if cor.confidence != "high":
+            fails += 1
+            print(f"  ✗ FAIL [㉖가 오탈자 강등] {o!r}→{c!r}")
     for o, c in demote_cases:
         cor = Correction(original=o, corrected=c, reason="교정", source="ai_typo",
                          color=HL_TYPO, confidence="high")
@@ -567,8 +599,8 @@ def phase_a_grammar_demote():
         if got != expect:
             fails += 1
             print(f"  ✗ FAIL [낱말삭제] {o!r}→{c!r} 기대강등={expect} 실제={got}")
-    n = (len(demote_cases) + len(keep_cases) + len(broken_cases) + 1
-         + len(del_cases))
+    n = (len(demote_cases) + len(keep_cases) + len(broken_cases)
+         + len(repair_cases) + 3 + 1 + len(del_cases))
     print(f"  → {n - fails}/{n} 통과" + ("  ✅" if fails == 0 else "  ❌"))
     return fails
 
