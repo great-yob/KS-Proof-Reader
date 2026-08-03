@@ -868,6 +868,46 @@ _NORM_VERB_CASES = [
     ("메세지 전달이 중요하다.",             "메세지", "메세지", False, "명사(비활용형) — 메시지 카드 보존"),
 ]
 
+# D-5 규범표기 **체언+조사** 동형이의 가드 — (문장, 어절 w, norm_map 키, 기대 보류 여부, 설명).
+#   D-4의 명사 쪽 짝. 워커 [5.7]/[5.8]과 동일 호출( is_noun_josa_homograph(key, w, 문장) ). 2조건:
+#   ①key=통어절 ②문맥 kiwi가 [체언+조사]로 가르고 그 체언이 정확 등재 표제어(1글자 허용).
+#   계기(2026-08-03 사용자 보고): '하는 말이'·'많단 말이에요'의 '말이'(말+주격조사)가 방언
+#   표제어 '말이→말니'로 오매칭. norm_map 전수 스캔 결과 같은 형상 382건(base 등재 173건).
+#   ⚠ 케이스 삭제 금지 — SKIP은 과교정 회귀 감시, KEEP은 정당 카드 보존 감시.
+#   ⚠ KEEP의 '키로'·'탱이'가 핵심 — 낱말로 굳은 표기는 kiwi가 통째로 읽어야 가드가 안 터진다.
+#     이게 깨지면 가드가 '체언+조사 모양이면 무조건 보류'로 퇴화한 것이다.
+_NORM_NOUN_CASES = [
+    ('애들이 주로 하는 말이, "어차피 자립수당 받잖아요"라고 한다.', "말이", "말이", True,
+     "말+주격조사(보고 사례) — 방언 '말이→말니' 치환 보류"),
+    ("그건 말이 안 된다는 뜻이다.",          "말이",   "말이",   True,  "말+이 — 말니 보류"),
+    ("건물 앞이 넓어서 주차가 편하다.",       "앞이",   "앞이",   True,  "앞+이 — '앞니' 보류"),
+    ("창문을 여니 바람이 시원하게 들어온다.", "바람이", "바람이", True,  "바람+이 — '바람니' 보류"),
+    ("요즘 그 일에 신경이 많이 쓰인다.",      "신경이", "신경이", True,  "신경+이 — '싱경이' 보류"),
+    ("그 사람의 실력은 보통이 아니다.",       "보통이", "보통이", True,  "보통+이 — '보퉁이' 보류"),
+    ("아이의 손과 발이 모두 차가웠다.",       "손과",   "손과",   True,  "손+과(1글자 base) — '쑨커' 보류"),
+    ("이번 사고는 나로 인해 벌어진 일이다.",  "나로",   "나로",   True,  "나+로 — '나루' 보류"),
+    ("여기서 10키로 떨어진 곳에 있다.",       "키로",   "키로",   False, "kiwi가 NNB 단일 형태소 — 킬로 카드 보존"),
+    ("탱이 한 마리를 잡아 올렸다.",           "탱이",   "탱이",   False, "kiwi가 NNG 단일 형태소 — 매기 카드 보존"),
+    ("두 사람이 실강이를 벌이고 있었다.",     "실강이를", "실강이", False, "①조사 딸린 매칭=명사 사용 — 실랑이 카드 보존"),
+    ("컨텐츠 산업이 성장하고 있다.",          "컨텐츠", "컨텐츠", False, "체언+조사 아님 — 콘텐츠 카드 보존"),
+    ("메세지 전달이 중요하다.",              "메세지", "메세지", False, "체언+조사 아님 — 메시지 카드 보존"),
+]
+
+# D-6 규범표기 카드의 **등장 경계** — (한글 런, 카드 원문, 기대 유지 여부).
+#   review_panel._mark_stem_boundary_skips 대상 ⑤가 core.morph.nominal_boundaries로 판정한다.
+#   같은 보고에서 '말이' 카드가 '말이에요' **속**을 반복 1/2로 잡았다(수락 시 '말니에요').
+#   유지 조건: 등장 양끝이 형태소 경계 + 런에 용언·어미·계사 없음(순수 체언 연쇄).
+_NORM_OCC_CASES = [
+    ("말이에요",   "말이",   False, "말/NNG+이/VCP+에요/EF — 용언 꼬리(보고 사례)"),
+    ("말이다",     "말이",   False, "계사 활용"),
+    ("말이야기",   "말이",   False, "체언 연쇄지만 등장 끝이 형태소 경계 아님"),
+    ("앞이라도",   "앞이",   False, "앞/NNG+이/VCP+라도/EC"),
+    ("탱이었다",   "탱이",   False, "탱/NNG+이/VCP+었/EP+다/EF"),
+    ("컨텐츠를",   "컨텐츠", True,  "체언+조사 — 조사형 등장 보존"),
+    ("컨텐츠산업", "컨텐츠", True,  "복합명사 성분 — 정당한 등장 보존"),
+    ("메세지창에서", "메세지", True, "복합명사+조사 — 보존"),
+]
+
 
 def phase_f_realword():
     """실단어 오류 finder(core/realword.py) — 결정론 후보 생성부만 게이트.
@@ -1321,6 +1361,37 @@ def phase_d_rules():
                 print(f"  ✗ FAIL [D-4 용언가드] {key!r}(어절 {w!r}): 기대 "
                       f"{'보류' if expect_skip else '유지'} 실제={got} — {label}")
         print(f"  D-4 용언 활용형 가드: {n_vh}케이스 완료")
+
+        # D-5 체언+조사 동형이의 가드(D-4의 명사 쪽 짝 — 말이/앞이/손과류)
+        n_nh = 0
+        for sent, w, key, expect_skip, label in _NORM_NOUN_CASES:
+            n_nh += 1
+            try:
+                got = _nd.is_noun_josa_homograph(key, w, sent)
+            except Exception as e:
+                got = f"<예외 {e}>"
+            if got != expect_skip:
+                fails += 1
+                print(f"  ✗ FAIL [D-5 체언가드] {key!r}(어절 {w!r}): 기대 "
+                      f"{'보류' if expect_skip else '유지'} 실제={got} — {label}")
+        print(f"  D-5 체언+조사 가드: {n_nh}케이스 완료")
+
+        # D-6 규범표기 카드 등장 경계(검수 패널 대상 ⑤와 동일 판정)
+        from core import morph as _mp
+        n_oc = 0
+        for run, orig, expect_keep, label in _NORM_OCC_CASES:
+            n_oc += 1
+            try:
+                b = _mp.nominal_boundaries(run)
+                p = run.find(orig)
+                got = bool(b is not None and p in b and (p + len(orig)) in b)
+            except Exception as e:
+                got = f"<예외 {e}>"
+            if got != expect_keep:
+                fails += 1
+                print(f"  ✗ FAIL [D-6 등장경계] {orig!r}⊂{run!r}: 기대 "
+                      f"{'유지' if expect_keep else '제외'} 실제={got} — {label}")
+        print(f"  D-6 규범표기 등장 경계: {n_oc}케이스 완료")
 
     print(f"  → Phase D {'✅ 통과' if fails == 0 else f'❌ {fails}건 실패'}")
     return fails

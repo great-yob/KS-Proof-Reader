@@ -1075,7 +1075,18 @@ class ReviewPanel(QWidget):
                 and corr.count(" ") < orig.count(" ")
                 and _re.fullmatch(r"[가-힣]+(?: [가-힣]+)+", orig)
             )
-            if not (is_split or is_flag or is_expand or is_join):
+            # 대상 ⑤: 규범표기 카드([5.7] norm_map·[5.8] 어문 페어) — 원문이 문서의 **한글 런
+            #   전체**로 조회된 것이라, 더 긴 런 속 우연한 부분문자열은 같은 낱말이 아니다.
+            #   2026-08-03 사용자 보고에서 '말이'(→말니) 카드가 '말이에요' **속**을 반복 1/2로
+            #   하이라이트했다 — 수락하면 '말니에요'가 된다. 글자를 바꾸는 교정이라 is_split·
+            #   is_join(글자 불변)·is_flag(dict_flag)·is_expand(자기확장) 어디에도 안 걸렸다.
+            #   ⚠ 여기선 base 비교가 아니라 **형태소 경계**로 판정한다(아래) — base 비교는
+            #   '컨텐츠'(→콘텐츠)가 '컨텐츠산업' 속에서 발동하는 정당한 성분 교정까지 죽인다.
+            is_norm = bool(
+                c.get("source") == "dict" and c.get("category") == "규범표기"
+                and orig and _re.fullmatch(r"[가-힣]+", orig)
+            )
+            if not (is_split or is_flag or is_expand or is_join or is_norm):
                 continue
             orig_h = _hang.sub("", orig)
             if not orig_h:
@@ -1100,6 +1111,16 @@ class ReviewPanel(QWidget):
             #   카드('…채널을'→'…채널 을 분리' 등)에서 조사를 떼고 비교하면 전부 불일치로
             #   제외돼 카드가 통째로 사라졌다(2026-07-02 미탐 보고 — 회귀 수정).
             if token_h == orig_h:
+                continue
+            if is_norm:
+                # 규범표기(대상 ⑤) — 등장의 **양끝이 모두 형태소 경계**이고 그 런에
+                #   용언·어미·계사가 없을 때만(=순수 체언 연쇄) 같은 낱말로 인정한다.
+                #   유지: '컨텐츠'⊂'컨텐츠를'(컨텐츠+를)·'컨텐츠산업'(컨텐츠+산업).
+                #   제외: '말이'⊂'말이에요'(말+이/VCP+에요/EF — 용언 꼬리),
+                #        '말이'⊂'말이야기'(체언 연쇄지만 끝이 경계 아님).
+                b = _morph.nominal_boundaries(token)
+                if b is None or (p - left) not in b or (p + len(orig) - left) not in b:
+                    o["excluded"] = True
                 continue
             base = _morph.strip_josa(token) or token
             if _hang.sub("", base) != orig_h:       # 어절 base ≠ original → 더 긴 복합어 → 제외

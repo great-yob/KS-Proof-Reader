@@ -298,17 +298,59 @@ def is_verb_inflection_homograph(key: str, eojeol: str, text: str) -> bool:
     return lookup_norm(lemma) is None
 
 
-def _is_exact_headword(word: str) -> bool:
+def is_noun_josa_homograph(key: str, eojeol: str, text: str) -> bool:
+    """norm_map 키 `key`가 이 문서에서 '체언 + 조사'와 동형이라 치환을 보류해야 하는가?
+
+    is_verb_inflection_homograph(용언 활용형)의 **명사 쪽 짝**. 계기(2026-08-03 사용자
+    보고): "애들이 주로 하는 **말이**"·"엄청 많단 **말이**에요"의 '말이'(말+주격조사)가
+    방언 표제어 '말이→말니'로 오매칭돼 규범표기 카드가 생성됐다. 기존 가드 3종이 모두
+    비켜 간다 — `_VARIANT_SENSE`는 빌드타임 표제어 뜻 가드, `is_homograph_norm_key`는
+    **base 2글자 이상 + 명확한 조사(이/가 제외)** 구조만 보고('말'은 1글자, '이'는 제외
+    대상), `is_verb_inflection_homograph`는 용언만 본다.
+
+    규모: norm_map 12,750건 중 **382건**이 '체언+조사' 형상이고 그 중 **173건은 base가
+    등재 표제어**다. 현대문에서 그대로 터지는 것만 추려도 앞이→앞니, 젖이→젖니,
+    바람이→바람니, 신경이→싱경이, 보통이→보퉁이, 겉이→같이, 톱이→톱니, 손과→쑨커,
+    나로→나루, 살도→쇄도 등 — 전부 '말이'와 같은 부류의 치명적 오교정이다.
+
+    2조건 전부 충족 시 True:
+      ① key가 어절 전체와 일치 — 조사 딸린 매칭('찌게를'·'실강이를')은 명사 사용 신호라
+        미적용(카드 보존). is_verb_inflection_homograph ①과 동일.
+      ② 문맥 kiwi 분석에서 등장이 [체언 + 조사]로 갈리고(core.morph.noun_josa_split),
+        그 체언이 **정확 등재 표제어**(1글자 허용 — '말'·'앞'·'손'). 체언이 헛것이면
+        ('고림장이'=고림장+이) 방언 표제어 쪽이 옳으므로 카드를 유지한다.
+    ⚠ 판별의 핵심은 **문맥**이다 — 낱말로 굳은 표기는 kiwi가 통째로 읽어 발동하지 않는다
+      (실측: '10키로 떨어진'→킬로 카드 보존, '탱이 한 마리'→매기 카드 보존).
+    억제 방향 트레이드오프(수용): 방언 명사를 조사 없이 통어절로 쓴 문맥('곰방이 물고')은
+    체언+조사로 읽혀 미탐 — 과교정 0 원칙 우선. 형태소 미가용 시 False(graceful).
+    """
+    if not key or key != eojeol:
+        return False
+    try:
+        from core import morph as _morph
+        base = _morph.noun_josa_split(text, eojeol) if _morph.available() else None
+    except Exception:
+        base = None
+    if not base:
+        return False
+    return _is_exact_headword(base, min_len=1)
+
+
+def _is_exact_headword(word: str, min_len: int = 2) -> bool:
     """`word`가 사전에 **정확히** 등재된 표제어인가(조사 stem 폴백 없음).
 
     lookup_word()는 조사형(컨텐츠'를')을 stem으로 되돌려 exists=True로 보므로 복합어
     성분 판정엔 부적합하다. 여기선 정확 일치 + 동형이의 번호접미(등장01) 변형만 본다.
+
+    `min_len`은 기본 2 — 복합어 성분 판정에서 1글자를 받으면 거의 모든 음절이 표제어라
+    무의미해진다. **문맥 형태소 분석이 이미 체언으로 판정한 스팬**을 재확인할 때만
+    min_len=1로 낮춘다(is_noun_josa_homograph — '말'·'앞'·'손' 같은 1글자 체언).
     """
     conn = _get_conn()
     if conn is None:
         return False
     clean = re.sub(r"[^가-힣]", "", word).strip()
-    if len(clean) < 2:
+    if len(clean) < min_len:
         return False
     try:
         if conn.execute("SELECT 1 FROM words WHERE word=? LIMIT 1", (clean,)).fetchone():

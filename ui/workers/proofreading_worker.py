@@ -575,6 +575,12 @@ class ProofreadingWorker(QThread):
                             #   377건 실측). 문맥상 표준 용언의 활용형이면 치환 보류.
                             if _nd.is_verb_inflection_homograph(key, w, text):
                                 continue
+                            # 체언+조사 동형이의 가드 — '말이'(말+주격조사)가 방언 표제어
+                            #   '말이→말니'로 오매칭되는 부류(앞이→앞니·신경이→싱경이 등
+                            #   382건 형상, base 등재 173건 실측). 문맥이 체언+조사로
+                            #   읽히면 치환 보류(낱말로 굳은 '키로'·'탱이'는 단일 형태소라 무영향).
+                            if _nd.is_noun_josa_homograph(key, w, text):
+                                continue
                             # 받침이 바뀌면 뒤 조사도 호응시킨다(스윕과→스위프와).
                             josa = _rj(norm, w[len(key):]) if w.startswith(key) else ""
                             corrected = norm + josa
@@ -641,6 +647,9 @@ class ProofreadingWorker(QThread):
                                 continue
                             # 용언 활용형 동형이의 가드(norm_map [5.7]과 동일 — 나올/짚고류).
                             if _nd.is_verb_inflection_homograph(key, w, text):
+                                continue
+                            # 체언+조사 동형이의 가드(norm_map [5.7]과 동일 — 말이/앞이류).
+                            if _nd.is_noun_josa_homograph(key, w, text):
                                 continue
                             # 받침이 바뀌면 뒤 조사도 호응시킨다(스윕과→스위프와).
                             josa = _rj(norm, w[len(key):]) if w.startswith(key) else ""

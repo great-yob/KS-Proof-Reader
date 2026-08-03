@@ -267,6 +267,107 @@ def verb_inflection_lemma(text: str, eojeol: str, max_occurrences: int = 4):
     return None
 
 
+# 체언 계열 태그(조사 앞에 올 수 있는 것) — noun_josa_split·nominal_boundaries 공용.
+#   XSN(파생접미사 '-생·-님')·XPN(접두사)까지 포함해야 '과생이'=과/NNG+생/XSN+이/JKS 같은
+#   분해도 '체언+조사'로 읽힌다. 용언(V*)·어미(E*)·계사(VCP/VCN)·파생용언(XSV/XSA)은 제외.
+_NOMINAL = ("NNG", "NNP", "NNB", "NP", "NR", "XSN", "XPN")
+
+
+def noun_josa_split(text: str, eojeol: str, max_occurrences: int = 4):
+    """eojeol이 문서 문맥에서 '체언 + 조사'로 읽히면 그 **체언 표면형**을 반환.
+
+    regularization(norm_map/어문 페어)류 '어절 표면 매칭' 교정의 **체언+조사 동형이의
+    가드**용. verb_inflection_lemma(용언 활용형)와 같은 사각을 명사 쪽에서 막는다:
+    '말이'(말+주격조사)가 방언 표제어 '말이→말니'에 오매칭돼 "하는 말이"를 "하는 말니"로
+    바꾸는 부류(2026-08-03 사용자 보고). norm_map 전수 스캔 382건이 이 형상이고,
+    그 중 173건은 base가 등재 표제어라 현대문에서 그대로 지뢰다(앞이→앞니, 바람이→
+    바람니, 신경이→싱경이, 보통이→보퉁이, 손과→쑨커, 나로→나루 …).
+
+    판정 — 통어절 등장( (?<![가-힣])eojeol(?![가-힣]) ) 표본 최대 max_occurrences개 중
+    **하나라도** 체언+조사로 읽히면 그 체언을 반환(하나라도 그렇게 읽히면 일괄 치환이
+    그 등장을 훼손하므로 보수적으로 전체 보류가 옳다 — verb_inflection_lemma와 동일 철학):
+      · 등장 주변 ±48자 창을 kiwi로 분석해 스팬이 [체언(_NOMINAL) 런 + 조사(J*) 런]이면 해당.
+      · ⚠ 문맥이 판별의 핵심이다. 낱말로 굳은 표기는 kiwi가 통째 한 형태소로 읽어
+        가드가 발동하지 않는다(실측: '10키로 떨어진'의 '키로'=NNB 단일 → 킬로 교정 보존,
+        '탱이 한 마리'의 '탱이'=NNG 단일 → 매기 교정 보존). 반면 '하는 말이,'는
+        말/NNG+이/JKS, '차란 무엇인가'는 차/NNG+란/JX로 갈려 보류된다.
+      · 불규칙 결합('과잘'=과자/NNG+ᆯ/JKO)은 표면 경계가 어긋나므로 판정 보류(카드 유지).
+
+    ⚠ 조사 딸린 표면('찌게를')은 명사 사용 신호이므로 **호출 측이 가드 대상에서 제외**할 것.
+    ⚠ 반환된 체언이 실제 등재 표제어인지 확인도 호출 측 몫
+      (nikl_dict.is_noun_josa_homograph가 담당 — 체언이 헛것이면 방언 표제어 쪽이 옳다).
+    kiwi 미가용·미발견 시 None (graceful — 가드 미적용).
+    """
+    kiwi = _get_kiwi()
+    if kiwi is None or not text or not eojeol:
+        return None
+    try:
+        pat = re.compile(r"(?<![가-힣])" + re.escape(eojeol) + r"(?![가-힣])")
+    except re.error:
+        return None
+    n = 0
+    for m in pat.finditer(text):
+        if n >= max_occurrences:
+            break
+        n += 1
+        lo = max(0, m.start() - 48)
+        window = text[lo:min(len(text), m.end() + 48)]
+        pos = m.start() - lo
+        try:
+            tokens = kiwi.analyze(window)[0][0]
+        except Exception:
+            continue
+        span = [t for t in tokens if pos <= t.start < pos + len(eojeol)]
+        if len(span) < 2:
+            continue
+        j = len(span)                       # 끝에서부터 조사 런을 떼어 낸다
+        while j > 0 and span[j - 1].tag.startswith("J"):
+            j -= 1
+        if j == 0 or j == len(span):        # 조사가 없거나 전부 조사 → 해당 없음
+            continue
+        if any(t.tag.split("-")[0] not in _NOMINAL for t in span[:j]):
+            continue
+        prev, first_j = span[j - 1], span[j]
+        if first_j.start != prev.start + prev.len:   # 불규칙 결합 → 보류
+            continue
+        base = eojeol[:first_j.start - pos]
+        if base and len(base) < len(eojeol):
+            return base
+    return None
+
+
+def nominal_boundaries(run: str):
+    """`run`(한글 런)이 **체언 연쇄(+조사)** 로만 분석되면 형태소 경계 오프셋 집합을 반환.
+
+    용언·어미·계사·파생용언이 하나라도 섞이면 None — 그 런 안의 **부분 치환은 안전하지
+    않다**는 뜻이다. 검수 등장 필터(review_panel._mark_stem_boundary_skips 대상 ⑤)가
+    규범표기 카드의 등장을 걸러내는 데 쓴다: '말이' 교정이 '말이에요'(말/NNG+이/VCP+
+    에요/EF) 속에서 발동해 '말니에요'를 만드는 것은 막고, '컨텐츠'(→콘텐츠) 교정이
+    '컨텐츠산업'·'컨텐츠를' 같은 **체언 연쇄** 안에서 발동하는 것은 살린다.
+
+    경계 집합에는 0과 len(run)도 포함한다. 등장의 양끝이 모두 경계여야 같은 낱말이다
+    ('말이야기'=말/NNG+이야기/NNG는 체언 연쇄지만 '말이'의 끝이 경계가 아니라 제외).
+    kiwi 미가용·분석 실패 시 None(=보수적 제외).
+    """
+    kiwi = _get_kiwi()
+    if kiwi is None or not run:
+        return None
+    try:
+        tokens = kiwi.analyze(run)[0][0]
+    except Exception:
+        return None
+    if not tokens:
+        return None
+    bounds = {0, len(run)}
+    for t in tokens:
+        tag = t.tag.split("-")[0]
+        if tag not in _NOMINAL and not tag.startswith("J"):
+            return None
+        bounds.add(t.start)
+        bounds.add(t.start + t.len)
+    return bounds
+
+
 # `single_char_tail_ok=False`에서도 **정상으로 인정하는 1글자 꼬리** — 행정·기술 문서에서
 #   자유롭게 새 낱말을 만드는 '라벨 접미사'다(서비스명·분포표·결합키·보안팀·접속일·카드망).
 #   이 목록이 없으면 그런 정상 복합어가 모두 검수 카드가 된다(실측 3문서 순증 9/2/5건 중
