@@ -523,19 +523,23 @@ class MainWindow(QMainWindow):
         # 대기 항목이 있어도 버튼은 활성 — 누르면 _start_apply가 미선택을 막고 에러 팝업.
         self.footer.set_primary(f"✓  교정 적용 ({accepted}항목)", variant="action_pink",
                                 enabled=total > 0, visible=True, show_reset=True)
-        # 1차 통일 뒤에도 갈린 계열이 남으면 **2단계 재검토**를 보조 버튼으로 연다
-        #   (사용자 결정 2026-08-04). 자동으로 다시 끌고 들어가지 않는다 — 남은 갈림은
-        #   대부분 사용자가 방금 내린 결정의 결과라, 되묻는 건 사용자가 원할 때만.
-        self.footer.set_recheck(bool(n_fam) and self._consistency_done, n_fam)
+        # 1차 통일 뒤에도 **아직 결정하지 않은** 계열·낱말이 남으면 2단계 재검토를 보조
+        #   버튼으로 연다. ⚠ 남은 '갈림' 전체를 세면 안 된다 — 사용자가 '그대로 두기'로
+        #   결정한 계열도 갈린 상태로 남으므로, 무엇을 골라도 버튼이 사라지지 않아
+        #   교정이 끝나지 않는 화면이 된다(사용자 보고 2026-08-04).
+        left = self.review_panel.consistency_pending_count() if self._consistency_done else 0
+        self.footer.set_recheck(bool(left), left)
 
     # ── 표기 일관성 단계 ─────────────────────────
-    def _on_consistency_counts(self, pending: int, accepted: int, total: int):
+    def _on_consistency_counts(self, pending: int, done: int, total: int):
         if not self.review_panel.in_consistency_mode():
             return
-        self.rail.set_step_result("review", f"표기 일관성 {accepted} / {total}")
+        # 용어: 이 단계의 카드는 '통일/그대로 두기/낱말 표기 고르기'가 섞여 있으므로
+        #   공통 어휘는 **결정**이다(수락이 아니다).
+        self.rail.set_step_result("review", f"표기 일관성 {done} / {total}")
         self.footer.set_status(
-            f"표기 일관성 검토 중 — 통일 : {accepted} / {total}계열 · 대기 : {pending}계열")
-        self.footer.set_primary(f"✓  표기 일관성 적용 ({accepted}항목)", variant="action_pink",
+            f"표기 일관성 검토 중 — 결정 : {done} / {total} · 대기 : {pending}")
+        self.footer.set_primary(f"✓  표기 일관성 적용 ({done}항목)", variant="action_pink",
                                 enabled=True, visible=True, show_reset=True)
 
     def _enter_consistency(self):
@@ -554,31 +558,23 @@ class MainWindow(QMainWindow):
 
     def _apply_consistency(self):
         """선택한 계열을 통일하고 '교정 제안' 그리드로 복귀."""
-        pending, accepted, total = self.review_panel.get_consistency_counts()
+        pending, done, total = self.review_panel.get_consistency_counts()
         if pending > 0:
             self._warn_popup(
                 "검토가 끝나지 않았습니다",
-                f"모든 표기 일관성 제안을 '통일' 또는 '그대로 두기'로 선택해야 합니다.\n"
-                f"아직 결정하지 않은 항목이 {pending}건 남아 있습니다.")
+                f"계열 카드는 '통일(✓)' 또는 '그대로 두기(✕)'를, 낱말 카드는 쓸 표기를\n"
+                f"골라야 합니다. 아직 결정하지 않은 항목이 {pending}건 남아 있습니다.")
             return
         rd = self.review_panel.consistency_round()
         n = self.review_panel.apply_consistency()
         self._consistency_done = True
         self.activity.log(
-            f"[표기 일관성] {rd}차 통일 · 계열 {accepted}건 · 교정 {n}건 방향 조정")
-        # ⚠ 한 낱말은 꼬리·머리 두 계열에 동시에 속한다('지원정책' = '…정책' ∩ '지원…').
-        #   그래서 이 라운드의 통일에서 빠지는 낱말이 두 종류 생긴다(consistency_family.plan):
-        #   ① 잠김 — 먼저 결정한 계열이 가져갔다(화면에서 눌러 되돌릴 수 있었다).
-        #   ② 계열 보호 — 다른 축에서 멀쩡하던 계열을 깨뜨려 되돌렸다. 그 계열은 갈리지 않아
-        #      카드로도 안 나오니 사용자가 볼 기회조차 없다.
-        #   둘 다 원인이 다르므로 따로 알린다. 화면엔 집계만, 개별 낱말은 원문 로그에 불릿으로.
-        locked = self.review_panel.get_consistency_locked()
+            f"[표기 일관성] {rd}차 결정 {done}건 · 교정 {n}건 방향 조정")
+        # ⚠ 겹치는 낱말(두 계열이 다르게 요구)은 **낱말 카드에서 이미 결정됐다** — 여기서
+        #   보고할 게 없다. 남는 보고는 '멀쩡한 계열을 깨뜨려 되돌린 낱말'뿐이다(그 계열은
+        #   갈리지 않아 카드로도 안 나오니 사용자가 볼 기회조차 없다).
+        #   화면엔 집계만, 개별 낱말은 원문 로그에 불릿으로(화면 로그 규약).
         blocked = self.review_panel.get_consistency_blocked()
-        if locked:
-            self.activity.log(
-                f"[표기 일관성] 두 계열이 겹쳐 먼저 결정한 쪽으로 정한 낱말 {len(locked)}건")
-            for _w in locked:
-                self.activity.log(f"      · 앞선 계열이 가져감 '{_w}'")
         if blocked:
             self.activity.log(
                 f"[표기 일관성] 다른 계열의 표기가 갈릴까 봐 통일하지 않은 낱말 "
@@ -593,13 +589,13 @@ class MainWindow(QMainWindow):
                 f"[표기 일관성] 사용자 선택으로 다른 계열이 갈리게 된 낱말 {len(broken)}건")
             for _w in broken:
                 self.activity.log(f"      · 사용자 선택으로 다른 계열이 갈림 '{_w}'")
-        # 남은 갈림은 **재검토 버튼**으로 다시 볼 수 있다(_on_review_counts가 켠다).
-        #   겹치는 교정으로 통일이 아예 안 되는 부류(실측 실파일E 24계열 중 1건: '산업 분류'가
-        #   구간을 선점해 '분류 체계' 등장이 shadowed)는 재검토로도 안 풀리므로 그대로 알린다.
-        left = len(self.review_panel.consistency_families())
-        if left:
-            self.activity.log(
-                f"[표기 일관성] {rd}차 뒤에도 표기가 갈린 계열 {left}건 — 재검토로 다시 볼 수 있습니다")
+        # 아직 **결정하지 않은** 것이 남으면 재검토 버튼으로 다시 볼 수 있다
+        #   (_on_review_counts가 켠다). 이미 결정한 계열은 갈린 채로 남아도 다시 묻지 않는다
+        #   — 그래야 사용자에게 '끝'이 있다.
+        left = self.review_panel.consistency_pending_count()
+        self.activity.log(
+            f"[표기 일관성] {rd}차 뒤 결정할 계열·낱말 {left}건"
+            + ("" if left else " · 표기 일관성 검토 완료"))
         self.footer.set_idle("교정 제안 검토 중")
         self._on_review_counts(*self._count_review())
 

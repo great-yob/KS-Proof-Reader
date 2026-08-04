@@ -1561,10 +1561,11 @@ def phase_d_rules():
                 print(f"  ✗ FAIL [D-7 머리 축] {label}: 기대={expect} 실제={got}")
 
         # ⓔ **두 축이 같은 낱말을 반대로 요구**할 때(=한 낱말이 두 계열에 속함).
-        #   ⚠ 계약(2026-08-04 사용자 결정 '두 단계 검토'): **사용자가 먼저 수락한 계열이
-        #     가져간다**(seq). 앱이 몰래 고르는 게 아니라 ① 순서는 사용자가 만들고
-        #     ② 잠김으로 화면에 보이고 ③ override로 되돌릴 수 있어야 성립한다. 셋 중 하나라도
-        #     빠지면 조용한 오통일이므로, 이 세 케이스를 지우지 말 것.
+        #   ⚠ 계약(2026-08-04 재설계): 앱은 **정하지 않는다**. 그 낱말은 계열 카드에서
+        #     빠지고 `contested_words()`가 내는 **낱말 카드 한 장**에서 한 번만 결정한다.
+        #     결정 전엔 손대지 않고 `undecided`로 돌려준다.
+        #     ⚠ 이전 구현('먼저 수락한 계열이 가져가고 다른 카드에서 눌러 되돌리기')은
+        #       두 카드가 서로를 되돌리는 **핑퐁**이 되어 폐기됐다 — 되살리지 말 것.
         _x_cards = [_fam_card("지원 정책", "지원정책"), _fam_card("보상정책", "보상 정책"),
                     _fam_card("지원사업", "지원 사업")]
         _x_fams = _cfam.find_conflicts(_x_cards)
@@ -1572,22 +1573,28 @@ def phase_d_rules():
         _lead_f = next(f for f in _x_fams if f["axis"] == "lead")
 
         n_fam += 1
-        _tail_f.update(status="accepted", choice="joined", seq=1)   # 먼저: …정책 → 붙임
-        _lead_f.update(status="accepted", choice="spaced", seq=2)   # 나중: 지원… → 띄어쓰기
+        _tail_f.update(status="accepted", choice="joined")     # …정책 → 붙임
+        _lead_f.update(status="accepted", choice="spaced")     # 지원… → 띄어쓰기
         _p = _cfam.plan(_x_fams, _x_fams)
-        _own = _p["locked"].get("지원정책", (None, None))[0]
-        if _own is not _tail_f or _p["want"].get("지원정책") != "joined":
+        if _p["undecided"] != ["지원정책"] or "지원정책" in _p["want"] or \
+                any(o == "지원 정책" for _a, _ci, o, _r in _p["jobs"]):
             fails += 1
-            print(f"  ✗ FAIL [D-7 잠김] 먼저 수락한 계열이 낱말을 가져가야 한다 — "
-                  f"주인={_own and _own['key']} want={_p['want'].get('지원정책')}")
+            print(f"  ✗ FAIL [D-7 겹침] 결정 전엔 손대지 않고 undecided여야 한다 — "
+                  f"undecided={_p['undecided']} want={_p['want'].get('지원정책')}")
 
         n_fam += 1
-        _p = _cfam.plan(_x_fams, _x_fams, {"지원정책": _lead_f["key"]})
-        if _p["want"].get("지원정책") != "spaced" or \
-                _p["locked"].get("지원정책", (None,))[0] is not _lead_f:
+        _w = _cfam.contested_words(_x_fams)
+        if [x["base"] for x in _w] != ["지원정책"] or set(_w[0]["by"]) != {"joined", "spaced"}:
             fails += 1
-            print(f"  ✗ FAIL [D-7 잠김 되돌리기] override가 주인을 바꿔야 한다 — "
-                  f"실제 want={_p['want'].get('지원정책')}")
+            print(f"  ✗ FAIL [D-7 낱말 카드] 겹치는 낱말이 낱말 카드 재료로 나와야 한다 — "
+                  f"{[x['base'] for x in _w]}")
+
+        n_fam += 1
+        _p = _cfam.plan(_x_fams, _x_fams, {"지원정책": "spaced"})   # 낱말 카드에서 결정
+        if _p["undecided"] or _p["want"].get("지원정책") != "spaced":
+            fails += 1
+            print(f"  ✗ FAIL [D-7 낱말 결정] 낱말 카드 선택이 그대로 반영돼야 한다 — "
+                  f"want={_p['want'].get('지원정책')} undecided={_p['undecided']}")
 
         n_fam += 1
         _tail_f["choice"] = _lead_f["choice"] = "spaced"       # 두 계열이 **같은** 방향
@@ -1616,11 +1623,11 @@ def phase_d_rules():
 
         n_fam += 1
         for f in _a_fams:
-            f.update(status="accepted", choice=f["proposal"], seq=1)
-        if _cfam.plan(_a_fams, _a_fams)["locked"]:
+            f.update(status="accepted", choice=f["proposal"])
+        if _cfam.plan(_a_fams, _a_fams)["undecided"]:
             fails += 1
             print(f"  ✗ FAIL [D-7 공동 제안] 기본 제안대로 전부 수락했는데 낱말이 부딪힌다 "
-                  f"— 공동 풀이가 안 먹었다")
+                  f"— 공동 풀이가 안 먹었다(그만큼 낱말 카드가 늘어난다)")
 
         n_fam += 1
         if (_cfam.family_label(_tail_f), _cfam.family_label(_lead_f)) != ("…정책", "지원…"):

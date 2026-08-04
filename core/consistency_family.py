@@ -340,25 +340,58 @@ def demands(families: list) -> dict:
     return out
 
 
-def plan(families: list, all_families: list = None, overrides: dict = None,
+def contested_words(families: list) -> list:
+    """**두 계열이 서로 다른 표기를 요구하는 낱말** 목록 — 낱말 카드 1장의 재료.
+
+    반환: `[{"base","spaced","joined","n_joined","n_spaced","member",
+             "by": {"spaced": [family,…], "joined": [family,…]}}, …]`(base 순)
+
+    ⚠ **거절하지 않은 계열의 현재 방향**으로 본다(수락된 것만 보지 않는다). 수락만 세면
+      사용자가 카드를 하나씩 수락하는 동안 낱말 카드가 **뒤늦게 하나씩 튀어나와**, 다
+      끝냈다고 생각한 뒤에 새 할 일이 생긴다(실측: 1차에서 낱말 카드 0장 → 적용 후 미결정
+      4건). 진입 시점에 할 일 전체가 보여야 한다. 실행(`plan`)은 수락된 것만 본다.
+
+    ⚠ 이 낱말들은 **계열 카드에서 결정할 수 없다.** 두 계열이 각자 다른 답을 요구하고,
+      어느 쪽이 옳은지 앱은 알 수 없기 때문이다(알면 애초에 자동 통일이 된다).
+      한때 '먼저 수락한 계열이 가져가고 다른 카드에선 눌러서 되돌리기'로 풀었는데,
+      **두 카드가 서로를 되돌리는 핑퐁이 되고 사용자가 무엇을 고르는 중인지 알 수 없었다**
+      (사용자 보고 2026-08-04, 실사용 화면). → 겹치는 낱말은 계열에서 빼내
+      **낱말 카드 한 장으로 한 번만** 묻는다. 결정은 한 곳, 결과는 확정.
+    """
+    live = {}
+    for f in families:
+        if f.get("status") == "rejected":
+            continue            # 통일하지 않기로 한 계열은 아무 표기도 요구하지 않는다
+        for m in f["members"]:
+            live.setdefault(m["base"], {}).setdefault(f["choice"], []).append(f)
+
+    out = []
+    for b, dirs in sorted(live.items()):
+        if len(dirs) < 2:
+            continue
+        m = next(m for f in families for m in f["members"] if m["base"] == b)
+        out.append({"base": b, "spaced": m["spaced"], "joined": m["joined"],
+                    "n_joined": m["n_joined"], "n_spaced": m["n_spaced"],
+                    "member": m, "by": dirs})
+    return out
+
+
+def plan(families: list, all_families: list = None, word_choices: dict = None,
          allow_break: bool = False) -> dict:
     """수락된 계열들의 결정을 **낱말 단위로 합쳐** 실행 계획을 만든다.
 
-    반환 `{"want": {base: direction}, "owner": {base: family},
-           "locked": {base: (owner, [뒤로 밀린 계열, …])},
-           "blocked": {base: family}, "jobs": [action_for 결과, …]}`
+    반환 `{"want": {base: direction}, "contested": {base: {dir: [family,…]}},
+           "undecided": [base, …], "blocked": {base: family},
+           "breaks": {base: family}, "jobs": [action_for 결과, …]}`
 
     두 축이 생기면서 **한 낱말이 두 계열에 속하게** 됐고, 그래서 계열마다 따로 실행하면
     안 되는 이유가 둘이다:
 
-    ① **반대 요구**(`locked`) — 꼬리 계열은 붙임, 머리 계열은 띄어쓰기를 요구한다. 어느
-       쪽이 옳은지 앱은 알 수 없다(알면 애초에 자동 통일이 된다). → **사용자가 먼저
-       결정한 계열이 그 낱말을 가져가고**(`f["seq"]` 오름차순. `overrides`가 있으면 그게
-       우선), 나머지 계열의 카드에는 '잠김'으로 **보이게** 한다. 눌러서 되돌릴 수 있다.
-       ⚠ 앱이 몰래 한쪽을 고르는 것과는 다르다 — 순서는 사용자가 만든 것이고, 화면에
-         누가 가져갔는지 나오고, 되돌릴 수 있다. **이 세 가지가 빠지면 조용한 오통일이다.**
-       (2026-08-04 이전 구현은 양쪽 다 손대지 않고 로그로만 알렸다 — 사용자 결정으로
-        '두 단계 검토'가 들어오면서, 1단계에서 최대한 정리하는 이 규칙으로 바뀌었다.)
+    ① **반대 요구**(`contested`) — 꼬리 계열은 붙임, 머리 계열은 띄어쓰기를 요구한다.
+       → `word_choices[base]`(낱말 카드에서 사용자가 고른 표기)가 있으면 그대로 쓰고,
+       없으면 **손대지 않고** `undecided`로 돌려준다(호출부가 '결정 필요'로 센다).
+       ⚠ 앱이 임의로 한쪽을 택하지 않는다. 순서(먼저 수락한 계열)로 정하는 방식은
+         2026-08-04 폐기 — `contested_words()` 헤더 참조.
 
     ② ★**멀쩡한 계열 깨뜨리기**(`blocked`) — 이건 실측으로 발견했다(사용자 지적 파일):
        두 축을 그냥 나란히 놓고 기본 제안대로 전부 통일하면, 한 축의 통일이 **다른 축에서
@@ -389,20 +422,19 @@ def plan(families: list, all_families: list = None, overrides: dict = None,
         for m in f["members"]:
             members.setdefault(m["base"], m)
 
-    # ① 낱말마다 **주인 계열**을 정한다 — override > 사용자가 먼저 수락한 순서(seq) >
-    #    계열 키(seq가 없을 때의 결정성 보장).
-    ovr = overrides or {}
-    owner, locked = {}, {}
+    # ① 낱말마다 갈 방향을 정한다. 두 계열이 다르게 요구하면(contested) 앱은 못 정한다 —
+    #    낱말 카드에서 받은 `word_choices`가 있을 때만 움직이고, 없으면 손대지 않는다.
+    wc = word_choices or {}
+    contested, want, undecided = {}, {}, []
     for b, dirs in demands(families).items():
-        claims = [f for fs in dirs.values() for f in fs]
-        pick = next((f for f in claims if f.get("key") == ovr.get(b)), None)
-        if pick is None:
-            pick = min(claims, key=lambda f: (f.get("seq", 1 << 30), str(f.get("key"))))
-        owner[b] = pick
-        others = [f for f in claims if f is not pick and f["choice"] != pick["choice"]]
-        if others:
-            locked[b] = (pick, others)
-    want = {b: f["choice"] for b, f in owner.items()}
+        if len(dirs) == 1:
+            want[b] = next(iter(dirs))
+            continue
+        contested[b] = dirs
+        if wc.get(b) in ("joined", "spaced"):
+            want[b] = wc[b]
+        else:
+            undecided.append(b)
     intact = [(f, next(iter(_dirs_of(f["members"]))))
               for f in fams_all if not f["split"]]
 
@@ -447,14 +479,14 @@ def plan(families: list, all_families: list = None, overrides: dict = None,
         act = action_for(members[b], want[b])
         if act:
             jobs.append(act)
-    return {"want": want, "owner": owner, "locked": locked,
+    return {"want": want, "contested": contested, "undecided": sorted(undecided),
             "blocked": blocked, "breaks": _breaks(blocked), "jobs": jobs}
 
 
-def resolve_jobs(families: list, all_families: list = None, overrides: dict = None,
+def resolve_jobs(families: list, all_families: list = None, word_choices: dict = None,
                  allow_break: bool = False):
     """`plan()`의 얇은 래퍼 — `(jobs, 계열 보호로 손대지 않은 낱말)`."""
-    p = plan(families, all_families, overrides, allow_break)
+    p = plan(families, all_families, word_choices, allow_break)
     return p["jobs"], sorted(p["blocked"])
 
 
