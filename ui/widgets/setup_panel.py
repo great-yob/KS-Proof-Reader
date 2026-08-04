@@ -21,6 +21,29 @@ from ui.widgets._toggle import ToggleSwitch
 from ui.styles.theme import restyle
 
 
+# ══════════════════════════════════════════════════════════════
+# 기능 잠금 플래그 — 되살릴 땐 **여기 한 곳만** True로 바꾼다.
+# ══════════════════════════════════════════════════════════════
+# ⚠ 전자동(자동 일괄 적용) 잠금 — 사용자 결정 2026-08-04.
+#   현재 아키텍처에선 위험이 너무 크다는 판단. 근거(2026-08-04 실측):
+#   전자동의 유일한 안전망은 `confidence=="low" 자동 거절` 하나뿐인데, AI가 오탈자를
+#   고치면서 문장을 손대는 교정 중 일부가 **high로 통과한다**. 확인된 부류:
+#     · '부고 있다.'→'두고 있다.' — 한 글자 치환이라 모양이 정상 오탈자 교정과 구별되지
+#       않는데 낱말 뜻이 달라진다(기대는 '보고'). 구조 가드로는 원리적으로 못 가른다.
+#   ㉘(문장 경계 변경) 가드로 '두었으다.'→'두었으나,' 부류는 막았고, '과정 등이'
+#   부류는 원래 ㉕가 잡고 있었다. 그럼에도 위 잔여 부류가 남아 있어, 사람이 볼 기회가
+#   0이 되는 전자동은 아직 이르다는 결론.
+#   → 되살리는 조건: 실단어 오류 판별([[realword-error-detection]]의 kiwi LM 경로)이
+#     생성 결과에도 적용돼 위 부류가 high로 새지 않게 된 뒤.
+AUTO_APPLY_ENABLED = False
+
+# ⚠ 윤문(polish) 잠금 — 사용자 결정 2026-08-04.
+#   오탈자·띄어쓰기조차 완전히 커버되지 않은 상태라 윤문은 테스트 자체가 불가능하다는
+#   판단. 기능이 없어서가 아니라 **검증 순서** 때문에 잠근 것 — scope_polish 경로
+#   (prompts.build_polish_prompt / AI_CHUNK_POLISH 등)는 그대로 살려 둔다.
+POLISH_ENABLED = False
+
+
 class FilePanel(QFrame):
     file_selected = Signal(str)
 
@@ -210,22 +233,31 @@ class SetupPanel(QWidget):
             "list-checks", "항목별 검토", "권장",
             "교정 제안을 하나씩 확인하고\n사용자가 직접 수락-거절을 선택합니다.", True)
         self._card_auto = self._make_choice_card(
-            "zap", "자동 일괄 적용", "빠름",
-            "모든 교정 제안을 사용자의 검토 없이\n즉시 원본 파일에 적용합니다.", False)
+            "zap", "자동 일괄 적용",
+            "빠름" if AUTO_APPLY_ENABLED else "추후 예정",
+            "모든 교정 제안을 사용자의 검토 없이\n즉시 원본 파일에 적용합니다."
+            if AUTO_APPLY_ENABLED else
+            "교정 품질이 검토 없이 적용해도 될 수준에 이르면 오픈할 예정입니다",
+            False, locked=not AUTO_APPLY_ENABLED)
 
         self._card_review.mousePressEvent = lambda _e: self._select_apply_mode(False)
-        self._card_auto.mousePressEvent   = lambda _e: self._select_apply_mode(True)
+        if AUTO_APPLY_ENABLED:
+            self._card_auto.mousePressEvent = lambda _e: self._select_apply_mode(True)
 
         row.addWidget(self._card_review, 1)
         row.addWidget(self._card_auto, 1)
         lay.addLayout(row, 1)
         return lay
 
-    def _make_choice_card(self, icon, title, badge_text, desc, selected) -> QFrame:
+    def _make_choice_card(self, icon, title, badge_text, desc, selected,
+                          locked: bool = False) -> QFrame:
         card = QFrame()
         card.setProperty("role", "choice")
         card.setProperty("selected", "true" if selected else "false")
-        card.setCursor(Qt.PointingHandCursor)
+        # locked=선택 불가(추후 예정). QSS가 점선 테두리·흐린 글자로 그리고,
+        #   손 모양 커서를 주지 않아 '누를 수 있는 것'으로 보이지 않게 한다.
+        card.setProperty("locked", "true" if locked else "false")
+        card.setCursor(Qt.ArrowCursor if locked else Qt.PointingHandCursor)
 
         cl = QVBoxLayout(card)
         cl.setContentsMargins(22, 16, 22, 16)
@@ -234,7 +266,7 @@ class SetupPanel(QWidget):
         # 아이콘 + 제목 + 배지를 한 줄에(세로 높이 축소), 선택 체크는 같은 줄 오른쪽 끝.
         trow = QHBoxLayout()
         trow.setSpacing(8)
-        trow.addWidget(IconLabel(icon, role="accent", size=20))
+        trow.addWidget(IconLabel(icon, role="text_muted" if locked else "accent", size=20))
         trow.addWidget(label(title, role="h2"))
         tone = "primary" if badge_text == "권장" else ""
         trow.addWidget(badge(badge_text, tone=tone))
@@ -254,6 +286,11 @@ class SetupPanel(QWidget):
         return card
 
     def _select_apply_mode(self, auto: bool):
+        # ⚠ 잠금 시 전자동으로 갈 수 있는 경로를 여기서 끊는다 — 카드 클릭을 연결하지
+        #   않는 것만으로는 부족하고(다른 호출처가 생길 수 있다), 상태 변경 지점이
+        #   하나뿐이라 여기가 유일한 관문이다.
+        if auto and not AUTO_APPLY_ENABLED:
+            return
         if self._auto_apply == auto:
             return
         self._auto_apply = auto
@@ -302,8 +339,10 @@ class SetupPanel(QWidget):
             lambda v: self._set_scope("_scope_basic", v))
         self._tog_polish = self._add_toggle_row(
             lay, False, "윤문",
-            "문장 흐름 · 어미 · 중복 표현 개선",
-            lambda v: self._set_scope("_scope_polish", v))
+            "문장 흐름 · 어미 · 중복 표현 개선" if POLISH_ENABLED else
+            "오탈자·띄어쓰기 교정이 안정화된 후 오픈할 예정입니다",
+            lambda v: self._set_scope("_scope_polish", v),
+            locked=not POLISH_ENABLED, badge_text=None if POLISH_ENABLED else "추후 예정")
         return lay
 
     def _set_scope(self, attr: str, v: bool):
@@ -333,21 +372,34 @@ class SetupPanel(QWidget):
             lambda v: self._set_scope("_no_ai", v))
         return lay
 
-    def _add_toggle_row(self, lay, on, title, desc, on_change) -> ToggleSwitch:
+    def _add_toggle_row(self, lay, on, title, desc, on_change,
+                        locked: bool = False, badge_text: str = None) -> ToggleSwitch:
         row = QFrame()
         row.setProperty("role", "toggleRow")
+        row.setProperty("locked", "true" if locked else "false")
         rl = QHBoxLayout(row)
         rl.setContentsMargins(22, 14, 22, 14)
         rl.setSpacing(10)
         rl.setAlignment(Qt.AlignVCenter)
 
-        toggle = ToggleSwitch(on=on)
+        toggle = ToggleSwitch(on=False if locked else on)
         toggle.toggled.connect(on_change)
+        # ⚠ setEnabled(False)면 ToggleSwitch가 클릭을 무시하고(mousePressEvent의
+        #   isEnabled 검사) 트랙도 흐린 색으로 그린다 — 별도 잠금 처리 불필요.
+        if locked:
+            toggle.setEnabled(False)
+            toggle.setCursor(Qt.ArrowCursor)
         rl.addWidget(toggle)
 
         col = QVBoxLayout()
         col.setSpacing(2)
-        col.addWidget(label(title, role="title"))
+        trow = QHBoxLayout()
+        trow.setSpacing(8)
+        trow.addWidget(label(title, role="title"))
+        if badge_text:
+            trow.addWidget(badge(badge_text))
+        trow.addStretch()
+        col.addLayout(trow)
         col.addWidget(sub_label(desc, wrap=True))
         rl.addLayout(col, 1)
 
@@ -360,14 +412,19 @@ class SetupPanel(QWidget):
     # (파일 선택/드래그앤드롭은 FilePanel로 이관 완료 — 이곳의 잔재 핸들러들은
     #  존재하지 않는 self._dropzone 등을 참조하는 죽은 코드였으므로 삭제됨.)
 
+    def _polish_on(self) -> bool:
+        """윤문의 **유효** 상태 — 잠금이면 내부 필드와 무관하게 꺼진 것으로 본다.
+        get_options와 같은 기준을 쓰지 않으면 '시작은 되는데 아무것도 안 하는' 조합이 생긴다."""
+        return self._scope_polish and POLISH_ENABLED
+
     def scopes_selected(self) -> bool:
-        return any([self._scope_basic, self._scope_polish])
+        return any([self._scope_basic, self._polish_on()])
 
     def summary_text(self) -> str:
         scopes = []
         if self._scope_basic:  scopes.append("오탈자 · 띄어쓰기")
-        if self._scope_polish: scopes.append("윤문")
-        mode_text = "자동 일괄 적용" if self._auto_apply else "항목별 검토"
+        if self._polish_on():  scopes.append("윤문")
+        mode_text = "자동 일괄 적용" if (self._auto_apply and AUTO_APPLY_ENABLED) else "항목별 검토"
         no_ai = " / AI 제외" if self._no_ai else ""
         return f"{' / '.join(scopes)} / {mode_text}{no_ai}"
 
@@ -379,10 +436,12 @@ class SetupPanel(QWidget):
             # 오탈자·띄어쓰기는 단일 범위로 통합 — 두 플래그를 함께 전달한다.
             "scope_typo":     self._scope_basic,
             "scope_spacing":  self._scope_basic,
-            "scope_polish":   self._scope_polish,
+            # ⚠ 잠금 플래그를 여기서 한 번 더 곱한다(이중 안전장치). UI 상태가 어떤 경로로
+            #   틀어져도 워커·적용 단계로 True가 새어 나가지 않게 하는 마지막 관문이다.
+            "scope_polish":   self._scope_polish and POLISH_ENABLED,
             "gen_errata":     self._gen_errata,
             "deep_screening": True,   # 사전 원문 스크리닝은 항상 수행됨
-            "auto_apply":     self._auto_apply,
+            "auto_apply":     self._auto_apply and AUTO_APPLY_ENABLED,
         }
 
     def refresh_theme(self):

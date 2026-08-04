@@ -11,7 +11,9 @@ Gemini 3.1 Flash Lite 대상.
   5. JSON 출력(response_mime_type) + 파싱 salvage 백스톱 — 파싱 안정성
   6. 보수적 교정 — 과교정 방지
 
-⚠ 결정론(재현성)이 최우선 — temperature=0·seed로 같은 원고 → 같은 교정을 보장한다.
+⚠ 결정론(재현성)이 최우선 — **seed**로 같은 원고 → 같은 교정을 보장한다. temperature/
+   top_p/top_k는 Gemini 3.5 Flash-Lite 이후 지원 중단(제공 시 HTTP 400 예고)이라
+   2026-08-04 제거했고, 재현성은 seed 단독으로 유지됨을 실측했다(gemini_checker 주석 참조).
    response_schema(구조화 출력)는 재현성을 깨서 쓰지 않는다(gemini_checker 주석 참조).
 ⚠ 프롬프트 '내용'(무엇을 교정할지) 변경은 과교정 회귀를 일으킬 수 있어 골드셋
    정량 검증(precision/F0.5) 선결. KAGEC(규범 컨텍스트 주입) 제거 교훈 참고.

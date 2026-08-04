@@ -402,6 +402,12 @@ class ProofreadingWorker(QThread):
             #   exists_fn: ㉕와 공용인 철자 수정 carve-out(is_spelling_repair)에 쓰인다.
             ai_list = ai_guards.demote_word_deletion(
                 ai_list, lambda w: lookup_word(w)["exists"], logger=log)
+            # ㉘ 문장 경계 변경 강등 — 오탈자를 고치면서 문장이 끝나는 자리까지 옮기는 교정
+            #   ('초점을 두었으다.'→'초점을 두었으나,' — 종결어미+마침표가 연결어미+쉼표로).
+            #   ⚠ ㉕·㉖ **뒤**에 둘 것: 이 가드는 둘과 달리 is_spelling_repair 면제를 받지
+            #   않으므로, 앞에 두면 ㉕·㉖이 볼 카드를 먼저 강등해 그쪽 로그가 비어 원인
+            #   추적이 어려워진다(강등은 멱등이라 결과는 같다).
+            ai_list = ai_guards.demote_sentence_boundary_change(ai_list, logger=log)
         elif not opts.get("use_ai", True):
             log("  [AI] AI 분석 제외 모드 — Gemini 호출 없이 사전·규칙 검사만 수행합니다.")
         self.progress.emit(70, "AI 분석 완료" if opts.get("use_ai", True)

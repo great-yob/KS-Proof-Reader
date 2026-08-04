@@ -405,11 +405,22 @@ QFrame[role="choice"]:hover { border-color: $accent; }
 QFrame[role="choice"][selected="true"] {
     background: $accent_soft; border: 2px solid $accent;
 }
+/* 잠금(추후 예정) — 선택 불가 옵션. 점선 테두리 + 흐린 글자로 '지금은 못 고름'을 알린다.
+   ⚠ hover 강조를 반드시 되돌릴 것(위 :hover 규칙이 그대로 살아 있으면 눌릴 것처럼 보인다). */
+QFrame[role="choice"][locked="true"] {
+    background: $surface_alt; border: 1px dashed $border;
+}
+QFrame[role="choice"][locked="true"]:hover { border-color: $border; }
+QFrame[role="choice"][locked="true"] QLabel { color: $text_muted; }
 
 /* ── 토글 행 ────────────────────────────────── */
 QFrame[role="toggleRow"] {
     background: $surface_alt; border: 1px solid $border_light; border-radius: 10px;
 }
+QFrame[role="toggleRow"][locked="true"] {
+    border: 1px dashed $border;
+}
+QFrame[role="toggleRow"][locked="true"] QLabel { color: $text_muted; }
 
 /* ── 스텝퍼 레일 아이템 ─────────────────────── */
 QFrame[role="railItem"] { background: transparent; border: 1px solid $border; border-radius: 12px; }

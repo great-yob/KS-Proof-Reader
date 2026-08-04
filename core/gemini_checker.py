@@ -31,19 +31,26 @@ from .prompts import (
 )
 
 
-# S7: 모델 ID 우선순위 — 첫 번째가 실패(deprecated/unavailable)하면 다음으로 폴백
+# S7: 모델 ID 우선순위 — 첫 번째가 실패(deprecated/unavailable/일시 오류)하면 다음으로 폴백
 # 모델 후보 체인 — 앞에서부터 시도한다. 순서 기준은 **무료 티어 한도**(AI Studio 콘솔 실측,
 #   2026-07-22)다. 교정은 문서 한 건에 청크 수십 개를 던지므로 RPD(일일 요청)가 병목이다.
 #     gemini-3.5-flash-lite : 15 RPM / 250K TPM / 500 RPD  ← 기본
 #     gemini-3.1-flash-lite : 15 RPM / 250K TPM / 500 RPD  ← 백업(한도 소진 시)
-#     gemini-2.5-flash-lite : 10 RPM / 250K TPM /  20 RPD  ← 비상용(RPD가 작아 곧 소진)
-#     gemini-3.5-flash      :  5 RPM / 250K TPM /  20 RPD  ← 최후
+#     gemini-3.5-flash      :  5 RPM / 250K TPM /  20 RPD  ← 최후(전멸 방지용)
 #   ⚠ AI_CALL_DELAY(4.1s)는 15 RPM 기준이다. 앞 두 모델이 15 RPM이라 그대로 유효하다.
 #   ⚠ gemini-2.0-flash는 콘솔에서 0/0(할당 없음)으로 확인돼 체인에서 제외했다.
+#   ⚠ gemini-2.5-flash-lite는 2026-08-04 체인에서 제거했다. 무료 RPD가 20이라 청크 수십 개를
+#     던지는 이 앱에선 폴백 구실을 못 한다(공식 지원종료일은 '미공개'이므로 종료 임박이 이유가
+#     아니다). 같은 20 RPD인 3.5-flash는 '전부 죽었을 때 0건보다 낫다'는 최후 보루로 남긴다.
+#
+# 지원종료일(공식 https://ai.google.dev/gemini-api/docs/deprecations, 2026-08-04 확인):
+#     gemini-3.5-flash-lite : 미공개 (GA 2026-07-21)
+#     gemini-3.1-flash-lite : **2027-05-07** ← 체인에서 유일하게 공지된 종료일. 대체는 3.5-lite
+#     gemini-3.5-flash      : 미공개 (GA 2026-05-19)
+#   표에 적힌 날짜는 '가장 이른 가능일'이라 앞당겨질 수 있다. 2027-05 전에 재점검할 것.
 _MODEL_CANDIDATES = (
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
-    "gemini-2.5-flash-lite",
     "gemini-3.5-flash",
 )
 
@@ -513,10 +520,16 @@ class GeminiChecker:
             # JSON 형식은 mime_type + _parse_json_response의 salvage 백스톱으로 보장.
             #   ⚠ response_schema(구조화 출력)는 재현성을 깨서 쓰지 않는다(상단 주석 참조).
             response_mime_type = "application/json",
-            # 결정론적 출력 — 같은 원고 → 같은 교정
-            temperature        = 0.0,
-            top_p              = 1.0,
-            top_k              = 1,
+            # 결정론적 출력 — 같은 원고 → 같은 교정.
+            #   ⚠ 담당자는 **seed 하나뿐**이다(2026-08-04 실측). temperature/top_p/top_k는
+            #     Gemini 3.5 Flash-Lite·3.6 Flash **및 이후 전 모델**에서 지원 중단이며
+            #     "제공하면 HTTP 400"이 예고돼 제거했다. 제거해도 재현성은 그대로다:
+            #       seed=42만        → 4회 호출 결과 해시 1종 (결정론 유지)
+            #       seed까지 제거    → 4회 호출 결과 해시 4종 (붕괴)
+            #     따라서 seed는 **절대 빼지 말 것**. 반대로 temperature 등을 되살리면
+            #     신규 모델에서 400으로 전멸한다(재도입 금지).
+            #   ⚠ 이 제거는 무해한 정리가 아니라 **출력이 바뀌는 변경**이다(구 모델에선 아직
+            #     세 파라미터가 실제로 반영됐다). 골드셋 before/after로 검증했다.
             seed               = 42,
             # 청크 호출 타임아웃 — API가 멈춰도 워커가 영원히 블록(앱 프리즈)되지 않게.
             http_options       = genai_types.HttpOptions(timeout=AI_REQUEST_TIMEOUT),
@@ -549,15 +562,16 @@ class GeminiChecker:
             avail = tuple(m for m in chain if m not in self._quota_blocked)
             if not avail:
                 avail = chain          # 전부 소진 → 원래 순서로(백오프 재시도가 처리)
-            # 모델 고정은 유지하되, 고정된 모델이 한도 소진이면 잠금을 무시하고 체인을 탄다.
-            models_to_try = (
-                (avail[0],) if (self._model_locked and avail[0] == self._model_id)
-                else avail
-            )
+            # ⚠ 고정 모델이라도 후보 목록을 **자르지 않는다**(2026-08-04). chain이 이미
+            #   self._model_id를 맨 앞에 두므로 정상 경로에선 첫 후보에서 곧바로 return되어
+            #   비용이 0이고, 잘라내기가 실제로 작동하는 건 '고정 모델이 실패한 경우'뿐이다.
+            #   그때야말로 나머지 후보를 타야 하는데 과거엔 여기서 체인이 끊겼다.
+            models_to_try = avail
 
             transient = False
             forced_fallback = False
-            for model_id in models_to_try:
+            last_idx = len(models_to_try) - 1
+            for idx, model_id in enumerate(models_to_try):
                 try:
                     response = self.client.models.generate_content(
                         model    = model_id,
@@ -611,8 +625,24 @@ class GeminiChecker:
                             continue
                         if logger:
                             logger("  [AI] 모든 후보 모델의 한도가 소진됨 — 백오프 후 재시도")
-                    # 일시 오류(429/5xx/타임아웃/네트워크)는 재시도 대상
+                        transient = True
+                        break
+                    # 일시 오류(5xx/타임아웃/네트워크)는 재시도 대상
                     transient = _is_transient_error(msg)
+                    # ★ 일시 오류라도 **백오프보다 다음 모델이 먼저**다(2026-08-04).
+                    #   503("This model is currently experiencing high demand")은 모델 **단위**
+                    #   과부하라 5·15초 백오프로는 안 풀린다. 과거엔 여기서 곧장 break해
+                    #   1순위가 죽으면 멀쩡한 나머지 후보를 한 번도 안 써보고 청크를 통째로
+                    #   버렸다(실측 2026-08-04: 3.5-flash-lite만 503 6/6, 나머지 3종 정상).
+                    #   한도 소진(_quota_blocked)과 달리 **영구 차단하지 않는다** — 일시적이라
+                    #   다음 청크에서 1순위가 회복돼 있을 수 있다.
+                    if transient and idx < last_idx:
+                        self._model_locked = False   # 잠금 해제 → 성공한 모델로 재고정
+                        if logger:
+                            logger(f"  [AI] '{model_id}' 일시 오류"
+                                   f"({type(exc).__name__}) — "
+                                   f"다음 모델 '{models_to_try[idx + 1]}'로 전환")
+                        continue
                     break
 
             if forced_fallback and attempt < max_tries - 1:

@@ -2035,6 +2035,83 @@ def _is_undecidable_word_deletion(original: str, corrected: str,
     return False                       # 전부 인접 완전중복 → 명백한 중복 오타
 
 
+# ── ㉘ 문장 경계 변경(종결 ↔ 비종결) → 오탈자 교정에 편승한 문장 재구성(강등) ──────
+#
+# 배경(2026-08-04 실측). AI가 오탈자를 고치면서 **문장이 끝나는 자리를 옮기는** 교정을 낸다:
+#     '초점을 두었으다.' → '초점을 두었으나,'
+# 원문은 `다/EF + ./SF`(문장 종결)인데 교정문은 `으나/EC + ,/SP`(연결)다. 뒤 문장이
+# '그리고'로 시작하므로 이 교정이 적용되면 두 문장이 어색하게 이어붙는다. 기대되는 교정은
+# '두었다'(오탈자 '으' 제거)이며, 어미를 바꿀 이유가 없다.
+#
+# ★ 왜 기존 가드가 못 잡나 — **`is_spelling_repair`가 True라서**다. ㉕(문법 재구성)·㉖(낱말
+#   삭제)는 오탈자 교정을 역발동시키지 않으려고 이 carve-out을 공유하는데, 이 교정은 모양이
+#   딱 철자 수정('으다'→'으나')이라 그 면제를 그대로 받아 high로 통과한다.
+#   ⇒ **이 가드는 의도적으로 `is_spelling_repair`를 면제 사유로 쓰지 않는다.** 철자 수정이든
+#     아니든 '문장이 끝나는 자리'를 바꾸면 그건 오탈자 교정의 범위 밖이기 때문이다.
+#     (㉕·㉖의 carve-out은 유지 — 그쪽은 구조 비교라 오탈자에 역발동하지만, 여기는 문장
+#      경계라는 단일 관측량만 보므로 오탈자가 개입해도 판정이 뒤집히지 않는다.)
+#
+# 판정은 **모양 두 가지**만 본다(사유 문구·의미 해석 없음):
+#   ① 종결부호 ↔ 비종결부호  ('…다.' → '…나,')
+#   ② 종결어미(EF) ↔ 연결어미(EC)
+# 둘 중 하나라도 뒤집히면 강등. 둘 다 그대로면(예 '부고 있다.'→'두고 있다.' — 양쪽 EF+SF)
+# 건드리지 않는다. 그 부류(낱말은 바뀌었으나 문장 구조는 동일)는 **의미 판단이 필요해 구조
+# 가드로는 원리적으로 못 가른다** — [[realword-error-detection]]의 kiwi LM 경로 소관이다.
+#
+# ⚠ 드롭이 아니라 **강등**이다. 문장부호·어미 선택은 저자 권한이며 AI가 맞을 때도 있다
+#   (문서엔 실제로 종결부호가 빠진 문장이 있다). 앱은 이미 결정론 문장부호 규칙군을 전부
+#   저신뢰로 다루므로([[bracket-and-dependent-noun-spacing]]), 같은 잣대를 AI 교정에도 적용하는 셈.
+_TERMINAL_PUNCT = ".!?。！？…"
+_FINAL_ENDING_TAGS = ("EF", "EC")
+
+
+def _final_ending_tag(s: str):
+    """마지막 **어말어미**의 태그(EF=종결/EC=연결). 어미가 없거나 분석 불가면 None."""
+    tokens = _tokens(s)
+    if not tokens:
+        return None
+    for t in reversed(tokens):
+        if t.tag in _FINAL_ENDING_TAGS:
+            return t.tag
+    return None
+
+
+def _ends_terminal_punct(s: str) -> bool:
+    s = (s or "").rstrip()
+    return bool(s) and s[-1] in _TERMINAL_PUNCT
+
+
+def _is_sentence_boundary_change(original: str, corrected: str) -> bool:
+    o, c = (original or "").strip(), (corrected or "").strip()
+    if not o or not c or o == c:
+        return False
+    if o.replace(" ", "") == c.replace(" ", ""):
+        return False                      # 띄어쓰기만 바뀜 — 경계와 무관
+    # ① 종결부호 유무가 뒤집혔는가
+    if _ends_terminal_punct(o) != _ends_terminal_punct(c):
+        return True
+    # ② 어말어미 종류가 뒤집혔는가 (양쪽 다 판정돼야 함 — 하나라도 None이면 보류)
+    eo, ec = _final_ending_tag(o), _final_ending_tag(c)
+    return eo is not None and ec is not None and eo != ec
+
+
+def demote_sentence_boundary_change(corrections: list, logger=None) -> list:
+    """㉘ 문장이 끝나는 자리를 바꾸는 AI 교정을 low로 강등한다(제자리 수정 후 반환)."""
+    demoted = 0
+    for c in corrections:
+        if (c.source in ("ai_typo", "ai_polish") and c.confidence != "low"
+                and _is_sentence_boundary_change(c.original, c.corrected)):
+            c.confidence = "low"
+            if not (c.reason or "").startswith("[검수]"):
+                c.reason = ("[검수] " + (c.reason or "")
+                            + " (문장 종결 위치 변경 — 오탈자 교정 범위를 넘음, 검토 필요)")
+            demoted += 1
+    if logger and demoted:
+        logger(f"  → 문장 경계 변경 AI 교정 {demoted}건 검수 카드로 강등 "
+               "(종결↔연결 전환은 편집 판단 — 자동 적용 제외)")
+    return corrections
+
+
 def demote_word_deletion(corrections: list, exists_fn=None, logger=None) -> list:
     """㉖ 내용 낱말을 지우는 AI 교정을 low로 강등한다(제자리 수정 후 반환).
 
