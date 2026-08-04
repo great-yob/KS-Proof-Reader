@@ -19,6 +19,7 @@ class StatusFooter(QFrame):
     reset_clicked   = Signal()
     errata_clicked  = Signal()
     folder_clicked  = Signal()
+    recheck_clicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -67,6 +68,14 @@ class StatusFooter(QFrame):
                                       on_click=self.folder_clicked.emit)
         self._folder_btn.setVisible(False)
         lay.addWidget(self._folder_btn)
+
+        # 표기 일관성 2단계 — 1차 통일 뒤 **남은 갈림**을 다시 볼 때만 나온다.
+        #   1차 액션(교정 적용)을 가리면 안 되므로 ghost 보조 버튼이다.
+        self._recheck_btn = IconButton("rotate-ccw", text="일관성 선택 재검토", variant="ghost",
+                                       role="text_sub", size=14,
+                                       on_click=self.recheck_clicked.emit)
+        self._recheck_btn.setVisible(False)
+        lay.addWidget(self._recheck_btn)
 
         self._primary = IconButton("", text="", variant="primary",
                                    role="accent_fg", size=16,
@@ -123,8 +132,9 @@ class StatusFooter(QFrame):
         self._reset_btn.setVisible(False)
         self._errata_btn.setVisible(False)
         self._folder_btn.setVisible(False)
+        self._recheck_btn.setVisible(False)
         self._reset_cancel()
-        
+
         if hasattr(self, '_aurora_anim'):
             self._aurora_anim.stop()
         self._primary.setStyleSheet("")
@@ -135,6 +145,7 @@ class StatusFooter(QFrame):
         self._reset_btn.setVisible(False)
         self._errata_btn.setVisible(False)
         self._folder_btn.setVisible(False)
+        self._recheck_btn.setVisible(False)
         self._reset_cancel()
         
         self._busy_text = primary_text
@@ -159,6 +170,12 @@ class StatusFooter(QFrame):
         self._primary.setEnabled(enabled)
         self._primary.setVisible(visible)
         self._reset_btn.setVisible(show_reset)
+
+    # ── 표기 일관성 재검토(검토 화면 전용 보조 액션) ──
+    def set_recheck(self, visible: bool, count: int = 0):
+        self._recheck_btn.setText(f"일관성 선택 재검토 ({count}건)" if count
+                                  else "일관성 선택 재검토")
+        self._recheck_btn.setVisible(visible)
 
     # ── 결과 화면 전용 액션(정오표/폴더 열기) ─────────
     def set_result_actions(self, visible: bool, has_errata: bool = False):

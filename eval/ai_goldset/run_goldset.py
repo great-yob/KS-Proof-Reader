@@ -1535,6 +1535,133 @@ def phase_d_rules():
                 if u.replace(" ", "") != m["joined"]:
                     fails += 1
                     print(f"  ✗ FAIL [D-7 글자 불변] {m['base']!r} → {u!r}")
+
+        # ⓓ **머리 축**(`xx…` — 첫 성분이 같은 계열) 산출. 2026-08-03 사용자 지적:
+        #   꼬리 축만 보고 있었다. 실측(사용자 지적 파일 26.8만 자) 머리 축 충돌 26계열·
+        #   낱말 120 중 **81개가 머리 축에서만** 갈렸다(꼬리 축과 겹치는 건 39뿐).
+        #   ⚠ 기존 꼬리 축 케이스(ⓑ)의 기대값이 그대로여야 한다 — 축 추가가 기존 산출을
+        #     늘리거나 줄이면 안 된다(그건 회귀다).
+        for label, cards, expect in (
+            ("머리 축 방향 갈림 → 충돌",
+             [_fam_card("기술개발", "기술 개발"), _fam_card("기술 격차", "기술격차")],
+             [("lead", "기술")]),
+            ("머리 축 방향 같음 → 충돌 아님",
+             [_fam_card("기술개발", "기술 개발"), _fam_card("기술격차", "기술 격차")], []),
+            ("머리 낱말 다름 → 무관",
+             [_fam_card("기술개발", "기술 개발"), _fam_card("사업 격차", "사업격차")], []),
+            ("두 축 동시 산출(꼬리 먼저)",
+             [_fam_card("지원 정책", "지원정책"), _fam_card("보상정책", "보상 정책"),
+              _fam_card("지원사업", "지원 사업")],
+             [("tail", "정책"), ("lead", "지원")]),
+        ):
+            n_fam += 1
+            got = [(f["axis"], f["head"]) for f in _cfam.find_conflicts(cards)]
+            if got != expect:
+                fails += 1
+                print(f"  ✗ FAIL [D-7 머리 축] {label}: 기대={expect} 실제={got}")
+
+        # ⓔ **두 축이 같은 낱말을 반대로 요구**할 때(=한 낱말이 두 계열에 속함).
+        #   ⚠ 계약(2026-08-04 사용자 결정 '두 단계 검토'): **사용자가 먼저 수락한 계열이
+        #     가져간다**(seq). 앱이 몰래 고르는 게 아니라 ① 순서는 사용자가 만들고
+        #     ② 잠김으로 화면에 보이고 ③ override로 되돌릴 수 있어야 성립한다. 셋 중 하나라도
+        #     빠지면 조용한 오통일이므로, 이 세 케이스를 지우지 말 것.
+        _x_cards = [_fam_card("지원 정책", "지원정책"), _fam_card("보상정책", "보상 정책"),
+                    _fam_card("지원사업", "지원 사업")]
+        _x_fams = _cfam.find_conflicts(_x_cards)
+        _tail_f = next(f for f in _x_fams if f["axis"] == "tail")
+        _lead_f = next(f for f in _x_fams if f["axis"] == "lead")
+
+        n_fam += 1
+        _tail_f.update(status="accepted", choice="joined", seq=1)   # 먼저: …정책 → 붙임
+        _lead_f.update(status="accepted", choice="spaced", seq=2)   # 나중: 지원… → 띄어쓰기
+        _p = _cfam.plan(_x_fams, _x_fams)
+        _own = _p["locked"].get("지원정책", (None, None))[0]
+        if _own is not _tail_f or _p["want"].get("지원정책") != "joined":
+            fails += 1
+            print(f"  ✗ FAIL [D-7 잠김] 먼저 수락한 계열이 낱말을 가져가야 한다 — "
+                  f"주인={_own and _own['key']} want={_p['want'].get('지원정책')}")
+
+        n_fam += 1
+        _p = _cfam.plan(_x_fams, _x_fams, {"지원정책": _lead_f["key"]})
+        if _p["want"].get("지원정책") != "spaced" or \
+                _p["locked"].get("지원정책", (None,))[0] is not _lead_f:
+            fails += 1
+            print(f"  ✗ FAIL [D-7 잠김 되돌리기] override가 주인을 바꿔야 한다 — "
+                  f"실제 want={_p['want'].get('지원정책')}")
+
+        n_fam += 1
+        _tail_f["choice"] = _lead_f["choice"] = "spaced"       # 두 계열이 **같은** 방향
+        _jobs, _bl = _cfam.resolve_jobs(_x_fams, _x_fams)
+        _n_hit = sum(1 for _a, _ci, o, _r in _jobs if o == "지원 정책")
+        if _bl or _n_hit != 1:
+            fails += 1
+            print(f"  ✗ FAIL [D-7 같은 방향 중복] 같은 낱말을 두 번 뒤집으면 원위치가 된다 "
+                  f"— 동작 {_n_hit}회·blocked={_bl}")
+
+        # ⓖ **두 축 공동 기본 제안**(align_proposals) — 이웃 계열과 부딪히는 기본값을 미리
+        #   맞춘다. ⚠ 근거가 뚜렷한 계열(strong)은 절대 안 뒤집는다. 전부 한 방향으로 모는
+        #   '강제 통일'이 되면 '산학 협력'·'개인 정보'가 나온다(실측으로 닫힌 금지 사항).
+        n_fam += 1
+        _a_cards = [_fam_card("지원 정책", "지원정책"), _fam_card("보상정책", "보상 정책"),
+                    _fam_card("지원사업", "지원 사업")]
+        _a_fams = _cfam.find_conflicts(_a_cards)
+        _before = {f["key"]: f["proposal"] for f in _a_fams}
+        _cfam.align_proposals(_a_fams)
+        _after = {f["key"]: f["proposal"] for f in _a_fams}
+        _moved_strong = [f["key"] for f in _a_fams
+                         if f["strong"] and _before[f["key"]] != _after[f["key"]]]
+        if _moved_strong:
+            fails += 1
+            print(f"  ✗ FAIL [D-7 공동 제안] 근거가 뚜렷한 계열을 뒤집었다 — {_moved_strong}")
+
+        n_fam += 1
+        for f in _a_fams:
+            f.update(status="accepted", choice=f["proposal"], seq=1)
+        if _cfam.plan(_a_fams, _a_fams)["locked"]:
+            fails += 1
+            print(f"  ✗ FAIL [D-7 공동 제안] 기본 제안대로 전부 수락했는데 낱말이 부딪힌다 "
+                  f"— 공동 풀이가 안 먹었다")
+
+        n_fam += 1
+        if (_cfam.family_label(_tail_f), _cfam.family_label(_lead_f)) != ("…정책", "지원…"):
+            fails += 1
+            print(f"  ✗ FAIL [D-7 계열 라벨] 축 없이 키만 쓰면 '…지원'과 '지원…'이 화면에서 "
+                  f"구분되지 않는다")
+
+        # ⓕ ★**멀쩡한 계열 깨뜨리기 금지**(불변식: 이 단계는 새 혼재를 만들지 않는다).
+        #   실측(사용자 지적 파일): 가드 없이 두 축을 통일하면 **새로 갈린 계열 16건**이
+        #   생겨 총 충돌이 28→30으로 늘었다 — 축 추가의 의미가 사라진다. 그 계열은 갈리지
+        #   않아 카드로도 안 나오니 사용자는 볼 기회조차 없다. 지우지 말 것.
+        #   구성: 머리 계열 '현장…'은 갈렸고(기반=띄어쓰기 / 실습=붙임),
+        #        꼬리 계열 '…기반'은 **맞아 있다**(현장 기반·공급 기반 둘 다 띄어쓰기).
+        _g_cards = [_fam_card("현장기반", "현장 기반"), _fam_card("공급기반", "공급 기반"),
+                    _fam_card("현장 실습", "현장실습")]
+        _g_all = _cfam.analyze(_g_cards)
+        _g_intact = [f for f in _g_all if not f["split"]]
+        _g_lead = next(f for f in _g_all if f["axis"] == "lead" and f["head"] == "현장")
+        n_fam += 1
+        if not any(f["axis"] == "tail" and f["head"] == "기반" for f in _g_intact):
+            fails += 1
+            print(f"  ✗ FAIL [D-7 전체 계열] analyze()는 **갈리지 않은 계열도** 돌려줘야 "
+                  f"한다(가드가 그걸 검사한다) — 실제={[f['head'] for f in _g_intact]}")
+
+        n_fam += 1
+        _g_lead.update(status="accepted", choice="joined")     # 현장… → 붙임
+        _gp = _cfam.plan([_g_lead], _g_all)
+        if "현장기반" not in _gp["blocked"] or _gp["jobs"]:
+            fails += 1
+            print(f"  ✗ FAIL [D-7 계열 보호] '현장기반'을 붙이면 맞아 있던 '…기반' 계열이 "
+                  f"갈린다 → 손대지 않아야 한다 — blocked={list(_gp['blocked'])} "
+                  f"jobs={_gp['jobs']}")
+
+        n_fam += 1
+        _g_lead["choice"] = "spaced"                           # 반대 방향은 아무것도 안 깨뜨린다
+        _gp = _cfam.plan([_g_lead], _g_all)
+        if _gp["blocked"] or len(_gp["jobs"]) != 1:
+            fails += 1
+            print(f"  ✗ FAIL [D-7 계열 보호] 가드는 **깨뜨리는 방향에만** 걸려야 한다"
+                  f"(전면 차단이면 통일이 죽는다) — blocked={list(_gp['blocked'])} "
+                  f"jobs={_gp['jobs']}")
         print(f"  D-7 복합명사 가족 정합: {n_fam}케이스 완료")
 
     print(f"  → Phase D {'✅ 통과' if fails == 0 else f'❌ {fails}건 실패'}")

@@ -570,6 +570,13 @@ class ReviewPanel(QWidget):
         self._fam_mode = False
         self._families = []
         self._fam_cards = []
+        self._fam_all = []         # 갈리지 않은 계열까지 — 통일이 그걸 깨뜨리는지 검사(plan ②)
+        self._fam_locked = []      # 앞선 계열이 가져가 이 라운드에서 잠긴 낱말(적용 후 보고)
+        self._fam_blocked = []     # 다른 계열의 표기를 깨뜨려 손대지 않은 낱말(적용 후 보고)
+        self._fam_broken = []      # 2차~: 사용자가 알고 다른 계열을 가른 낱말(적용 후 보고)
+        self._fam_overrides = {}   # base → 계열 key. 사용자가 잠김을 눌러 주인을 바꾼 것
+        self._fam_seq = 0          # 계열 수락 **순서**(먼저 결정한 계열이 낱말을 가져간다)
+        self._fam_round = 0        # 표기 일관성 검토 회차(2단계 재검토)
         self._batch_flip = False
         # 미리보기 재렌더 병합 타이머(_refresh_preview(defer=True) 참조) — _refresh_preview가
         #   무조건 참조하므로 UI보다 먼저 만든다.
@@ -943,6 +950,9 @@ class ReviewPanel(QWidget):
         self._active_filter = None        # 새 문서 — 카테고리 필터 초기화
         self._active_occ_id = None
         self._flip_cache.clear()          # 본문이 바뀌었다 — 등장 수 캐시 무효
+        self._fam_round = 0               # 새 문서 — 표기 일관성 회차·잠김 상태 초기화
+        self._fam_overrides = {}
+        self._fam_locked, self._fam_blocked = [], []
         self._build_occurrences()
         self._rebuild_cards()
         self._refresh_preview(keep_scroll=False)   # 새 문서는 맨 위에서 시작
@@ -2089,14 +2099,35 @@ class ReviewPanel(QWidget):
         return self._fam_mode
 
     def enter_consistency_mode(self) -> int:
-        """그리드를 '표기 일관성 제안'으로 전환. 충돌이 없으면 0을 반환하고 전환하지 않는다."""
-        fams = self.consistency_families()
+        """그리드를 '표기 일관성 제안'으로 전환. 충돌이 없으면 0을 반환하고 전환하지 않는다.
+
+        ⚠ 카드로 내는 건 갈린 계열뿐이지만 **갈리지 않은 계열까지 들고 있어야** 한다 —
+          통일이 그 계열을 깨뜨리지 않는지 검사하는 데 쓴다(consistency_family.plan ②).
+        ⚠ 2회차(재검토)로 다시 들어올 수 있다 — 라운드 안에서만 뜻이 있는 상태
+          (수락 순서·잠김 되돌리기)는 여기서 **반드시 초기화**한다. 안 하면 지난 라운드의
+          순서가 이번 라운드의 주인을 정한다.
+        """
+        from core import consistency_family as _cf
+        all_fams = _cf.analyze(self._corrections)
+        fams = [f for f in all_fams if f["split"]]
         if not fams:
             return 0
         for f in fams:
             f["status"] = "pending"
             f["choice"] = f["proposal"]
+        # 두 축의 기본 제안을 함께 푼다 — 이웃 계열과 부딪히거나 멀쩡한 계열을 깨는
+        #   기본값을 미리 없앤다(2차부터는 보호 가드가 풀려 있어 후자가 실제 피해가 된다).
+        _cf.align_proposals(fams, all_fams)
+        for f in fams:
+            f["choice"] = f["proposal"]
         self._families = fams
+        self._fam_all = all_fams
+        self._fam_locked = []
+        self._fam_blocked = []
+        self._fam_broken = []
+        self._fam_overrides = {}
+        self._fam_seq = 0
+        self._fam_round += 1
         self._fam_mode = True
         self._prefetch_timer.stop()
         self._set_grid_title("표기 일관성 제안", self._FAM_STOPS)
@@ -2113,8 +2144,9 @@ class ReviewPanel(QWidget):
         self._fam_cards = []
         self._loaded_card_count = 0
         self._new_scroll_content()
+        plan = self._fam_plan()        # 문서 전체를 한 번 푸는 계산 — 카드마다 부르지 않는다
         for i, f in enumerate(self._families):
-            c = self._create_family_card(f, i)
+            c = self._create_family_card(f, i, plan)
             self._scroll_layout.insertWidget(self._scroll_layout.count() - 1, c)
             self._fam_cards.append(c)
 
@@ -2124,11 +2156,28 @@ class ReviewPanel(QWidget):
             return
         self._fam_mode = False
         self._families = []
+        self._fam_all = []
         self._fam_cards = []
         self._set_grid_title("교정 제안", self._CARD_STOPS)
         self._chips_box.setVisible(True)
         self._rebuild_cards()
         self._emit_counts()
+
+    def get_consistency_locked(self) -> list:
+        """직전 `apply_consistency()`에서 **앞선 계열이 가져가 잠긴** 낱말 목록."""
+        return list(getattr(self, "_fam_locked", []))
+
+    def get_consistency_broken(self) -> list:
+        """직전 `apply_consistency()`에서 **사용자가 알고 다른 계열을 가른** 낱말 목록(2차~)."""
+        return list(getattr(self, "_fam_broken", []))
+
+    def consistency_round(self) -> int:
+        """지금까지 진행한 표기 일관성 검토 회차(2단계 재검토용)."""
+        return getattr(self, "_fam_round", 0)
+
+    def get_consistency_blocked(self) -> list:
+        """직전 `apply_consistency()`에서 **다른 계열의 표기를 깨뜨려 손대지 않은** 낱말 목록."""
+        return list(getattr(self, "_fam_blocked", []))
 
     def get_consistency_counts(self):
         """(대기, 수락, 전체) — 가족 카드 기준."""
@@ -2148,18 +2197,19 @@ class ReviewPanel(QWidget):
           프리즈가 된다 → `_batch_flip` 가드로 묶고 끝난 뒤 한 번만 재구성한다.
         """
         from core import consistency_family as _cf
-        jobs = []
-        for f in self._families:
-            if f["status"] != "accepted":
-                continue
-            for m in f["members"]:
-                act = _cf.action_for(m, f["choice"])
-                if act:
-                    jobs.append(act)
+        # ⚠ 낱말 단위 합산은 core 단일 출처(plan) — 한 낱말이 두 축의 계열에 동시에 속하므로
+        #   계열마다 그냥 실행하면 ① 같은 방향이면 두 번 뒤집혀 원위치가 되고 ② 반대 방향이면
+        #   나중 계열이 앞의 것을 조용히 덮어쓰며 ③ 다른 축에서 멀쩡하던 계열이 갈린다.
+        _plan = self._fam_plan()
+        jobs = _plan["jobs"]
+        self._fam_locked = sorted(_plan["locked"])
+        self._fam_blocked = sorted(_plan["blocked"])
+        self._fam_broken = sorted(_plan["breaks"])   # 2차: 사용자가 알고 가른 계열의 낱말
         # 그리드를 먼저 교정 카드 모드로 되돌린다 — _apply_flip이 만지는 카드 목록이
         #   가족 카드면 안 되므로, 카드 없는 상태에서 데이터만 바꾸고 마지막에 재구성한다.
         self._fam_mode = False
         self._families = []
+        self._fam_all = []
         self._fam_cards = []
         self._cards = []
         self._loaded_card_count = 0
@@ -2186,7 +2236,7 @@ class ReviewPanel(QWidget):
     def _fam_dir_label(self, direction: str) -> str:
         return "띄어쓰기" if direction == "spaced" else "붙여쓰기"
 
-    def _create_family_card(self, fam: dict, idx: int) -> QFrame:
+    def _create_family_card(self, fam: dict, idx: int, plan: dict = None) -> QFrame:
         from core import consistency_family as _cfam
         pal = current_palette()
         card = QFrame()
@@ -2201,7 +2251,9 @@ class ReviewPanel(QWidget):
         chip = label("표기 일관성")
         chip.setStyleSheet(_pill_qss(pal, "review"))
         top.addWidget(chip)
-        head_lbl = label(f"‘…{fam['head']}’ 계열 {len(fam['members'])}종")
+        # 계열 표기는 축까지 보여야 뜻이 통한다 — 꼬리 '…정책' / 머리 '지원…'
+        #   (같은 낱말이 두 축의 키가 될 수 있다). 라벨 조립은 core 단일 출처.
+        head_lbl = label(f"‘{_cfam.family_label(fam)}’ 계열 {len(fam['members'])}종")
         head_lbl.setStyleSheet(
             f"color: {pal['text_muted']}; font-size: 11px; border: none; background: transparent;")
         top.addWidget(head_lbl)
@@ -2211,9 +2263,9 @@ class ReviewPanel(QWidget):
         accept_btn.setToolTip("선택한 표기로 이 계열 전체를 통일합니다.")
         reject_btn.setToolTip("통일하지 않고 지금 결정을 그대로 둡니다(정당한 구분).")
         accept_btn.clicked.connect(
-            lambda _e, f=fam, c=card: self._set_family_status(f, c, "accepted"))
+            lambda _e, f=fam: self._set_family_status(f, "accepted"))
         reject_btn.clicked.connect(
-            lambda _e, f=fam, c=card: self._set_family_status(f, c, "rejected"))
+            lambda _e, f=fam: self._set_family_status(f, "rejected"))
         top.addWidget(accept_btn)
         top.addWidget(reject_btn)
         cl.addLayout(top)
@@ -2226,7 +2278,7 @@ class ReviewPanel(QWidget):
         for d in ("spaced", "joined"):
             b = QPushButton(self._fam_dir_label(d))
             b.setCursor(Qt.PointingHandCursor)
-            b.clicked.connect(lambda _e, f=fam, c=card, dd=d: self._set_family_choice(f, c, dd))
+            b.clicked.connect(lambda _e, f=fam, dd=d: self._set_family_choice(f, dd))
             card._dir_btns[d] = b
             seg.addWidget(b)
         seg.addStretch()
@@ -2260,6 +2312,11 @@ class ReviewPanel(QWidget):
             nxt = label("")
             nxt.setTextFormat(Qt.PlainText)
             nxt.setWordWrap(True)
+            # 잠긴 낱말은 눌러서 이 계열로 가져올 수 있다 — 핸들러는 restyle이 갈아 끼우므로
+            #   여기서 한 번만 걸고, 이후엔 `_on_click`만 바꾼다(안 그러면 지난 라운드의
+            #   람다가 남아 엉뚱한 낱말을 가져간다).
+            nxt._on_click = None
+            nxt.mousePressEvent = lambda _e, w=nxt: (w._on_click() if w._on_click else None)
             row.addWidget(cur, 1)
             row.addWidget(arrow)
             row.addWidget(nxt, 1)
@@ -2276,22 +2333,73 @@ class ReviewPanel(QWidget):
         card._fam = fam
         card._accept_btn = accept_btn
         card._reject_btn = reject_btn
-        self._style_family_card(card)
+        card._ev_lbl = ev
+        self._style_family_card(card, plan)
         return card
 
-    def _set_family_choice(self, fam: dict, card: QFrame, direction: str):
-        fam["choice"] = direction
-        self._style_family_card(card)
+    def _fam_plan(self) -> dict:
+        """지금 결정 상태로 통일하면 어떻게 되는가(core 단일 출처).
 
-    def _set_family_status(self, fam: dict, card: QFrame, status: str):
+        ⚠ **2차 재검토부터는 계열 보호 가드를 푼다**(`allow_break`). 1차 뒤 남은 갈림은
+          거의 다 '다른 축 계열이 그 낱말을 붙잡고 있어서'라, 가드를 그대로 두면 2차에서
+          아무것도 못 움직인다(실측 3원고 모두 조정 0~1건). 대신 어떤 계열이 갈리게 되는지
+          카드에 보여 주고 사용자가 고르게 한다.
+        """
+        from core import consistency_family as _cf
+        return _cf.plan(self._families, getattr(self, "_fam_all", None),
+                        getattr(self, "_fam_overrides", None),
+                        allow_break=self.consistency_round() >= 2)
+
+    def _take_family_base(self, fam: dict, base: str):
+        """잠긴 낱말을 **이 계열이 가져온다**(사용자가 잠김 배지를 눌렀다).
+
+        앞선 계열이 가져간 것을 뒤집는 유일한 경로다 — 되돌릴 수 없으면 '먼저 결정한
+        계열이 이긴다'는 규칙이 사실상 앱의 임의 선택이 된다.
+        """
+        self._fam_overrides[base] = fam["key"]
+        self._restyle_family_related(fam)
+
+    def _restyle_family_related(self, fam: dict):
+        """`fam`과 **낱말을 공유하는** 계열 카드까지 다시 그린다.
+
+        한 낱말은 꼬리·머리 두 계열에 동시에 속하므로('지원정책' = '…정책' ∩ '지원…'),
+        이 카드의 결정이 **다른 카드의 표시**를 바꾼다(그쪽에서 그 낱말이 제외된다).
+        전량 재스타일은 계열이 수십 장이라 낭비 — 겹치는 것만 다시 그린다.
+        ⚠ `plan()`은 문서 전체를 한 번 푸는 계산이라 **카드마다 다시 부르지 않는다**.
+        """
+        plan = self._fam_plan()
+        bases = {m["base"] for m in fam["members"]}
+        for c in self._fam_cards:
+            f = getattr(c, "_fam", None)
+            if f is fam or (f and any(m["base"] in bases for m in f["members"])):
+                self._style_family_card(c, plan)
+
+    def _set_family_choice(self, fam: dict, direction: str):
+        fam["choice"] = direction
+        self._restyle_family_related(fam)
+
+    def _set_family_status(self, fam: dict, status: str):
         fam["status"] = "pending" if fam["status"] == status else status
-        self._style_family_card(card)
+        if fam["status"] == "accepted":
+            # 수락 **순서**를 남긴다 — 두 계열이 같은 낱말을 반대로 요구할 때
+            #   먼저 결정한 쪽이 가져간다(consistency_family.plan ①).
+            self._fam_seq += 1
+            fam["seq"] = self._fam_seq
+        else:
+            fam.pop("seq", None)
+            # 이 계열이 가져왔던 낱말의 override도 함께 푼다(주인이 사라졌다).
+            for b, k in list(self._fam_overrides.items()):
+                if k == fam["key"]:
+                    del self._fam_overrides[b]
+        self._restyle_family_related(fam)
         self._emit_family_counts()
 
-    def _style_family_card(self, card: QFrame):
+    def _style_family_card(self, card: QFrame, plan: dict = None):
         from core import consistency_family as _cf
         pal = current_palette()
         fam = card._fam
+        if plan is None:
+            plan = self._fam_plan()
         st, choice = fam["status"], fam["choice"]
         acc, rej = st == "accepted", st == "rejected"
 
@@ -2320,17 +2428,61 @@ class ReviewPanel(QWidget):
                 f"background: {pal['accent'] if on else pal['surface']}; "
                 f"border: 1px solid {pal['accent'] if on else pal['border_strong']}; }}")
 
+        # 한 낱말은 꼬리·머리 두 계열에 동시에 속한다('지원정책' = '…정책' ∩ '지원…').
+        #   그래서 이 계열의 통일에서 **빠지는** 낱말이 생긴다(앞선 계열이 가져감 / 멀쩡한
+        #   계열 깨뜨림 — core/consistency_family.plan). 적용 뒤에 로그로만 알리면 사용자는
+        #   이미 화면을 떠난 뒤라 **결정하는 자리에서** 이유까지 보여 주고, 잠긴 것은
+        #   눌러서 되돌릴 수 있게 한다.
+        locked, blocked, breaks = plan["locked"], plan["blocked"], plan["breaks"]
+        n_out, broke = 0, set()
         for m, lbl in card._member_rows:
-            target = _cf.unified_form(m, choice)
-            if _cf.action_for(m, choice) is None:
+            b = m["base"]
+            why, click, tone = None, None, pal["warning"]
+            if acc and b in locked and locked[b][0] is not fam:
+                own = locked[b][0]
+                why = (f"‘{_cf.family_label(own)}’ 계열이 "
+                       f"{self._fam_dir_label(own['choice'])}로 결정 · 눌러 되돌리기")
+                tone = pal["accent"]
+                click = (lambda f=fam, bb=b: self._take_family_base(f, bb))
+            elif acc and b in blocked:
+                why = f"⚠ ‘{_cf.family_label(blocked[b])}’ 계열이 갈림 — 제외"
+            elif acc and b in breaks:
+                # 2차 재검토 — 가드를 풀었으므로 **바꾸긴 하되** 무엇이 갈리는지 알린다.
+                broke.add(breaks[b]["key"])
+                why = (f"{_soft_breakable(_cf.unified_form(m, choice))}   "
+                       f"⚠ ‘{_cf.family_label(breaks[b])}’ 계열이 갈립니다")
+            lbl._on_click = click
+            lbl.setCursor(Qt.PointingHandCursor if click else Qt.ArrowCursor)
+            if why:
+                n_out += 1
+                lbl.setText(why)
+                lbl.setStyleSheet(
+                    f"border: none; color: {tone}; font-weight: bold; "
+                    f"background: transparent;")
+            elif _cf.action_for(m, choice) is None:
                 lbl.setText("그대로")
                 lbl.setStyleSheet(
                     f"border: none; color: {pal['text_muted']}; background: transparent;")
             else:
-                lbl.setText(_soft_breakable(target))
+                lbl.setText(_soft_breakable(_cf.unified_form(m, choice)))
                 lbl.setStyleSheet(
                     f"border: none; color: {pal['text']}; font-weight: bold; "
                     f"background: transparent;")
+
+        ev = getattr(card, "_ev_lbl", None)
+        if ev is not None:
+            tail = ""
+            if broke:
+                # 2차: 이 통일이 **손해 보는 교환**인지 한눈에 — 갈리는 계열이 2개 이상이면
+                #   갈림을 옮기는 게 아니라 늘리는 것이다(사용자가 건너뛸 수 있게).
+                tail = f"   ⚠ 이 통일로 갈리는 계열 {len(broke)}개"
+            elif n_out:
+                tail = f"   다른 계열이 가져갔거나 제외한 낱말 {n_out}건"
+            ev.setText(f"계열 등장 — 붙임 {fam['n_joined']}회 : "
+                       f"띄어쓰기 {fam['n_spaced']}회{tail}")
+            ev.setStyleSheet(
+                f"color: {pal['warning'] if tail else pal['text_muted']}; border: none; "
+                f"background: transparent; font-size: 12px;")
 
         bg, border = pal["surface"], pal["border"]
         if acc:
