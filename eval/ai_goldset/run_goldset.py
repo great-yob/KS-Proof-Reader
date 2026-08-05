@@ -468,9 +468,34 @@ def phase_a_doc_dict():
         fails += 1
         print("  ✗ FAIL [각주절단] note_lines 없을 때 무회귀 실패")
 
+    # ── ㉙ 한자 병기 독음 — 워커 [6] 사전 안전망의 검수 카드 억제 집합 ────────────
+    #   실보고 2026-08-05(中國科學院 보고서 69K자): 중국 인명·기관명을 한자로 쓰고 괄호에
+    #   한글 독음을 병기한 원고에서 그 독음이 전부 '어느 사전에도 없음' 카드가 됐다
+    #   (dict_flags 225건 중 71건). 사전 확장으로는 못 푸는 부류라 **모양**으로 판정한다.
+    #   ⚠ 방향이 핵심 — 막는 건 '漢字(한글)' 하나뿐이고, 흔한 '한글(漢字)'는 한글이
+    #     본문이므로 반드시 계속 검사돼야 한다(같은 문서의 '과교융합(科教融合)'이 그 예).
+    hg_doc = ("연구팀은 戴彧虹(대욱홍) 교수와 淸华大学(칭화대학)·北京大学(베이징대학)의 "
+              "협력으로 과교융합(科教融合) 모형을 제시했다. 중국과학원(중국원)은 별도다.")
+    hg = ai_guards.hanja_gloss_readings(hg_doc)
+    hg_cases = [
+        ("대욱홍", True),        # 한자 뒤 괄호 독음 → 억제 대상
+        ("칭화대학", True),      # 4:4
+        ("베이징대학", True),    # ★4:5 — 길이 일치를 요구하지 않는다(중국어 발음 표기)
+        ("과교융합", False),     # ★역방향 '한글(漢字)' — 한글이 본문이므로 계속 검사
+        ("중국원", False),       # 한자 없는 괄호 → 무관
+        ("연구팀", False),
+    ]
+    for w, want in hg_cases:
+        if (w in hg) != want:
+            fails += 1
+            print(f"  ✗ FAIL [한자병기] {w!r} 기대={want} 실제={w in hg}")
+    if ai_guards.hanja_gloss_readings("") != frozenset():
+        fails += 1
+        print("  ✗ FAIL [한자병기] 빈 문서 무회귀 실패")
+
     n = (len(exp_cases) + len(hd_cases) + len(dm_cases) + len(ws_cases) + len(pj_cases)
          + len(gn_cases) + len(cv_cases) + len(fr_cases) + len(ts_cases)
-         + len(rvc_cases) + 1 + 1)
+         + len(rvc_cases) + len(hg_cases) + 1 + 1 + 1)
     print(f"  → {n - fails}/{n} 통과" + ("  ✅" if fails == 0 else "  ❌"))
     return fails
 
@@ -768,6 +793,7 @@ def _det_finders():
         ("paren_attach",        br.find_paren_attach,                True),
         ("unpaired_quotes",     qr.find_unpaired_quotes,             False),
         ("quote_punct_spacing", qr.find_quote_punct_spacing,         False),
+        ("reversed_quotes",     qr.find_reversed_quotes,             False),
         ("spelling_pairs",      sp.find_spelling_fixes,              False),
         ("spacing_suggestions", morph.find_spacing_suggestions,      True),
         ("dependent_noun",      morph.find_dependent_noun_spacing,   True),
@@ -825,6 +851,18 @@ _CLEAN_CORPUS = [
     #   '차등'은 등재 명사인데 find_dependent_noun_spacing이 차(NNG)+등(NNB)으로 봐 '차 등'으로
     #   쪼갰다. 이 finder엔 사전 가드가 아예 없었다. '일중'도 같은 부류.
     "차등 지급 방안을 검토했다.",
+    # 방향이 올바른 굽은따옴표 — reversed_quotes 는 여기서 절대 발화하면 안 된다
+    #   (역할이 아니라 글자 모양으로 판정하면 정상 인용까지 뒤집는다).
+    "그는 ‘성과’가 아니라 ‘메커니즘’을 보아야 한다고 말했다.",
+    # ★'10억' 연도 약물 오인 회귀(2026-08-05 실보고, 中國科學院 보고서 인용 기사 제목):
+    #   홑따옴표 + 두 자리 숫자를 연도('19)로 보고 스택에서 빼는 바람에 뒤의 정상 닫는
+    #   따옴표가 고아가 돼 거짓 보완 카드('10억'→''10억')가 났다. 연도는 뒤가 '년'이거나
+    #   비한글이다 — '10억'처럼 한글 단위가 붙으면 연도가 아니다.
+    "투자금 '10억' 유치에 성공했다.",
+    # ★'-어지다' 붙임 오탐 회귀(2026-08-05 실보고): 붙인 형태만 분석하면 kiwi가 멀쩡한
+    #   명사 '질적'을 지(VX)+ㄹ(ETM)+적(NNB)으로 읽어 '고려하여질적'으로 붙였다(high·자동 적용).
+    "여러 조건을 고려하여 질적 평가와 양적 평가를 수행했다.",
+    "정책을 고려하여 지원 규모와 지역을 확정했다.",
 ]
 
 # 발화 케이스 — (finder 이름, 오류 문장, 기대 원문 부분, 기대 교정 부분)
@@ -847,6 +885,12 @@ _POS_CASES = [
     ("spelling_pairs",      "왠만하면 곰곰히 생각컨대 위험을 무릎쓰고 갔다.", "생각컨대", "생각건대"),
     ("spelling_pairs",      "왠만하면 곰곰히 생각컨대 위험을 무릎쓰고 갔다.", "무릎쓰고", "무릅쓰고"),
     ("unbalanced_brackets", "여기서 살펴본다(참고 자료 누락\n다음 항목이다.", "(", ")"),
+    # 따옴표 방향 오류(굽은따옴표를 뒤집어 쓴 원고 — 2026-08-05 실파일 보고).
+    #   ⚠ 짝지어 쓰므로 한 줄에 두 쌍을 두어 '앞 인용의 닫는 + 뒤 인용의 여는'을
+    #     한 쌍으로 오인하던 옛 동작(quote_spacing 거짓 카드)까지 함께 감시한다.
+    ("reversed_quotes",     "중국의 ’성과‘가 아니라 ’메커니즘‘을 보는 접근이 필요함.",
+                            "’성과‘", "‘성과’"),
+    ("reversed_quotes",     "그는 ”준비되면“ 이라고 말했다.", "”준비되면“", "“준비되면”"),
 ]
 
 # D-4 규범표기 용언 활용형 동형이의 가드 — (문장, 어절 w, norm_map 키, 기대 보류 여부, 설명).

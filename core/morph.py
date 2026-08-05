@@ -1140,6 +1140,9 @@ def find_aux_connective_spacing(text: str) -> list:
 #   그 경계를 한 용언으로 보는 경우만 붙인다(실문서 거짓양성 0 검증). 공백만 제거(글자 불변).
 _JI_HEAD = "지졌져질진"   # 피동 '지'(VX) 계열로 시작하는 후행 어절(지고/졌고/져서/질/진다)
 
+# ⚠ 후행 어절 안의 **체언** 태그 — 이게 있으면 '지'는 피동 보조용언이 아니다(아래 가드).
+_JI_NOUN_TAGS = ("NNG", "NNP", "NNB", "NP", "NR", "SL", "SH", "SN")
+
 
 def find_eojida_join(text: str) -> list:
     """잘못 띄어 쓴 피동 '-어지다'를 붙인 후보를 [(original, joined), …]로 반환한다.
@@ -1179,6 +1182,21 @@ def find_eojida_join(text: str) -> list:
                      and t.start < la <= t.end for t in mt)
             vx = any(t.tag == "VX" and t.form == "지" and t.start <= la < t.end for t in mt)
             if not (straddle or (ec and vx)):
+                continue
+            # ⚠⚠ **후행 어절에 체언이 있으면 붙이지 않는다**(2026-08-05 사용자 보고).
+            #   kiwi는 붙인 문자열만 받으면 멀쩡한 '명사'를 피동으로 읽어 버린다 —
+            #   '고려하여 질적,' → '고려하여질적,'을 분석하면 지/VX + ᆯ/ETM + **적/NNB**
+            #   가 나와 위 (ec and vx) 분기를 그대로 통과했다(실파일: 中國科學院 보고서,
+            #   `high`라 **자동 적용**됐고 사유는 '피동 -어지다'였다). 띄어 쓴 원형은
+            #   질/NNG + 적/XSN 으로 정상 분석되지만, 이 규칙은 붙인 형태만 보므로
+            #   그 사실을 알지 못한다. ⚠ kiwi 점수 비교로는 못 가른다 — 실측상 kiwi가
+            #   내부적으로 자동 띄어쓰기를 해 두 형태의 점수가 **완전히 동일**하다
+            #   (작아 졌다·만들어 지고도 delta 0). 갈라지는 지점은 하나뿐이다:
+            #   진짜 피동 '-어지다'의 후행 어절은 **전부 용언 형태소**(지/VV·었/EP·다/EF)
+            #   이고, 오탐은 그 안에 **체언**이 들어 있다(적/NNB·지원/NNG·지역/NNG).
+            #   → 경계 이후 토큰에 체언 태그가 하나라도 있으면 스킵.
+            #   수용한 미탐: '만들어 진것'처럼 후행 어절에 의존명사가 붙은 경우(억제 방향).
+            if any(t.start >= la and t.tag in _JI_NOUN_TAGS for t in mt):
                 continue
             orig = A + " " + B
             if orig in seen:

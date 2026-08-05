@@ -837,6 +837,26 @@ class ProofreadingWorker(QThread):
                 if net_q:
                     merged.extend(net_q)
                     det_review.append(("따옴표", len(net_q)))
+                # 따옴표 **방향 오류** — 여닫이를 뒤집어 쓴 원고(’성과‘ → ‘성과’).
+                #   사용자 보고 2026-08-05: 이런 원고에서 모양만 보는 띄어쓰기 규칙이
+                #   한 인용의 닫는 따옴표와 다음 인용의 여는 따옴표를 짝으로 오인해
+                #   엉뚱한 공백 카드를 냈다. 원인(부호 방향) 쪽을 카드로 낸다.
+                #   ⚠ 이 규칙만 글자(따옴표 두 개)를 바꾸므로 반드시 저신뢰 검수 카드.
+                net_r = []
+                for orig, fixed, why in _qr.find_reversed_quotes(text):
+                    if orig in existing:
+                        continue
+                    net_r.append(Correction(
+                        original=orig, corrected=fixed,
+                        reason=f"[검수] {why}",
+                        source="punct", color=HL_DICT,
+                        category="문장부호", confidence="low",
+                    ))
+                    existing.add(orig)
+                if net_r:
+                    merged.extend(net_r)
+                    det_review.append(("따옴표방향", len(net_r)))
+                    log(f"  [문장부호] 따옴표 방향 오류 {len(net_r)}건 검수 카드")
             except Exception as e:
                 log(f"  [문장부호] 괄호·따옴표 짝 맞추기 스킵: {e}")
 
@@ -876,6 +896,16 @@ class ProofreadingWorker(QThread):
             except Exception:
                 _abbrevs = frozenset()
             skipped_abbrev = 0
+            # 한자 병기 독음('戴彧虹(대욱홍)'의 '대욱홍')도 검수 카드에서 뺀다 — 저자가
+            #   바로 앞에 원어를 적어 둔 음역이지 표제어를 확인할 어휘가 아니다(㉙).
+            #   실측(中國科學院 보고서 69K자): dict_flags 225건 중 71건이 이 부류.
+            #   ⚠ 반대 방향 '한글(漢字)'은 한글이 본문이므로 대상 아님 — 같은 문서의
+            #   '과교융합(科教融合)'은 그대로 카드로 남는다.
+            try:
+                _hanja_gloss = ai_guards.hanja_gloss_readings(text)
+            except Exception:
+                _hanja_gloss = frozenset()
+            skipped_gloss = 0
             # 빈도 가드 — 문서에서 여러 번 반복되는 미등재어는 작가 의도 용어
             #   (외래어·전문용어·고유명사·브랜드명)일 확률이 압도적이다(사용자 보고
             #   #2: '바이오' 16회). 진짜 오탈자는 보통 1~2회에 그치고, 빈출어는 AI가
@@ -908,6 +938,10 @@ class ProofreadingWorker(QThread):
                 # 저자가 '(이하 …)'로 선언한 약칭 → 저자 표기이므로 카드 제외
                 if _abbrevs and (clean in _abbrevs or _fbase in _abbrevs):
                     skipped_abbrev += 1
+                    continue
+                # 한자 병기 독음('漢字(한글)') → 저자가 단 음역이므로 카드 제외(㉙)
+                if _hanja_gloss and (clean in _hanja_gloss or _fbase in _hanja_gloss):
+                    skipped_gloss += 1
                     continue
                 # 따옴표로 영문과 붙은 한글 오타(예: 캐나가"Say)는 혼합 토큰이라 필터가
                 #   통째로 제외했다 → **따옴표가 섞인 경우에만** 한글 런만 떼어 검사·표시한다.
@@ -968,6 +1002,9 @@ class ProofreadingWorker(QThread):
             if skipped_abbrev:
                 log(f"  → 저자 선언 약칭 {skipped_abbrev}건 검수 카드 제외 "
                     f"('(이하 …)' 정의 표기)")
+            if skipped_gloss:
+                log(f"  → 한자 병기 독음 {skipped_gloss}건 검수 카드 제외 "
+                    f"('漢字(한글)' 형태의 저자 음역)")
             # ⚠ **나머지 억제 사유도 반드시 남긴다.** 집계만 하고 로그가 없으면 미등재어가
             #   어느 단계에서 사라졌는지 사후 추적이 불가능하다 — `재산관` 미탐
             #   (2026-07-31)이 정확히 이 구멍이었다. 스크리닝은 통과했는데 여기

@@ -138,8 +138,22 @@ def find_quote_spacing(text: str) -> list:
     · 공백을 넣거나(여는 앞) 빼므로(닫는 뒤 조사) 글자 불변(환각 0). 닫는 따옴표 뒤 조사는
       '한글이 더 안 이어질 때'만 조사로 인정('의미'의 '의'는 조사 아님). 탐지 전용 검수 카드.
 
+    ⚠⚠ **모양으로 찾고 역할로 거른다**(2026-08-05 사용자 보고). 위 정규식은 글자 모양
+    (‘…’)으로만 짝을 잡는데, 굽은따옴표를 **뒤집어 쓴 원고**(’성과‘가 아니라 ’메커니즘‘을)
+    에서는 그게 통째로 어긋난다 — 한 인용의 **닫는** 따옴표와 다음 인용의 **여는** 따옴표를
+    한 쌍으로 오인해 그 사이(성과‘가 아니라 ’)에 공백을 넣으라는 카드를 냈다. 원고에서
+    실제로 틀린 건 따옴표 **방향**이지 띄어쓰기가 아니다(→ `quote_rules.find_reversed_quotes`).
+    그래서 `quote_rules`의 **줄 문맥 스택**이 판정한 역할과 대조해, 여는 자리가 정말
+    `open`이고 닫는 자리가 정말 `close`일 때만 후보로 삼는다. 역할표를 못 얻으면
+    (임포트 실패) 기존 동작으로 되돌아간다 — 억제 방향이라 안전하다.
+
     반환: [(original, corrected), ...] (중복 제거). 미설치/실패 시 [].
     """
+    try:
+        from core import quote_rules as _qr
+        roles = _qr.quote_roles_text(text)
+    except Exception:
+        roles = None
     out, seen = [], set()
     for opn, cls in _QUOTE_PAIRS:
         if opn == cls:
@@ -151,6 +165,10 @@ def find_quote_spacing(text: str) -> list:
             s, e = m.start(), m.end()
             if not re.search(r"[가-힣]", m.group(1)):
                 continue                                   # 인용 내용에 한글 없음 → 스킵
+            # 줄 문맥이 판정한 역할과 어긋나면(역방향 원고·스택 오염) 후보 아님
+            if roles is not None and not (roles.get(s) == "open"
+                                          and roles.get(e - 1) == "close"):
+                continue
 
             # 좌: 단어 + 여는따옴표(공백 없음) → 앞 단어 전체를 잡아 공백 삽입
             left_fix = s > 0 and text[s - 1].isalnum()

@@ -18,6 +18,8 @@ core/quote_rules.py — 따옴표 짝·방향 판정과 따옴표 관련 결정�
 
 설계 정합성(괄호 짝 bracket_rules와 동궤):
   · 글자를 치환하지 않고 **따옴표 한 짝만 삽입**하거나 **공백만 가감**한다(환각 0).
+    ⚠ 예외는 `find_reversed_quotes` 하나 — 여기서만 **따옴표 두 글자의 '방향'**을
+    바꾼다(’…‘ → ‘…’). 안쪽 글자는 여전히 불변이고, 저신뢰 검수 카드다.
   · 탐지 전용 — 저신뢰 '검수 카드'로만 노출(자동수정 아님).
   · GUI-agnostic (PySide6 미사용) — core/ 규칙. 사전·형태소 불필요(순수 규칙).
 """
@@ -32,7 +34,10 @@ import re
 _Q_CLASS = {"'": "s", "‘": "s", "’": "s", '"': "d", "“": "d", "”": "d"}
 _ALL_QUOTES = set(_Q_CLASS)
 _CURLY_OPEN_SHAPE = {"‘", "“"}                      # 굽은 '여는 모양'(방향 신뢰 가능)
+_CURLY_CLOSE_SHAPE = {"’", "”"}                     # 굽은 '닫는 모양'
 _ORPHAN_OPENER_FOR = {"’": "‘", "”": "“"}           # 고아 닫는 따옴표 → 보완할 여는 짝
+# 굽은따옴표의 올바른 방향 짝 — 역방향 사용(’…‘)을 바로잡을 때 쓴다.
+_CORRECT_PAIR = {"s": ("‘", "’"), "d": ("“", "”")}
 
 # 내용 글자(한글·한자·라틴·숫자) — 닫는 문맥/어구 런 판정용.
 _CONTENT_CH = re.compile(r"[0-9A-Za-z가-힣㐀-鿿]")
@@ -83,8 +88,13 @@ def _analyze_line(line: str):
         #   (사용자 보고 2026-07-21: '건강보험료' 뒤 '19년이 스택을 오염시켜 다음 문장의
         #   여는 따옴표가 close로 오판됨). 앞이 비내용(공백/문두/부호)일 때만 — 4자리 연도
         #   '2024'·'1인 가구'(숫자 1자리)·측정 5'는 대상 아님.
+        #   ⚠ **두 자리 숫자 뒤에 한글 단위가 붙으면 연도가 아니다**(2026-08-05 실측 수정):
+        #   기사 제목 "…쓸어간다...'10억' 러브콜에"의 `'10억'`이 연도로 오인돼 여는 따옴표가
+        #   스택에서 빠졌고, 그 결과 뒤의 정상 닫는 따옴표가 고아가 돼 거짓 보완 카드
+        #   (`10억'`→`'10억'`)가 났다. 연도 약물은 뒤가 공백·부호이거나 '년'(‘19년)이다.
         if (ch in ("'", "’") and not (_CONTENT_CH.match(prev) or prev in _BRACKET_CLOSE)
-                and re.match(r"\d\d(?!\d)", line[i + 1:])):
+                and re.match(r"\d\d(?!\d)", line[i + 1:])
+                and not re.match(r"\d\d(?!년)[가-힣]", line[i + 1:])):
             roles[i] = "apostrophe"
             continue
         st = stacks[cls]
@@ -130,6 +140,22 @@ def _analyze_line(line: str):
 def quote_roles(line: str) -> dict:
     """줄 안 따옴표의 역할만 반환 — {index: role}. (morph 기호 뒤 명사 띄어쓰기 등 공용)"""
     return _analyze_line(line)[0]
+
+
+def quote_roles_text(text: str) -> dict:
+    """문서 전체 기준 **절대 인덱스** 역할표 — {abs_index: role}.
+
+    판정 자체는 줄 단위(_analyze_line)로 하고 오프셋만 더한다. 문서 오프셋으로 도는
+    규칙(spacing_rules.find_quote_spacing)이 '이 따옴표가 정말 여는 것인가'를 물을 때
+    쓴다 — 글자 모양만 보는 쪽(‘…’ 정규식)은 역방향 원고에서 통째로 오판한다.
+    """
+    roles, off = {}, 0
+    for line in text.split("\n"):
+        if any(q in line for q in _ALL_QUOTES):
+            for i, r in _analyze_line(line)[0].items():
+                roles[off + i] = r
+        off += len(line) + 1
+    return roles
 
 
 def _run_start_before(line: str, i: int) -> int:
@@ -193,15 +219,85 @@ def find_unpaired_quotes(text: str) -> list:
                 # 뒤 조사를 원문에 포함 — 같은 어구가 정상 짝으로도 등장할 때('테크 패스'및
                 #   vs 원 패스'를) 적용 검색이 정상 쪽을 오염시키지 않게 유일성을 높인다.
                 josa = jm.group(1)
-            opener = _ORPHAN_OPENER_FOR.get(ch, ch)
+            # ⚠ 고아가 **여는 모양**(‘ “)이면 이 원고는 따옴표를 뒤집어 쓰고 있다
+            #   (실파일: '쌍륜 구동(Double-Wheel Drive)‘에 따라'). 그대로 앞에 ‘를
+            #   넣으면 ‘…‘ 라는 또 다른 역방향 짝이 완성될 뿐이므로, 짝을 채우면서
+            #   **고아 쪽 방향도 함께 바로잡는다**(‘…’). 방향이 맞는 고아(’ ” )·곧은
+            #   따옴표는 기존대로 앞에 짝만 넣는다(글자 불변).
+            cls = _Q_CLASS[ch]
+            if ch in _CURLY_OPEN_SHAPE:
+                opener, closer = _CORRECT_PAIR[cls]
+                why = (f"짝 없는 따옴표 {ch} — 여는 따옴표 추가 + 방향 교정"
+                       f"(넣을 위치는 검토 필요)")
+            else:
+                opener, closer = _ORPHAN_OPENER_FOR.get(ch, ch), ch
+                why = (f"닫는 따옴표 {ch} 의 짝 여는 따옴표가 없음 — 여는 따옴표 추가"
+                       "(넣을 위치는 검토 필요)")
             original = run + ch + josa
-            corrected = opener + original
+            corrected = opener + run + closer + josa
             if original in seen:
                 continue
             seen.add(original)
+            out.append((original, corrected, why))
+    return out
+
+
+def find_reversed_quotes(text: str) -> list:
+    """**따옴표 방향 오류**(’성과‘ → ‘성과’)를 [(original, corrected, reason), …]로.
+
+    사용자 보고 2026-08-05(실파일: 中國科學院 보고서 — 문서 전체가 굽은따옴표를
+    뒤집어 쓴다: `중국의 ’성과‘가 아니라 ’메커니즘‘을`, 18곳). 이런 원고에서는
+    **여는 자리에 닫는 모양(’ ”)** 이, **닫는 자리에 여는 모양(‘ “)** 이 온다.
+    이건 띄어쓰기 문제가 아니라 부호 자체의 오류인데, 모양만 보는 규칙
+    (spacing_rules.find_quote_spacing의 ‘…’ 정규식)은 **한 인용의 닫는 따옴표와
+    다음 인용의 여는 따옴표**를 짝으로 오인해 그 사이에 공백을 넣으라는 카드를 냈다
+    ('성과‘가 아니라 ’' → '성과 ‘가 아니라 ’'). 원인을 고치는 쪽이 이 규칙이다.
+
+    판정 = **문맥 스택이 확정한 짝**(_analyze_line)에서 여는 자리 글자가 굽은
+    '닫는 모양'인 경우. 글자 모양이 아니라 역할로 보기 때문에 정상 원고·혼용 원고
+    (‘…' 곧은/굽은 섞임)에는 발동하지 않는다.
+
+    가드(보수 — 짝 판정이 흔들릴 수 있는 자리는 전부 뺀다):
+      · 여는 따옴표 **바로 뒤가 내용 글자**여야 한다(따옴표는 인용문에 붙는다).
+        문장 사이에 홀로 떠 있는 따옴표가 우연히 짝지어진 경우를 배제한다.
+      · 닫는 따옴표 **바로 앞이 공백이 아니어야** 한다(같은 이유. 인용이 부호로
+        끝나는 '…했다.’ 는 허용).
+      · 인용 내용은 1~60자, 탭 없음(탭이 든 원문은 본문 탐색이 불안정), 내용
+        글자를 하나 이상 포함.
+    바꾸는 것은 **따옴표 두 글자의 방향뿐**이고 안쪽 글자는 건드리지 않는다.
+    """
+    out, seen = [], set()
+    for line in text.split("\n"):
+        if not any(q in line for q in _ALL_QUOTES):
+            continue
+        roles, pairs = _analyze_line(line)
+        for oi, role in roles.items():
+            if role != "open" or oi not in pairs:
+                continue
+            och = line[oi]
+            if och not in _CURLY_CLOSE_SHAPE:        # 여는 자리가 정상 모양 → 무관
+                continue
+            ci = pairs[oi]
+            if ci <= oi:
+                continue
+            inner = line[oi + 1:ci]
+            if not (1 <= len(inner) <= 60) or "\t" in inner:
+                continue
+            if not _CONTENT_CH.search(inner):
+                continue
+            if not (_CONTENT_CH.match(inner[0]) or inner[0] in "([{（「『【《〈"):
+                continue                              # 여는 따옴표 뒤 공백/부호 → 스킵
+            if inner[-1].isspace():
+                continue                              # 닫는 따옴표 앞 공백 → 스킵
+            opener, closer = _CORRECT_PAIR[_Q_CLASS[och]]
+            original = line[oi:ci + 1]
+            corrected = opener + inner + closer
+            if original == corrected or original in seen:
+                continue
+            seen.add(original)
             out.append((original, corrected,
-                        f"닫는 따옴표 {ch} 의 짝 여는 따옴표가 없음 — 여는 따옴표 추가"
-                        "(넣을 위치는 검토 필요)"))
+                        f"따옴표 방향 오류 — 여는 자리에 닫는 따옴표({och}), 닫는 자리에 "
+                        f"여는 따옴표({line[ci]})가 쓰임 → {opener}…{closer} 로 바로잡음"))
     return out
 
 
@@ -270,11 +366,19 @@ if __name__ == "__main__":
         "국립국어원'맞춤법규칙'에 따르면",         # 붙은 여는 따옴표(짝 있음) → 고아 아님
         "Jones' 이론과 '가설' 검증",               # 라틴 소유격 → 고아 카드 없음
         "don't stop, it's fine",                   # 아포스트로피 → 무변경
+        # 방향 오류 — 여닫이를 뒤집어 쓴 원고(2026-08-05 실보고)
+        "중국의 ’성과‘가 아니라 ’메커니즘‘을 보는 접근이 필요함",
+        "그는 ”준비되면“ 이라고 말했다.",
+        "그는 ‘성과’가 아니라 ‘메커니즘’을 보았다.",   # 방향 정상 → 무변경
+        "투자금 '10억' 유치에 성공했다.",             # 연도 약물 아님 → 고아 카드 없음
+        "'19년 대비 '20년 실적",                     # 연도 약물 → 무변경
     ]
     for t in tests:
         print(f"  {t!r}")
         for o, c, why in find_unpaired_quotes(t):
             print(f"      짝: {o!r} ⇒ {c!r}   [{why}]")
+        for o, c, why in find_reversed_quotes(t):
+            print(f"      방향: {o!r} ⇒ {c!r}")
         for o, c in find_quote_punct_spacing(t):
             print(f"      띄어쓰기: {o!r} ⇒ {c!r}")
     print()
