@@ -254,24 +254,34 @@ $a=Get-Process -Id $p.Id -EA SilentlyContinue; if($a){"OK $($a.MainWindowTitle)"
 
 대신 **무설치 정적 불변식 검사**로 대체한다. `.iss`가 바뀌었으면 실행한다(1초):
 
+⚠ 아래 스크립트에 **위치 인자(`$1`·`$2`)를 쓰지 말 것.** 스킬 본문은 `/release`에 넘긴
+인자로 `$1`·`$2`가 **치환된 채** 주입된다(2026-08-05 실측: `chk "라벨" '패턴'` 구조가
+`grep -qF "사내"`로 바뀌어 8개 항목이 전부 같은 문자열을 검사하게 됐다 — 검사가 통째로
+장식이 된다). 그래서 항목 표를 here-doc으로 읽고 **이름 있는 변수**만 쓴다.
+
 ```bash
 ISS=installer/KS-Proof-Reader.iss
 fail=0
-chk() { grep -qF "$2" "$ISS" && echo "  OK  $1" || { echo "  FAIL $1"; fail=1; }; }
-chk "AppId 고정(업그레이드를 동일 제품으로 인식)"      'AppId={{32456C4A-71D7-46B8-A59C-60B51DD21734}'
-chk "설치 경로=LOCALAPPDATA\Programs(업데이터 robocopy 전제)" 'DefaultDirName={localappdata}\Programs\'
-chk "경로 선택 페이지 비활성(경로 이탈 방지)"          'DisableDirPage=yes'
-chk "관리자 권한 불필요(UAC 없음)"                    'PrivilegesRequired=lowest'
-chk "[Files] dist 트리 통째 복사"                     'Source: "{#SrcDir}\*"; DestDir: "{app}"'
-chk "[Files] 하위폴더 포함(bridge32/data)"             'recursesubdirs'
-chk "[UninstallDelete] {app} 정리"                    'Type: filesandordirs; Name: "{app}"'
+while IFS='|' read -r label pat; do
+  [ -z "$label" ] && continue
+  if grep -qF "$pat" "$ISS"; then echo "  OK  $label"; else echo "  FAIL $label"; fail=1; fi
+done <<'CHECKS'
+AppId 고정(업그레이드를 동일 제품으로 인식)|AppId={{32456C4A-71D7-46B8-A59C-60B51DD21734}
+설치 경로=LOCALAPPDATA\Programs(업데이터 robocopy 전제)|DefaultDirName={localappdata}\Programs\
+경로 선택 페이지 비활성(경로 이탈 방지)|DisableDirPage=yes
+관리자 권한 불필요(UAC 없음)|PrivilegesRequired=lowest
+[Files] dist 트리 통째 복사|Source: "{#SrcDir}\*"; DestDir: "{app}"
+[Files] 하위폴더 포함(bridge32/data)|recursesubdirs
+[UninstallDelete] {app} 정리|Type: filesandordirs; Name: "{app}"
+CHECKS
 head -c 3 "$ISS" | od -An -tx1 | grep -q "ef bb bf" \
   && echo "  OK  UTF-8 BOM" || { echo "  FAIL UTF-8 BOM(Inno가 ANSI로 읽어 한글 깨짐)"; fail=1; }
 exit $fail
 ```
 
 하나라도 FAIL이면 **릴리스를 멈추고 보고**한다. 이 여덟 줄이 옛 설치 검증이 실제로
-지키던 것 전부다 — 나머지는 `verify()`가 이미 본다.
+지키던 것 전부다 — 나머지는 `verify()`가 이미 본다. 출력이 `OK 8줄`이 아니거나 라벨이
+비어 보이면 **검사 자체가 망가진 것**이니, 통과로 읽지 말고 스크립트를 먼저 고친다.
 
 ⚠ **되살리자는 판단이 들면 먼저 이 문단을 읽을 것.** "한 번쯤 실제로 깔아 보는 게
 안전하지 않나"는 직관은 위 두 근거(구조적 미러 + 파괴 비용)를 이기지 못한다.
