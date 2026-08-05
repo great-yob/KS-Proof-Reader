@@ -264,7 +264,22 @@ def find_reversed_quotes(text: str) -> list:
         끝나는 '…했다.’ 는 허용).
       · 인용 내용은 1~60자, 탭 없음(탭이 든 원문은 본문 탐색이 불안정), 내용
         글자를 하나 이상 포함.
-    바꾸는 것은 **따옴표 두 글자의 방향뿐**이고 안쪽 글자는 건드리지 않는다.
+    바꾸는 것은 **따옴표 두 글자의 방향**과, 아래 조사 붙임의 **공백 하나**뿐이다 —
+    안쪽 글자는 건드리지 않는다.
+
+    ⚠⚠ **닫는 따옴표 뒤 조사는 이 카드가 함께 붙인다**(2026-08-05 사용자 보고):
+    `’백인계획/천인계획/만인계획‘ 을` 처럼 방향 오류 + 조사 띄움이 겹친 자리에서
+    조사 붙임이 통째로 **미탐**됐다. 그 일을 하던 `spacing_rules.find_quote_spacing`은
+    **글자 모양**(‘…’)으로 짝을 찾으므로 뒤집힌 짝을 아예 보지 못한다.
+    ★ 그렇다고 그쪽을 방향 인식으로 고치면 **같은 자리에 카드가 둘** 생기고, 겹침
+    해소(`_resolve_overlaps`: 최장 승)가 둘 중 하나를 조용히 가린다 — 방금 그
+    증상으로 방향 카드가 사라진 전례가 있다(morph.find_symbol_noun_spacing 건).
+    → **한 자리는 한 카드**가 원칙이므로, 방향 오류 자리의 조사 붙임은 이 규칙이
+    떠맡아 `’…‘ 을` → `‘…’을` 한 장으로 낸다.
+    ⚠ 공백은 **정확히 한 칸**만 흡수한다(카드 원문이 브리지 RepeatFind의 리터럴
+    탐색 대상이라, 여러 칸·탭을 넣으면 본문에서 못 찾는 카드가 된다).
+    ⚠ **여는 따옴표 앞 띄움**(`낱말’인용‘` → `낱말 ’인용‘`)은 다루지 않는다 —
+    실측 16짝 중 0건이고, 앵커를 앞 낱말까지 늘리면 다른 규칙과 겹칠 위험만 커진다.
     """
     out, seen = [], set()
     for line in text.split("\n"):
@@ -290,14 +305,27 @@ def find_reversed_quotes(text: str) -> list:
             if inner[-1].isspace():
                 continue                              # 닫는 따옴표 앞 공백 → 스킵
             opener, closer = _CORRECT_PAIR[_Q_CLASS[och]]
-            original = line[oi:ci + 1]
-            corrected = opener + inner + closer
+            # 닫는 따옴표 + 공백 한 칸 + 조사 → 조사를 붙인다(위 ⚠⚠ 참조).
+            rest, josa, tail = line[ci + 1:], "", ""
+            if rest.startswith(" ") and not rest[1:2].isspace():
+                jm = _JOSA_RE.match(rest[1:])
+                if jm:
+                    josa = jm.group(1)
+                    tail = " " + josa
+            original = line[oi:ci + 1] + tail
+            corrected = opener + inner + closer + josa
             if original == corrected or original in seen:
                 continue
+            # 불변식 — 따옴표와 공백을 뺀 알맹이가 같아야 한다(글자 변경 0).
+            _kernel = lambda s: "".join(c for c in s if c not in _ALL_QUOTES and c != " ")
+            if _kernel(original) != _kernel(corrected):
+                continue
             seen.add(original)
-            out.append((original, corrected,
-                        f"따옴표 방향 오류 — 여는 자리에 닫는 따옴표({och}), 닫는 자리에 "
-                        f"여는 따옴표({line[ci]})가 쓰임 → {opener}…{closer} 로 바로잡음"))
+            why = (f"따옴표 방향 오류 — 여는 자리에 닫는 따옴표({och}), 닫는 자리에 "
+                   f"여는 따옴표({line[ci]})가 쓰임 → {opener}…{closer} 로 바로잡음")
+            if josa:
+                why += f" (닫는 따옴표 뒤 조사 '{josa}'도 붙임)"
+            out.append((original, corrected, why))
     return out
 
 
@@ -369,6 +397,8 @@ if __name__ == "__main__":
         # 방향 오류 — 여닫이를 뒤집어 쓴 원고(2026-08-05 실보고)
         "중국의 ’성과‘가 아니라 ’메커니즘‘을 보는 접근이 필요함",
         "그는 ”준비되면“ 이라고 말했다.",
+        "혁신: ’백인계획/천인계획/만인계획‘ 을 통한 영입",   # 방향 + 조사 붙임 한 카드
+        "’표준‘ 을지로에서 만났다.",                        # '을지로'는 조사 아님 → 붙임 없음
         "그는 ‘성과’가 아니라 ‘메커니즘’을 보았다.",   # 방향 정상 → 무변경
         "투자금 '10억' 유치에 성공했다.",             # 연도 약물 아님 → 고아 카드 없음
         "'19년 대비 '20년 실적",                     # 연도 약물 → 무변경
