@@ -948,6 +948,10 @@ def _spaceable_after_symbol(tok) -> bool:
     return False
 
 
+# 굽은따옴표 방향 뒤집기 — 길이가 보존되므로 형태소 오프셋이 그대로 대응한다.
+_FLIP_CURLY = str.maketrans({"‘": "’", "’": "‘", "“": "”", "”": "“"})
+
+
 def find_symbol_noun_spacing(text: str) -> list:
     """닫는 기호 바로 뒤에 **명사(체언)** 가 붙어 있으면 띄어쓰기 후보로 만든다.
 
@@ -1006,6 +1010,31 @@ def find_symbol_noun_spacing(text: str) -> list:
                     pch = line[qpos - 1] if qpos > 0 else ""
                     if not (pch and (_CONTENT_CH_RE.match(pch) or pch in _CLOSE_SYM)):
                         continue
+                    # ⚠⚠ **방향 오류 자리에서는 kiwi의 품사 판정을 그대로 믿을 수 없다**
+                    #   (2026-08-05 사용자 보고). 원고가 따옴표를 뒤집어 쓰면(’…‘) 닫는
+                    #   자리 글자가 **여는 모양(‘)** 이라 kiwi가 그것을 SSO로 읽고, 뒤따르는
+                    #   글자를 '인용 시작'으로 보아 **조사를 명사로 강제 해석**한다:
+                    #     '’과학강국‘으로의' → … ‘/SSO + **으로의/NNP**   ← 거짓 체언
+                    #     '‘과학강국’으로의' → … ’/SSC + 으로/JKB + 의/JKG ← 올바른 조사
+                    #   그래서 '기호 뒤 명사 띄어쓰기' 카드가 조사 앞에 나갔고(사용자 지적:
+                    #   "'으로의'는 명사가 아닌 조사"), 그 카드가 원문이 더 길다는 이유로
+                    #   겹침 해소(_resolve_overlaps: 최장 승)에서 **따옴표 방향 오류 카드를
+                    #   가려 버렸다** — 정작 고쳐야 할 카드가 사라진 것이 보고의 본질이다.
+                    #   → 방향 오류 자리면 **방향을 바로잡은 형태로 다시 분석**해, 그때도
+                    #   체언이면 그대로 진행하고 아니면 스킵한다. 실측(실파일 방향 오류 21곳):
+                    #   이 자리에서 나온 카드 1건이 전부 거짓이었고 이 검사로 소멸,
+                    #   진짜 체언 사례('’표준‘규칙을')는 보존된다.
+                    #   ⚠ 방향이 **맞는** 닫는 따옴표·괄호에서는 이 오독이 재현되지 않는다
+                    #   (‘표준’으로의·(센터)으로의·[붙임]으로의 전부 조사로 정상 분석) —
+                    #   그래서 조사 목록을 새로 두지 않고 이 자리에만 국소로 검사한다.
+                    if t.form in ("‘", "“"):
+                        try:
+                            ftoks = kiwi.analyze(w.translate(_FLIP_CURLY))[0][0]
+                        except Exception:
+                            continue
+                        if not any(ft.start == nx.start and _spaceable_after_symbol(ft)
+                                   for ft in ftoks):
+                            continue
                 else:
                     # 닫는 괄호 라벨/약어 예외((주)·(사)·(1) 등 짝 안 내용 1글자)
                     if t.form in ")]}）］｝":
