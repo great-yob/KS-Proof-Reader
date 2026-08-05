@@ -79,6 +79,16 @@ def main():
         mode = "light"
     apply_theme(app, mode)
 
+    # ── 사내 계정 실행 게이트 ─────────────────────────────────────────
+    # 퍼블릭 릴리스라 앱은 누구나 받을 수 있는 반면 AI·사전 API는 무료 한도(RPD)를
+    #   전 사용자가 공유한다. 사내 계정이 확인되기 전에는 **MainWindow를 만들지 않는다**
+    #   — 창을 띄운 뒤 기능만 잠그면 잠금 해제 경로가 UI 여기저기로 번진다.
+    #   저장된 세션이 있으면 입력 없이 통과하고, 서버에 못 닿으면 core.auth의
+    #   오프라인 유예(7일)가 통과를 결정한다. 사용자가 종료를 택하면 창 없이 끝난다.
+    from ui.widgets.login_dialog import require_login
+    if require_login() is None:
+        sys.exit(0)
+
     from ui.main_window import MainWindow
     window = MainWindow()
     window.show()

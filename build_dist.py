@@ -67,6 +67,9 @@ _EXCLUDE_PATTERNS = (
     "key.txt", "config.ini", "교정샘플", "korean-ambiguity-data",
     "api_cache.db", "event_queue.db", "__pycache__", ".venv",
     "stdict.db.bak", "userdict/snapshot.json",
+    # 빌드 PC에 로그인한 사내 세션(refresh_token, DPAPI 암호화) — 배포본에 절대 금지.
+    #   stage_data가 *.db만 복사해 지금은 걸리지 않지만, 규칙으로 못 박아 둔다.
+    ".ks_session",
 )
 
 

@@ -106,9 +106,9 @@ class MainWindow(QMainWindow):
         self._wire()
         self._show_phase("setup")
 
-        # 공유 용어 뇌 — 로그인은 **선택**. 앱 시작 시 저장된 사내 세션을 백그라운드 복원하고,
-        #   로그인돼 있으면 동기화·큐레이션을 활성화한다(미로그인 시 교정 기능엔 영향 없음).
-        self._auth_workers = []
+        # 사내 계정 — 로그인은 **실행 게이트**라 여기 도달했다는 건 이미 통과했다는 뜻이다
+        #   (main.py require_login). 여기서는 세션을 헤더에 반영하고 공유 용어 뇌
+        #   동기화·큐레이션을 활성화하기만 한다.
         self._curator_panel = None
         self._login_dialog = None
         self._start_session_restore()
@@ -692,28 +692,38 @@ class MainWindow(QMainWindow):
         self._sync_workers = [w for w in self._sync_workers if w.isRunning()]
 
     def _start_session_restore(self):
-        """저장된 사내 세션(DPAPI)을 백그라운드 복원. 성공 시 로그인 상태·동기화 활성."""
-        try:
-            from ui.workers.login_worker import RestoreWorker
-            w = RestoreWorker(parent=self)
-            w.done.connect(self._on_session_restored)
-            self._track_auth_worker(w)
-            w.start()
-        except Exception:
-            pass
+        """세션 상태를 헤더에 반영하고, 로그인 상태면 동기화를 건다.
 
-    def _on_session_restored(self, user):
+        ⚠ 실행 게이트(main.py `require_login`)가 창을 만들기 **전에** 이미 세션을
+        복원·검증했다 — 여기서 다시 restore()를 부르면 refresh_token을 한 번 더
+        회전시키는 불필요한 왕복이다. 그래서 세션이 있으면 상태 반영만 하고,
+        없을 때(개발 우회 KS_SKIP_LOGIN)만 조용히 넘어간다.
+        """
         try:
+            from core import auth
+            user = auth.current_user()
             self._apply_auth_state(user)
-            if user:
+            if not user:
+                return
+            self.activity.log(
+                f"  [계정] {user.get('name') or user.get('email')} 로그인됨"
+                + ("  (관리자)" if user.get("role") == "admin" else ""))
+            if auth.is_offline_session():
+                # 오프라인 유예 통과 — 동기화·큐레이션은 자동 no-op(토큰 없음).
                 self.activity.log(
-                    f"  [계정] 세션 복원 — {user.get('name') or user.get('email')}")
-                self._start_sync("sync")   # 보류 이벤트 push + 최신 스냅샷 pull
+                    f"  [계정] 오프라인 모드 — 공유 용어 사전 동기화는 다음 접속 시 "
+                    f"(유예 {auth.grace_days_left()}일 남음)")
+                return
+            self._start_sync("sync")   # 보류 이벤트 push + 최신 스냅샷 pull
         except Exception:
-            self._log_auth_error("세션 복원")
+            self._log_auth_error("세션 확인")
 
     def _open_login_dialog(self):
-        """사내 계정 로그인 다이얼로그(선택). 성공 시 동기화·큐레이션 활성."""
+        """사내 계정 로그인 다이얼로그. 성공 시 동기화·큐레이션 활성.
+
+        게이트를 통과해 들어온 상태에서는 헤더 버튼이 '로그아웃'이므로, 이 경로는
+        개발 우회(KS_SKIP_LOGIN)로 무세션 실행 중일 때만 열린다.
+        """
         try:
             from ui.widgets.login_dialog import LoginDialog
             # 모달 수명 동안 강한 참조 유지 — 워커 스레드가 다이얼로그 GC와 함께
@@ -736,6 +746,10 @@ class MainWindow(QMainWindow):
             self._log_auth_error("로그인 후 처리")
 
     def _logout(self):
+        """로그아웃 후 **다시 게이트를 세운다** — 로그인이 앱 사용 조건이므로 무세션
+        상태로 창을 남겨 둘 수 없다. 사용자가 로그인 창에서 종료를 택하면 앱을 닫는다
+        (계정 전환은 여기서 그대로 가능).
+        """
         try:
             from core import auth
             auth.logout()
@@ -749,6 +763,21 @@ class MainWindow(QMainWindow):
             self.activity.log("  [계정] 로그아웃")
         except Exception:
             self._log_auth_error("로그아웃")
+            return
+        try:
+            from ui.widgets.login_dialog import require_login
+            user = require_login(self)
+            if user is None:
+                self.close()
+                return
+            self._apply_auth_state(auth.current_user())
+            self.activity.log(
+                f"  [계정] 로그인 — {user.get('name') or user.get('email')}"
+                + ("  (관리자)" if user.get("role") == "admin" else ""))
+            self._start_sync("sync")
+        except Exception:
+            self._log_auth_error("재로그인")
+            self.close()
 
     def _log_auth_error(self, where: str):
         """인증 관련 슬롯의 예외를 로그로 흡수 — 선택적 로그인이 앱을 종료시키지 않게 한다."""
@@ -762,14 +791,6 @@ class MainWindow(QMainWindow):
         """헤더 로그인 표시 + 관리자면 큐레이션 버튼 노출."""
         self.header.set_auth_state(user)
         self.header.set_curator_visible(bool(user) and user.get("role") == "admin")
-
-    def _track_auth_worker(self, w):
-        self._auth_workers = [x for x in getattr(self, "_auth_workers", []) if x.isRunning()]
-        self._auth_workers.append(w)
-        w.finished.connect(self._prune_auth_workers)
-
-    def _prune_auth_workers(self):
-        self._auth_workers = [x for x in self._auth_workers if x.isRunning()]
 
     def _open_curator_panel(self):
         """사내 용어 큐레이션 패널(관리자) 열기."""
@@ -1166,8 +1187,8 @@ class MainWindow(QMainWindow):
                 w.terminate()
                 w.wait(500)
             self._update_worker = None
-        # 동기화·인증 워커는 단명 — 잠시 대기 후 남아있으면 강제 종료(네트워크 블로킹 회피).
-        for attr in ("_sync_workers", "_auth_workers"):
+        # 동기화 워커는 단명 — 잠시 대기 후 남아있으면 강제 종료(네트워크 블로킹 회피).
+        for attr in ("_sync_workers",):
             for w in getattr(self, attr, []):
                 try:
                     if w.isRunning():
