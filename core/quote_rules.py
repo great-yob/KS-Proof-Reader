@@ -321,8 +321,7 @@ def find_reversed_quotes(text: str) -> list:
             if _kernel(original) != _kernel(corrected):
                 continue
             seen.add(original)
-            why = (f"따옴표 방향 오류 — 여는 자리에 닫는 따옴표({och}), 닫는 자리에 "
-                   f"여는 따옴표({line[ci]})가 쓰임 → {opener}…{closer} 로 바로잡음")
+            why = (f"따옴표 방향 오류 수정")
             if josa:
                 why += f" (닫는 따옴표 뒤 조사 '{josa}'도 붙임)"
             out.append((original, corrected, why))
