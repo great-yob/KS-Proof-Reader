@@ -1373,21 +1373,33 @@ class ResultPanel(QWidget):
         failed = r.get("failed", 0)
         consumed = r.get("consumed", 0)
         flagged = r.get("flagged", 0)
-        review_mode = flagged > 0 and applied == 0
+        # ★결과물 '정오표만'(사용자가 설정에서 고른 값)과, 그냥 고칠 게 없었던 실행은
+        #   다르다. 전자는 수락한 교정이 있고 사람이 반영해야 하므로 그 수치를 보여야
+        #   하고, 후자는 검수 건수만 있다. ⚠ 두 경우 모두 `applied`는 0이므로 옛
+        #   휴리스틱(flagged>0 and applied==0)만으로는 가를 수 없다.
+        errata_only = bool(r.get("errata_only"))
+        to_apply = r.get("to_apply", 0)
+        to_apply_occ = r.get("to_apply_occ", 0)
+        review_mode = errata_only or (flagged > 0 and applied == 0)
 
         cors = self._corrections or []
         n_ai = sum(1 for c in cors if str(c.get("source", "")).startswith("ai_"))
         n_rule = len(cors) - n_ai
-        n_prop = len(cors) if cors else (flagged if review_mode
-                                         else applied + failed + consumed)
-        rate = (applied / n_prop * 100.0) if (n_prop and not review_mode) else 0.0
+        n_prop = len(cors) if cors else (
+            (to_apply + flagged) if errata_only else
+            flagged if review_mode else applied + failed + consumed)
+        # 게이지 비율 — 교정본 모드는 '적용률', 정오표만 모드는 '수락률'(둘 다 제안 대비).
+        done = to_apply if errata_only else applied
+        rate = (done / n_prop * 100.0) if (n_prop and (errata_only or not review_mode)) else 0.0
 
-        self._col.addWidget(self._build_header(review_mode, flagged))
+        self._col.addWidget(self._build_header(review_mode, flagged,
+                                               errata_only, to_apply))
         self._col.addWidget(self._build_pipeline(
             review_mode, applied, occ, failed, consumed, flagged,
-            n_prop, n_rule, n_ai, rate))
+            n_prop, n_rule, n_ai, rate, errata_only, to_apply, to_apply_occ))
         self._col.addWidget(self._build_charts(
-            review_mode, applied, flagged, n_prop, n_rule, n_ai, rate, cors))
+            review_mode, applied, flagged, n_prop, n_rule, n_ai, rate, cors,
+            errata_only, to_apply))
 
         bottom = QHBoxLayout()
         bottom.setSpacing(22)
@@ -1441,7 +1453,8 @@ class ResultPanel(QWidget):
         return riser
 
     # ── 헤더 ─────────────────────────────────────
-    def _build_header(self, review_mode, flagged) -> QWidget:
+    def _build_header(self, review_mode, flagged,
+                      errata_only=False, to_apply=0) -> QWidget:
         pal = current_palette()
         w = _twidget()
         row = QHBoxLayout(w)
@@ -1471,7 +1484,9 @@ class ResultPanel(QWidget):
         else:
             saved_txt = ""
         saved = f" · 수작업 대비 {saved_txt} 절약" if saved_txt else ""
-        if review_mode:
+        if errata_only:
+            detail = f"정오표 생성 완료 · 반영 필요 {to_apply}건 (한글 파일 미수정)"
+        elif review_mode:
             detail = f"검수 완료 · 정오표 {flagged}건 기록 (HWP 미수정)"
         else:
             detail = f"완료"
@@ -1555,7 +1570,8 @@ class ResultPanel(QWidget):
         return c
 
     def _build_pipeline(self, review_mode, applied, occ, failed, consumed,
-                        flagged, n_prop, n_rule, n_ai, rate) -> QWidget:
+                        flagged, n_prop, n_rule, n_ai, rate,
+                        errata_only=False, to_apply=0, to_apply_occ=0) -> QWidget:
         pal = current_palette()
         w = _twidget()
         row = QHBoxLayout(w)
@@ -1595,8 +1611,20 @@ class ResultPanel(QWidget):
         row.addWidget(self._rise(f2, self._T_CARD2), 1)
         row.addWidget(self._connector(self._T_CARD3))
 
-        # 03 적용(또는 검수) — 히어로 숫자(강조색 + accent/시안 글로우 글래스)
-        if review_mode:
+        # 03 적용(또는 정오표/검수) — 히어로 숫자(강조색 + accent/시안 글로우 글래스)
+        if errata_only:
+            # ⚠ '적용'이라 쓰지 않는다 — 이 모드는 문서를 고치지 않았고, 반영은
+            #   사람이 정오표를 보고 한다. 숫자는 '반영해야 할 건수'다.
+            f3, v3 = self._stage_card("03", "정오표", "한글 파일 미수정 · 수동 반영",
+                                      tint="accent", shine_delay=self._T_CARD3 + 560)
+            v3.addLayout(self._unit_row(
+                self._num(to_apply, px=58, color=pal["accent"],
+                          delay=self._T_CARD3 + 380, duration=1700), "건", unit_px=18))
+            meta = f"{to_apply_occ:,}곳 반영 필요"
+            if flagged:
+                meta += f"  |  검수 {flagged:,}건"
+            self._card_meta(v3, meta)
+        elif review_mode:
             f3, v3 = self._stage_card("03", "검수", "정오표 기록 · HWP 미수정",
                                       tint="accent", shine_delay=self._T_CARD3 + 560)
             v3.addLayout(self._unit_row(
@@ -1645,7 +1673,8 @@ class ResultPanel(QWidget):
 
     # ── 상세 분석(차트) ───────────────────────────
     def _build_charts(self, review_mode, applied, flagged, n_prop,
-                      n_rule, n_ai, rate, cors) -> QWidget:
+                      n_rule, n_ai, rate, cors,
+                      errata_only=False, to_apply=0) -> QWidget:
         w = _twidget()
         col = QVBoxLayout(w)
         col.setContentsMargins(0, 0, 0, 0)
@@ -1710,12 +1739,22 @@ class ResultPanel(QWidget):
             l1.addStretch()
             entries.append((self._rise(fr1, self._T_CH2), self._T_CH2))
 
-        # 3) 적용률 게이지
-        fr2, l2 = self._section("교정 적용률", shine_delay=self._T_CH3 + 560,
-                                hero_title=True)
+        # 3) 적용률(정오표만 모드에서는 수락률) 게이지
+        #    ⚠ 제목까지 바꾼다 — 문서를 고치지 않았는데 '적용률'이라 쓰면 그 비율이
+        #      무엇의 비율인지 거짓이 된다. 이 모드의 분모/분자는 제안 대비 수락이다.
+        fr2, l2 = self._section("교정 수락률" if errata_only else "교정 적용률",
+                                shine_delay=self._T_CH3 + 560, hero_title=True)
         fr2.setMinimumWidth(_CHART_CARD_MIN_W)
         # 외부 캡션 라벨 대신 제안 소스 도넛과 동일한 항상-표출 툴팁 버블로 대체.
-        if review_mode:
+        if errata_only:
+            rejected = max(0, n_prop - to_apply)
+            gauge = RadialGauge(rate / 100.0,
+                                bubble_labels=(f"반영 필요 : {to_apply:,}건",
+                                               f"거절 : {rejected:,}건"),
+                                fill_color=current_palette()["accent"],
+                                reject_color=_ACCEPT_COLOR,
+                                canvas_w=232, canvas_h=262)
+        elif review_mode:
             gauge = RadialGauge(1.0, caption="검수 완료", center_text="검수",
                                 bubble_label=f"검수 {flagged:,}건", canvas_w=232, canvas_h=262)
         else:

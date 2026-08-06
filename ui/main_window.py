@@ -647,8 +647,13 @@ class MainWindow(QMainWindow):
         self._capture_correction_events()
 
         self._cleanup_worker("_apply_worker")
+        # 등장(occurrence)별 결정을 함께 넘긴다 — 정오표가 '등장 1곳 = 1행'이라
+        #   skip_occurrences만으로는 복원할 수 없는 구분(사용자 거절 ↔ 애초에 등장이
+        #   아닌 자리)이 필요하다. ReviewPanel.get_occurrence_rows 주석 참조.
         self._apply_worker = ApplyWorker(self._file_path, self._corrections,
-                                         self._options, parent=self)
+                                         self._options,
+                                         occ_rows=self.review_panel.get_occurrence_rows(),
+                                         parent=self)
         self._apply_worker.progress.connect(self._on_worker_progress)
         self._apply_worker.log_message.connect(self.activity.log)
         self._apply_worker.finished.connect(self._on_apply_done)
@@ -830,8 +835,21 @@ class MainWindow(QMainWindow):
             char_count=char_count,
             page_count=getattr(self, "_page_count", None),
             file_name=os.path.basename(self._file_path) if self._file_path else "")
-        if flagged > 0 and applied == 0:
-            # 사전 전용 검수 모드 — HWP 미수정, 정오표만
+        if result.get("errata_only"):
+            # 결과물 '정오표만' — 한글 파일을 열되 고치지 않았다(쪽 번호 수집만).
+            #   ⚠ 여기서 '적용'이라는 말을 쓰면 안 된다. 반영은 사람이 한다.
+            n = result.get("to_apply", 0)
+            occ_n = result.get("to_apply_occ", 0)
+            occ_part = f" · 본문 {occ_n}곳" if occ_n else ""
+            flag_part = f" · 검수 {flagged}건" if flagged else ""
+            # ⚠ ' — '를 쓰지 말 것. 화면 로그는 34자를 넘으면 **' — ' 앞에서 자른다**
+            #   (activity_panel._condense) — 그러면 '정오표 생성 완료'만 남고 수치가
+            #   통째로 사라진다(실측 확인). 규약: 수치를 앞에, 구분은 ' · '로.
+            self.activity.log(
+                f"✓ 정오표 생성 완료 · 반영 필요 {n}건{occ_part}{flag_part} (한글 파일 미수정)")
+            self.rail.set_step_result("done", f"정오표 : {n}건")
+        elif flagged > 0 and applied == 0:
+            # 적용할 교정이 없어 치환이 0건이었던 실행(옵션이 아니라 상태).
             self.activity.log(f"✓ 검수 완료 — 검수 {flagged}건 정오표 기록 (HWP 미수정)")
             self.rail.set_step_result("done", f"검수 : {flagged}건")
         else:
@@ -851,7 +869,11 @@ class MainWindow(QMainWindow):
             self._on_generate_errata_requested()
 
     def _on_footer_folder_clicked(self):
-        self._open_path_folder(self._result.get("hwp_path", ""))
+        # '정오표만' 결과물에는 교정본이 없다 — 그때는 정오표가 있는 폴더를 연다.
+        #   버튼 문구가 '폴더 열기'라 어느 쪽이든 어긋나지 않는다.
+        path = (self._result.get("hwp_path", "")
+                or self._result.get("errata_path", ""))
+        self._open_path_folder(path)
 
     def _open_path_folder(self, path: str):
         if not path or not os.path.exists(path):
@@ -866,26 +888,29 @@ class MainWindow(QMainWindow):
         try:
             from output.errata_generator import generate_errata
             mode = "polish" if self._options.get("scope_polish") else "typo"
-            # ApplyWorker가 동봉한, 실제 적용 결과(applied/error/partial/consumed)가
-            #   병합된 행 데이터를 그대로 재사용한다 — 수동 정오표도 진실을 기록.
-            full_detail = self._result.get("errata_detail")
-            if not full_detail:
-                # 폴백(적용 결과 데이터 부재) — 결정만으로 구성(적용 여부는 미확인 상태)
-                full_detail = [
+            # ApplyWorker가 동봉한, 실제 적용 결과와 **쪽 번호**가 병합된 등장 단위 행을
+            #   그대로 재사용한다 — 수동 정오표도 같은 진실을 기록한다.
+            rows = self._result.get("errata_rows")
+            if not rows:
+                # 폴백(적용 결과 데이터 부재) — 결정만으로 구성한다. 쪽 번호는 문서를
+                #   다시 열어야 알 수 있으므로 비운다('—'로 표시될 뿐 행은 남는다).
+                rows = [
                     {
+                        "page":      None,
                         "original":  c["original"],
                         "corrected": c["corrected"],
                         "reason":    c.get("reason", ""),
+                        "category":  c.get("category", ""),
                         "source":    c.get("source", "dict"),
                         "color":     c.get("color", 0),
-                        "decision":  "accepted" if c.get("status") == "accepted" else "rejected",
-                        "applied":   c.get("status") == "accepted",
-                        "error":     "",
+                        "outcome":   ("applied" if c.get("status") == "accepted"
+                                      else "rejected"),
+                        "note":      "",
                     }
                     for c in self._corrections
                 ]
             errata_path = generate_errata(
-                detail   = full_detail,
+                rows     = rows,
                 hwp_path = self._file_path,
                 options  = {
                     "used_ai":         self._options.get("use_ai", True),

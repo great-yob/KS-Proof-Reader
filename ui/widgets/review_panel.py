@@ -965,6 +965,38 @@ class ReviewPanel(QWidget):
     def get_corrections(self) -> list:
         return self._corrections
 
+    def get_occurrence_rows(self) -> list:
+        """등장(occurrence) 1곳 = 1행짜리 결정 목록 — 정오표가 등장 단위로 쓰인다.
+
+        ⚠ `Correction.skip_occurrences`만으로는 등장별 진실을 복원할 수 없다. 거기엔
+        **사용자가 거절한 등장**과 **애초에 등장이 아닌 자리**(`excluded` — '성장단계'
+        카드가 '성장단계별'을 부분문자열로 잡은 경우, _mark_stem_boundary_skips 참조)가
+        섞여 들어간다. 정오표에 후자를 '거절'로 적으면 사용자가 고르지도 않은 결정이
+        문서로 남는다. 그래서 상태를 **여기서** 그대로 내보낸다.
+
+        Returns:
+            [{"ci": 교정 인덱스, "occ": 그 교정 안에서의 등장 인덱스(0-based, 문서 순
+              = 브리지 RepeatFind 순 = skip_occurrences와 같은 좌표계),
+              "status": "accepted"|"rejected"|"pending",
+              "excluded": bool,   # 등장이 아님 → 정오표에서 제외할 것
+              "shadowed": bool,   # 더 긴 교정에 가려짐 → 그쪽 행이 대표하므로 제외할 것
+              "found": bool}, …]  # 본문에서 위치를 못 찾은 합성 항목이면 False
+        """
+        rows, seen = [], {}
+        for o in self._occ:
+            ci = o["ci"]
+            k = seen.get(ci, 0)
+            seen[ci] = k + 1
+            rows.append({
+                "ci":       ci,
+                "occ":      k,
+                "status":   o.get("status", "pending"),
+                "excluded": bool(o.get("excluded")),
+                "shadowed": bool(o.get("shadowed")),
+                "found":    o.get("pos") is not None,
+            })
+        return rows
+
     def _sort_by_position(self, corrections):
         if not self._full_text:
             return list(corrections)

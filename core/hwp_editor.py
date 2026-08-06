@@ -288,6 +288,40 @@ class HwpEditor:
             raise RuntimeError(f"문서 대조 검증 실패: {result.get('error')}")
         return result.get("found", {})
 
+    # 쪽 번호 수집의 전체 찾기 예산(등장 수). 등장 1곳당 9ms 실측(2026-08-05, 한/글
+    #   2010 · 05.hwp 82등장 0.70초)이라 6,000이면 ~55초. 대부분 원고는 등장 수천 곳
+    #   이하라 예산에 닿지 않는다.
+    _LOCATE_BUDGET = 6000
+    # …그래도 최악을 시간으로 한 번 더 묶는다. 이 단계는 정오표에 좌표를 넣기 위한
+    #   부가 작업이라, 사용자를 기다리게 할 자격이 이만큼뿐이다. 소진되면 남은 항목의
+    #   쪽 칸만 비고 정오표는 그대로 나온다.
+    _LOCATE_SECONDS = 45.0
+
+    def locate_originals(self, originals: list, budget: int = None) -> dict:
+        """각 원문의 **등장별 쪽 번호** 목록 (치환 없음 — 문서 무변경).
+
+        정오표를 '등장 1곳 = 1행'으로 쓰기 위한 것. ⚠ 반드시 `apply_corrections`
+        **이전에 한 번에** 호출할 것 — 치환이 진행되면 뒤 페이지가 밀려 앞뒤 항목의
+        쪽이 서로 다른 장면을 가리키게 된다(브리지 locate 주석 참조).
+
+        Returns:
+            dict: {original: [쪽|None, …]}. 못 찾은 원문은 키 자체가 없다.
+                  브리지 실패 시 예외 대신 빈 dict(쪽 칸만 비는 안전한 실패).
+        """
+        if not originals:
+            return {}
+        result = self._send_cmd({
+            "cmd": "locate",
+            "originals": list(originals),
+            "budget": int(budget or self._LOCATE_BUDGET),
+            "time_budget": self._LOCATE_SECONDS,
+        })
+        if not result.get("ok"):
+            if self.logger:
+                self.logger(f"  [쪽번호] 수집 실패: {result.get('error')} — 쪽 표시 생략")
+            return {}
+        return result.get("pages", {})
+
     def save_as(self, output_path: str):
         result = self._send_cmd({
             "cmd": "save_as",

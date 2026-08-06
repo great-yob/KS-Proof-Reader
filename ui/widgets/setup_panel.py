@@ -8,10 +8,10 @@ ui/widgets/setup_panel.py — 설정 패널 (업로드 + 옵션 통합)
 
 import os
 
-from PySide6.QtCore import Qt, Signal, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
-    QFrame, QScrollArea, QFileDialog, QGraphicsOpacityEffect
+    QFrame, QScrollArea, QFileDialog, QSizePolicy
 )
 
 from ui.widgets.components import (
@@ -179,6 +179,18 @@ class SetupPanel(QWidget):
         self._gen_errata   = True
         # AI 분석 제외 — Gemini 호출 없이 사전·규칙 파이프라인만 수행(오프라인 가능).
         self._no_ai        = False
+        # ★결과물 축 — '한글 파일을 고칠 것인가'(2026-08-05 사용자 결정).
+        #   False = 교정본 생성(현행: 본문 치환 + 빨강 표시 + _교정본 파일)
+        #   True  = 정오표만(한글 파일 무수정 — 진짜 '검수 모드')
+        #   ⚠ 이건 '교정 방식'(항목별 검토/자동 일괄)의 3번째 값이 **아니라 직교 축**이다.
+        #     정오표만 모드에서도 사용자는 검토 단계에서 수락/거절을 해야 한다 — 그래야
+        #     정오표가 [교정]/[거절]로 갈린다. 두 축을 한 묶음으로 만들면 검토 단계의
+        #     의미가 무너진다.
+        #   ⚠ 과거엔 이 모드가 **우연히** 도달하는 상태였다(수락한 치환이 0건일 때
+        #     apply_worker가 분기). 사용자가 의도할 수도 재현할 수도 없는 산출물이라
+        #     옵션으로 끌어올렸다. docs/proofreading-architecture.md Phase 2b의
+        #     'AI scope 0개 → 검수 모드' 진입 경로는 현행 UI에서 도달 불가능한 잔재다.
+        self._errata_only  = False
         # 사전 원문 스크리닝은 이제 항상 켜지는 기본 동작이다(옵트인 토글 폐지).
         self._build_ui()
 
@@ -207,9 +219,13 @@ class SetupPanel(QWidget):
         main_lay.setContentsMargins(27, 21, 27, 21)
         main_lay.setSpacing(40)
 
-        main_lay.addLayout(self._build_apply_mode_section(), 3)
-        main_lay.addLayout(self._build_scope_section(), 2)
-        main_lay.addLayout(self._build_extra_section(), 1)
+        # 네 섹션 모두 **가로 2단**이라 세로로는 내용만큼만 차지하면 된다.
+        #   ⚠ 여기에 stretch를 주면 남는 세로 공간이 카드 안으로 배분돼 제목과 설명
+        #     사이가 휑하게 벌어진다(실측). 남는 공간은 **맨 아래 stretch**가 먹는다.
+        for build in (self._build_apply_mode_section, self._build_scope_section,
+                      self._build_output_section, self._build_extra_section):
+            main_lay.addLayout(build(), 0)
+        main_lay.addStretch(1)
         
         col.addWidget(main_card)
 
@@ -226,18 +242,17 @@ class SetupPanel(QWidget):
         hdr.addStretch()
         lay.addLayout(hdr)
 
-        row = QVBoxLayout()
-        row.setSpacing(12)
+        row = self._pair_row()
 
         self._card_review = self._make_choice_card(
-            "list-checks", "항목별 검토", "권장",
-            "교정 제안을 하나씩 확인하고\n사용자가 직접 수락-거절을 선택합니다.", True)
+            "list-checks", "항목별 검토", None,
+            "교정 제안을 하나씩 확인하고\n사용자가 직접 수락 · 거절을 선택합니다.", True)
         self._card_auto = self._make_choice_card(
             "zap", "자동 일괄 적용",
-            "빠름" if AUTO_APPLY_ENABLED else "추후 예정",
-            "모든 교정 제안을 사용자의 검토 없이\n즉시 원본 파일에 적용합니다."
+            None if AUTO_APPLY_ENABLED else "추후 예정",
+            "사용자의 검토 없이 모든 교정 제안을 즉시 적용합니다."
             if AUTO_APPLY_ENABLED else
-            "교정 품질이 검토 없이 적용해도 될 수준에 이르면 오픈할 예정입니다",
+            "교정 품질의 최적화 이후\n오픈할 예정입니다.",
             False, locked=not AUTO_APPLY_ENABLED)
 
         self._card_review.mousePressEvent = lambda _e: self._select_apply_mode(False)
@@ -249,8 +264,25 @@ class SetupPanel(QWidget):
         lay.addLayout(row, 1)
         return lay
 
+    def _pair_row(self) -> QHBoxLayout:
+        """섹션 하나의 '가로 2단' 컨테이너 — 네 섹션이 같은 리듬을 갖게 한다.
+        ⚠ 두 칸에 **같은 stretch(1)** 를 줘야 폭이 반반이 된다. 카드 안 글자 길이가
+          달라도 칸 너비가 흔들리지 않게 하는 게 목적."""
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(12)
+        return row
+
     def _make_choice_card(self, icon, title, badge_text, desc, selected,
                           locked: bool = False) -> QFrame:
+        """선택 카드 — 세 섹션(교정 방식·교정 범위·결과물)이 모두 **둘 중 하나**다.
+
+        ⚠ 선택 표시는 **테두리·배경만**으로 한다(사용자 지정 2026-08-06 — 체크 아이콘
+          전면 삭제). 그래서 `_set_card_selected`는 QSS 속성만 갱신하면 되고, 카드에
+          붙어 있던 체크 위젯·불투명도 애니메이션은 없다.
+        ⚠ `badge_text`는 **잠금 표시('추후 예정') 전용**이다. 권장/기본/검수 같은
+          강조 칩은 제거했다 — 칩 없이도 선택 상태는 테두리로 읽힌다.
+        """
         card = QFrame()
         card.setProperty("role", "choice")
         card.setProperty("selected", "true" if selected else "false")
@@ -258,31 +290,25 @@ class SetupPanel(QWidget):
         #   손 모양 커서를 주지 않아 '누를 수 있는 것'으로 보이지 않게 한다.
         card.setProperty("locked", "true" if locked else "false")
         card.setCursor(Qt.ArrowCursor if locked else Qt.PointingHandCursor)
+        # 세로로는 내용 높이만 — 늘어나면 제목과 설명 사이가 벌어진다.
+        card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 
         cl = QVBoxLayout(card)
         cl.setContentsMargins(22, 16, 22, 16)
         cl.setSpacing(6)
 
-        # 아이콘 + 제목 + 배지를 한 줄에(세로 높이 축소), 선택 체크는 같은 줄 오른쪽 끝.
+        # 아이콘 + 제목 (+ 잠금 칩) 한 줄.
         trow = QHBoxLayout()
         trow.setSpacing(8)
         trow.addWidget(IconLabel(icon, role="text_muted" if locked else "accent", size=20))
         trow.addWidget(label(title, role="h2"))
-        tone = "primary" if badge_text == "권장" else ""
-        trow.addWidget(badge(badge_text, tone=tone))
+        if badge_text:
+            trow.addWidget(badge(badge_text))
         trow.addStretch()
-        check = IconLabel("circle-check", role="accent", size=18)
-        eff = QGraphicsOpacityEffect(check)
-        eff.setOpacity(1.0 if selected else 0.0)
-        check.setGraphicsEffect(eff)
-        trow.addWidget(check)
         cl.addLayout(trow)
 
         d = sub_label(desc, wrap=True)
         cl.addWidget(d)
-
-        card._check = check
-        card._check_eff = eff
         return card
 
     def _select_apply_mode(self, auto: bool):
@@ -294,34 +320,92 @@ class SetupPanel(QWidget):
         if self._auto_apply == auto:
             return
         self._auto_apply = auto
-        self._card_review.setProperty("selected", "false" if auto else "true")
-        self._card_auto.setProperty("selected", "true" if auto else "false")
-        
-        restyle(self._card_review)
-        restyle(self._card_auto)
-        
-        self._anim_group = QParallelAnimationGroup(self)
-        
-        anim1 = QPropertyAnimation(self._card_review._check_eff, b"opacity")
-        anim1.setDuration(250)
-        anim1.setStartValue(self._card_review._check_eff.opacity())
-        anim1.setEndValue(0.0 if auto else 1.0)
-        anim1.setEasingCurve(QEasingCurve.InOutQuad)
-        self._anim_group.addAnimation(anim1)
-        
-        anim2 = QPropertyAnimation(self._card_auto._check_eff, b"opacity")
-        anim2.setDuration(250)
-        anim2.setStartValue(self._card_auto._check_eff.opacity())
-        anim2.setEndValue(1.0 if auto else 0.0)
-        anim2.setEasingCurve(QEasingCurve.InOutQuad)
-        self._anim_group.addAnimation(anim2)
-        
-        self._anim_group.start()
-        
+        # 선택 표시 갱신은 세 섹션이 **한 함수**를 쓴다 — 예전엔 여기만 따로 구현돼
+        #   있어서 카드 스타일을 바꿀 때 두 곳을 고쳐야 했다(_set_card_selected).
+        self._set_card_selected(self._card_review, not auto)
+        self._set_card_selected(self._card_auto, auto)
         self.options_changed.emit()
+
+    # ── 결과물 ─────────────────────────────────
+    def _build_output_section(self) -> QVBoxLayout:
+        """'한글 파일을 고칠 것인가' 축 — 교정본 생성 / 정오표만(진짜 검수 모드).
+
+        ⚠ 교정 방식(항목별 검토/자동 일괄)과 **직교**한다 — 클래스 상단 `_errata_only`
+          주석 참조. 그래서 같은 섹션에 3번째 카드로 넣지 않고 섹션을 따로 둔다.
+        """
+        lay = QVBoxLayout()
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(16)
+
+        hdr = QHBoxLayout()
+        hdr.setSpacing(8)
+        # ⚠ 번들에 없는 아이콘 이름을 쓰면 **예외도 로그도 없이 빈 픽스맵**이 된다
+        #   (assets/icons/*.svg 에 실제로 있는 것만 쓸 것 — 'file-check'는 없다).
+        hdr.addWidget(IconLabel("file-text", role="text_sub", size=16))
+        hdr.addWidget(title_label("결과물"))
+        hdr.addStretch()
+        lay.addLayout(hdr)
+
+        row = self._pair_row()
+
+        self._card_out_hwp = self._make_choice_card(
+            "clipboard-check", "교정본 + 정오표", None,
+            "한글 파일에 교정을 반영하고\n고친 항목을 빨간색으로 표시합니다.", True)
+        self._card_out_errata = self._make_choice_card(
+            "table", "정오표만", None,
+            "한글 파일에 교정을 반영하지 않고\n교정 내용과 해당 페이지만 기록합니다.", False)
+
+        self._card_out_hwp.mousePressEvent = lambda _e: self._select_output_mode(False)
+        self._card_out_errata.mousePressEvent = lambda _e: self._select_output_mode(True)
+
+        row.addWidget(self._card_out_hwp, 1)
+        row.addWidget(self._card_out_errata, 1)
+        lay.addLayout(row, 1)
+        return lay
+
+    def _select_output_mode(self, errata_only: bool):
+        if self._errata_only == errata_only:
+            return
+        self._errata_only = errata_only
+        self._set_card_selected(self._card_out_hwp, not errata_only)
+        self._set_card_selected(self._card_out_errata, errata_only)
+        self._sync_errata_lock()
+        self.options_changed.emit()
+
+    def _sync_errata_lock(self):
+        """'정오표만'이면 정오표 생성 토글을 강제 ON + 잠금.
+
+        ⚠ 이 잠금이 없으면 **산출물이 0개인 조합**이 만들어진다(한글 파일도 안 고치고
+          정오표도 안 만듦). 윤문·자동 일괄 적용과 같은 잠금 관용구다 — 토글을 끄는
+          경로를 UI에서 막고, `get_options`에서 한 번 더 곱해 새어 나가지 못하게 한다.
+        """
+        lock = self._errata_only
+        tg = self._tog_errata
+        if lock:
+            tg.set_on(True, emit=False)
+            self._gen_errata = True
+        tg.setEnabled(not lock)
+        tg.setCursor(Qt.ArrowCursor if lock else Qt.PointingHandCursor)
+        row = getattr(tg, "_row", None)
+        if row is not None:
+            row.setProperty("locked", "true" if lock else "false")
+            restyle(row)
+        desc = getattr(tg, "_desc", None)
+        if desc is not None:
+            desc.setText("‘정오표만’ 선택\n- 항상 생성됩니다." if lock else
+                         "교정내용을 Excel로 출력\n- 불필요시 끄세요.")
 
     # ── 교정 범위 ───────────────────────────────
     def _build_scope_section(self) -> QVBoxLayout:
+        """교정 방식과 **같은 카드 · 같은 동작**(둘 중 하나) — 사용자 지정 2026-08-06.
+
+        ★근거: 윤문에는 **오탈자·띄어쓰기가 이미 포함**된다. 그래서 둘은 더할 수 있는
+          별개 범위가 아니라 '어디까지 볼 것인가'의 두 단계이고, 다중 선택으로 두면
+          '윤문만 켜고 오탈자는 끈' 조합처럼 존재하지 않는 상태가 UI에 생긴다.
+        ⚠ 그래서 윤문을 고르면 내부적으로 `_scope_basic`도 True를 유지한다 —
+          `gemini_checker.check_scope`는 typo 패스와 polish 패스를 **더해서** 돌리므로,
+          이렇게 해야 '윤문 = 오탈자·띄어쓰기 + 윤문'이 실제 동작과 일치한다.
+        """
         lay = QVBoxLayout()
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(16)
@@ -333,21 +417,48 @@ class SetupPanel(QWidget):
         hdr.addStretch()
         lay.addLayout(hdr)
 
-        self._tog_basic = self._add_toggle_row(
-            lay, True, "오탈자 · 띄어쓰기",
-            "국립국어원 표준국어대사전 + 우리말샘 사전 + AI 교정",
-            lambda v: self._set_scope("_scope_basic", v))
-        self._tog_polish = self._add_toggle_row(
-            lay, False, "윤문",
-            "문장 흐름 · 어미 · 중복 표현 개선" if POLISH_ENABLED else
-            "오탈자·띄어쓰기 교정이 안정화된 후 오픈할 예정입니다",
-            lambda v: self._set_scope("_scope_polish", v),
-            locked=not POLISH_ENABLED, badge_text=None if POLISH_ENABLED else "추후 예정")
+        row = self._pair_row()
+        self._card_basic = self._make_choice_card(
+            "spell-check", "오탈자 · 띄어쓰기", None,
+            "1차 : 표준국어대사전 + 우리말샘 + 온용어\n2차 : AI (Gemini) 분석",
+            not self._polish_on())
+        self._card_polish = self._make_choice_card(
+            "wand-sparkles", "윤문",
+            None if POLISH_ENABLED else "추후 예정",
+            "오탈자 · 띄어쓰기 + 문장 흐름 · 어미 · 중복 표현 개선" if POLISH_ENABLED else
+            "교정 품질의 최적화 이후\n오픈할 예정입니다.",
+            self._polish_on(), locked=not POLISH_ENABLED)
+
+        self._card_basic.mousePressEvent = lambda _e: self._select_scope(False)
+        if POLISH_ENABLED:
+            self._card_polish.mousePressEvent = lambda _e: self._select_scope(True)
+
+        row.addWidget(self._card_basic, 1)
+        row.addWidget(self._card_polish, 1)
+        lay.addLayout(row, 1)
         return lay
 
-    def _set_scope(self, attr: str, v: bool):
-        setattr(self, attr, v)
+    def _select_scope(self, polish: bool):
+        """교정 범위 선택 — 둘 중 하나(교정 방식·결과물과 같은 동작).
+
+        ⚠ 잠금 시 윤문으로 갈 수 있는 경로를 여기서 끊는다 — 카드 클릭을 연결하지
+          않는 것만으로는 부족하다(_select_apply_mode와 같은 '관문 하나' 원칙).
+        """
+        if polish and not POLISH_ENABLED:
+            return
+        if self._scope_polish == polish:
+            return
+        self._scope_polish = polish
+        # ⚠ 윤문에도 오탈자·띄어쓰기가 포함된다 → basic은 끄지 않는다(위 독스트링).
+        self._scope_basic = True
+        self._set_card_selected(self._card_basic, not polish)
+        self._set_card_selected(self._card_polish, polish)
         self.options_changed.emit()
+
+    def _set_card_selected(self, card: QFrame, on: bool):
+        """카드의 선택 표시 — 테두리·배경(QSS `selected` 속성)이 전부다."""
+        card.setProperty("selected", "true" if on else "false")
+        restyle(card)
 
     # ── 부가 기능 ───────────────────────────────
     def _build_extra_section(self) -> QVBoxLayout:
@@ -362,21 +473,28 @@ class SetupPanel(QWidget):
         hdr.addStretch()
         lay.addLayout(hdr)
 
+        row = self._pair_row()
         self._tog_errata = self._add_toggle_row(
-            lay, True, "정오표 자동 생성 (.xlsx)",
-            "교정 전-후, 교정 이유, 적용 결과를 Excel로 출력",
+            row, True, "정오표 자동 생성 (.xlsx)",
+            "교정내용을 Excel로 출력\n- 불필요시 끄세요.",
             lambda v: setattr(self, "_gen_errata", v))
         self._tog_no_ai = self._add_toggle_row(
-            lay, False, "AI 분석 제외 (대외비 문서용)",
-            "Gemini 호출 없이 사전·규칙 검사만 수행 — 오프라인 가능",
-            lambda v: self._set_scope("_no_ai", v))
+            row, False, "AI 분석 제외 (대외비 문서용)",
+            "Gemini 미호출로 보안강화\n- 오프라인 사용 가능",
+            lambda v: self._set_flag("_no_ai", v))
+        lay.addLayout(row, 1)
         return lay
+
+    def _set_flag(self, attr: str, v: bool):
+        setattr(self, attr, v)
+        self.options_changed.emit()
 
     def _add_toggle_row(self, lay, on, title, desc, on_change,
                         locked: bool = False, badge_text: str = None) -> ToggleSwitch:
         row = QFrame()
         row.setProperty("role", "toggleRow")
         row.setProperty("locked", "true" if locked else "false")
+        row.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         rl = QHBoxLayout(row)
         rl.setContentsMargins(22, 14, 22, 14)
         rl.setSpacing(10)
@@ -400,10 +518,15 @@ class SetupPanel(QWidget):
             trow.addWidget(badge(badge_text))
         trow.addStretch()
         col.addLayout(trow)
-        col.addWidget(sub_label(desc, wrap=True))
+        desc_lbl = sub_label(desc, wrap=True)
+        col.addWidget(desc_lbl)
         rl.addLayout(col, 1)
 
         lay.addWidget(row, 1)
+        # 잠금 상태를 나중에 바꾸려면 행 프레임(테두리·흐림)과 설명 라벨이 필요하다
+        #   (_sync_errata_lock). 토글만 들고 있으면 스위치만 꺼지고 행은 멀쩡해 보인다.
+        toggle._row = row
+        toggle._desc = desc_lbl
         return toggle
 
     # ══════════════════════════════════════════════
@@ -421,12 +544,13 @@ class SetupPanel(QWidget):
         return any([self._scope_basic, self._polish_on()])
 
     def summary_text(self) -> str:
-        scopes = []
-        if self._scope_basic:  scopes.append("오탈자 · 띄어쓰기")
-        if self._polish_on():  scopes.append("윤문")
+        # 교정 범위는 둘 중 하나 — 고른 쪽 하나만 적는다. 윤문이 오탈자·띄어쓰기를
+        #   포함하므로 '오탈자 · 띄어쓰기 / 윤문'처럼 둘 다 나열하면 중복이다.
+        scope_text = "윤문" if self._polish_on() else "오탈자 · 띄어쓰기"
         mode_text = "자동 일괄 적용" if (self._auto_apply and AUTO_APPLY_ENABLED) else "항목별 검토"
+        out_text = "정오표만" if self._errata_only else "교정본 + 정오표"
         no_ai = " / AI 제외" if self._no_ai else ""
-        return f"{' / '.join(scopes)} / {mode_text}{no_ai}"
+        return f"{scope_text} / {mode_text} / {out_text}{no_ai}"
 
     def get_options(self) -> dict:
         return {
@@ -439,11 +563,17 @@ class SetupPanel(QWidget):
             # ⚠ 잠금 플래그를 여기서 한 번 더 곱한다(이중 안전장치). UI 상태가 어떤 경로로
             #   틀어져도 워커·적용 단계로 True가 새어 나가지 않게 하는 마지막 관문이다.
             "scope_polish":   self._scope_polish and POLISH_ENABLED,
-            "gen_errata":     self._gen_errata,
+            # ⚠ '정오표만'이면 강제 True — 이게 없으면 산출물 0개 조합이 생긴다
+            #   (UI 잠금과 이중 안전장치. _sync_errata_lock 주석 참조).
+            "gen_errata":     self._gen_errata or self._errata_only,
             "deep_screening": True,   # 사전 원문 스크리닝은 항상 수행됨
             "auto_apply":     self._auto_apply and AUTO_APPLY_ENABLED,
+            # 결과물 축 — True면 한글 파일을 열되 **수정하지 않는다**(쪽 번호 수집만).
+            "errata_only":    self._errata_only,
         }
 
     def refresh_theme(self):
-        for tg in (self._tog_basic, self._tog_polish, self._tog_errata, self._tog_no_ai):
+        # 교정 범위는 토글에서 선택 카드로 바뀌었다 — 카드는 전역 QSS로 그려지므로
+        #   여기서 손댈 게 없고, 직접 그리는 ToggleSwitch만 다시 그린다.
+        for tg in (self._tog_errata, self._tog_no_ai):
             tg.refresh_theme()

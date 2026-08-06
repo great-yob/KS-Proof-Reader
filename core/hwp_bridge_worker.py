@@ -13,6 +13,8 @@ core/hwp_bridge_worker.py — 32비트 HWP COM 브리지 워커
   open      — HWP 파일 열기
   get_text  — 전체 텍스트 추출
   apply     — 교정 적용 (corrections 리스트)
+  verify    — 원문이 '찾기'로 도달 가능한지 검증 (치환 없음)
+  locate    — 원문의 등장별 쪽 번호 수집 (치환 없음, 정오표용)
   save_as   — 다른이름으로 저장
   close     — HWP 종료
   quit      — 워커 종료
@@ -868,6 +870,132 @@ class HwpBridge:
                 break
         return sorted(paras)
 
+    # ── 쪽 번호 취득 ──────────────────────────────────────────────────────────
+    #   `KeyIndicator()`는 9-튜플 `(succ, seccnt, secno, prnpageno, colno, line, pos,
+    #   over, ctrlname)`을 준다. 우리가 쓰는 건 **prnpageno(index 3)** 하나뿐이다.
+    #
+    #   ★왜 '절대 쪽'이 아니라 prnpageno인가 — 이게 **한/글 자신이 쓰는 좌표**다(실측
+    #   2026-08-05, 한/글 2010 8.5.8.1677): `Goto`로 10을 주면 prnpageno가 정확히 10인
+    #   자리로 간다. 즉 정오표에 적힌 숫자를 사용자가 Ctrl+G에 그대로 넣을 수 있다.
+    #   반대로 '문서 처음부터 센 물리 쪽'은 어디에도 입력할 수 없는 숫자다.
+    #   ⚠ 그 대가로 prnpageno는 **전역 단조도 유일도 아니다** — 구역마다 쪽 번호를 새로
+    #   시작할 수 있어서다(실측: 사단법인 파일 PageCount 160인데 문서 끝 prnpageno 152,
+    #   05.hwp는 문서 첫 쪽이 2). 그래서 이 값으로 정렬하거나 산술을 하면 안 된다.
+    #   표시 전용이다.
+    #
+    #   ⚠ 비용은 무시해도 된다(실측 0.13ms). 비싼 건 `RepeatFind`(30~50ms/건)이므로,
+    #   **이미 찾기를 하고 있는 자리에서만** 곁다리로 읽는다 — 쪽 번호를 위해 별도의
+    #   찾기를 새로 도는 일은 최소화한다(locate의 예산 상한 참조).
+    def _page_no(self):
+        """현재 커서 위치의 한/글 쪽 번호(prnpageno). 실패하면 None."""
+        try:
+            ki = self.hwp.KeyIndicator()
+            if isinstance(ki, tuple) and len(ki) > 3:
+                return int(ki[3])
+        except Exception:
+            pass
+        return None
+
+    # 한 원문당 훑을 등장 상한 — apply의 max_iters와 같은 값(정합).
+    _LOCATE_MAX_OCC = 100
+
+    def locate(self, originals, budget=4000, time_budget=60.0):
+        """각 원문의 **등장별 쪽 번호**를 찾기만으로 수집한다(치환 없음 — 문서 무변경).
+
+        정오표를 '등장 1곳 = 1행'으로 쓰기 위한 것.
+
+        ⚠ 반드시 **apply보다 먼저**, 그리고 **한 번에** 돌 것. 치환이 시작되면 글자
+        수가 바뀌어 뒤 페이지가 밀리므로(실측: 같은 낱말의 12번째 등장이 15쪽→16쪽),
+        쪽 번호는 '치환 전 문서'라는 단일 장면에서 통째로 떠야 서로 정합한다. 거절
+        교정의 원문이 겹치는 다른 교정에 먹혀 아예 사라질 수도 있다.
+
+        ⚠ 등장 순서(=인덱스)는 RepeatFind 순서 = 문서 순서라 검수 패널의 등장 인덱스와
+        같은 좌표계다(apply의 skip_occurrences가 기대는 것과 동일한 불변식).
+
+        `budget`(찾기 횟수)과 `time_budget`(초)은 **둘 다 상한**이다. 찾기 1건이
+        30~50ms라 상한이 없으면 등장 수천 개 원고에서 이 단계만 몇 분이 된다. 둘 중
+        하나라도 넘으면 남은 원문은 그냥 건너뛴다(쪽 칸이 빈다 — 정오표는 그대로
+        나오고 숫자만 없는, 안전한 실패다).
+        """
+        try:
+            self.hwp.HAction.Run("MoveDocBegin")
+        except Exception:
+            pass
+        pages, spent, truncated = {}, 0, False
+        total = len(originals)
+        t_start = time.time()
+
+        def _over():
+            return spent >= budget or (time.time() - t_start) >= time_budget
+
+        for idx, original_user in enumerate(originals):
+            if _over():
+                truncated = True
+                break
+            original = _clean((original_user or "").replace("\n", "\r"))
+            if not original:
+                continue
+            found = []
+            try:
+                # 앞 항목이 서브스토리(각주·표)에 커서를 남겼을 수 있다 — apply와 같은
+                #   상태 정규화를 거쳐야 문서 처음부터 일관되게 훑는다.
+                for _ in range(3):
+                    try:
+                        if not self.hwp.HAction.Run("CloseEx"):
+                            break
+                    except Exception:
+                        break
+                self.hwp.HAction.Run("MoveDocBegin")
+                pset = self.hwp.HParameterSet.HFindReplace
+                self.hwp.HAction.GetDefault("FindDlg", pset.HSet)
+                self.hwp.HAction.Execute("FindDlg", pset.HSet)
+                pset.FindString    = original
+                pset.IgnoreMessage = 1
+                pset.Direction     = 0
+                for prop, val in (
+                    ("WholeWordOnly", 0), ("CaseSensitive", 0), ("MatchCase", 0),
+                    ("FindRegExp", 0), ("UseWildCards", 0), ("SeveralWords", 0),
+                    ("AllWordForms", 0), ("HanjaFromHangul", 0), ("FindJaso", 0),
+                    ("IgnoreFindString", 0), ("IgnoreReplaceString", 1),
+                    ("AutoSpell", 0),
+                ):
+                    try:
+                        setattr(pset, prop, val)
+                    except Exception:
+                        pass
+                # ⚠ RepeatFind는 **SetPos로 커서를 옮겨 주지 않아도** 다음 등장으로
+                #   전진한다(실측: '연구' 35건을 SetPos 없이 전부 순회). 다만 어떤
+                #   문서에서 커서가 정체하면 무한루프가 되므로 GetPos 정체를 감지해
+                #   끊는다 — 상한(_LOCATE_MAX_OCC)만으로는 100회를 헛돌게 된다.
+                prev_pos = None
+                while len(found) < self._LOCATE_MAX_OCC and not _over():
+                    if not self.hwp.HAction.Execute("RepeatFind", pset.HSet):
+                        break
+                    spent += 1
+                    try:
+                        cur = self.hwp.GetPos()
+                    except Exception:
+                        cur = None
+                    if cur is not None and cur == prev_pos:
+                        break
+                    prev_pos = cur
+                    found.append(self._page_no())
+            except Exception:
+                pass
+            if found:
+                pages[original_user] = found
+            if (idx + 1) % 25 == 0 or idx == total - 1:
+                _send_progress(int((idx + 1) / max(1, total) * 100),
+                               f"쪽 번호 확인 중… {idx + 1}/{total}")
+        try:
+            self.hwp.HAction.Run("MoveDocBegin")
+        except Exception:
+            pass
+        if truncated:
+            _send_log(f"[쪽번호] 예산 소진(찾기 {spent}회 / {time.time() - t_start:.0f}초) "
+                      "— 나머지 원문의 쪽 번호는 생략")
+        return {"pages": pages, "truncated": truncated, "finds": spent}
+
     def verify(self, originals):
         """각 원문 문자열이 문서에서 '찾기'로 도달 가능한지 검증 (치환 없음 — 문서 무변경).
 
@@ -973,6 +1101,17 @@ class HwpBridge:
             replaced = 0
             err_msg  = ""
             path_used = "실패"
+            # 등장별 실적용 기록 — 정오표가 '등장 1곳 = 1행'이라 **어느 등장이 실제로
+            #   치환됐는지**를 알아야 한다. 매치마다 커서가 그 자리에 있으므로
+            #   KeyIndicator 한 번(0.13ms)이면 쪽까지 공짜로 딸려 온다.
+            #   [{"i": 등장 인덱스(0-based, 문서 순), "page": 쪽|None, "ok": 치환됨}, …]
+            #   ⚠ `ok=False`는 **부분 거절로 건너뛴 등장**이다 — 실패가 아니다.
+            #   ⚠ 여기 실린 `page`는 **치환이 진행되는 중의 쪽**이라 앞 항목들이 늘리거나
+            #     줄인 만큼 밀려 있다. 정오표의 정본은 apply 전에 한 번에 뜬 locate 결과이고
+            #     이 값은 폴백일 뿐이다(apply_worker._build_errata_rows 참조).
+            #   ⚠ AllReplace 폴백 경로는 등장별 정보가 없어 이 목록이 빈 채로 남는다
+            #     (호출부가 '등장별 근거 없음'으로 보고 항목 단위 결과로 폴백한다).
+            occ_pages = []
             # corrected가 original을 부분문자열로 포함하면(괄호 추가류) 찾기-치환이 자기
             #   삽입분을 다시 잡아 무한 증식한다 → 1차 RepeatFind는 랩 감지로, 2차
             #   AllReplace는 폴백 금지로 차단한다. try 밖(폴백)에서도 참조하므로 여기서 정의.
@@ -1110,8 +1249,11 @@ class HwpBridge:
                                 _gpos = None
                             _send_log(f"[적용진단]   매치#{count} (list,para,pos)={_gpos} "
                                       f"→ {'skip' if count in skip_occ else 'REPLACE'}")
+                        # 이 등장이 몇 쪽인지 — 치환 전, 커서가 매치 위에 있을 때 읽는다.
+                        _pg = self._page_no()
                         # 부분 거절 — 이 등장은 치환하지 않고 다음 매치로 커서만 이동
                         if count in skip_occ:
+                            occ_pages.append({"i": count, "page": _pg, "ok": False})
                             try:
                                 r = self.hwp.GetSelectedPos()
                                 if isinstance(r, tuple) and len(r) >= 7:
@@ -1198,6 +1340,7 @@ class HwpBridge:
 
                             replaced += 1
                             pass_replaced += 1
+                            occ_pages.append({"i": count, "page": _pg, "ok": True})
                         except Exception as e:
                             err_msg = f"교정/색상 적용 실패: {e}"
                             break
@@ -1269,6 +1412,7 @@ class HwpBridge:
                     "error":     err_msg,
                     "path":      path_used,
                     "replaced":  replaced,   # 본문에서 실제 치환된 등장 수
+                    "occ_pages": occ_pages,  # 등장별 쪽 번호·치환 여부(정오표 행 근거)
                 })
             else:
                 stats["fail"] += 1
@@ -1281,6 +1425,7 @@ class HwpBridge:
                                              " 이미 치환한 경우 (수동 확인 필요)"),
                     "path":      path_used,
                     "replaced":  0,
+                    "occ_pages": occ_pages,
                 })
 
             # 진행률 (stderr)
@@ -1389,6 +1534,10 @@ def main():
                 result = bridge.apply(req["corrections"])
             elif cmd == "verify":
                 result = bridge.verify(req["originals"])
+            elif cmd == "locate":
+                result = bridge.locate(req["originals"],
+                                       budget=req.get("budget", 4000),
+                                       time_budget=req.get("time_budget", 60.0))
             elif cmd == "save_as":
                 result = bridge.save_as(req["output_path"])
             elif cmd == "close":
