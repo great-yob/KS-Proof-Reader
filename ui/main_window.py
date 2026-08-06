@@ -22,7 +22,7 @@ from PySide6.QtCore import Qt, QUrl, QTimer
 from PySide6.QtGui import QCursor, QDesktopServices
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QStackedWidget, QMessageBox, QApplication, QAbstractButton,
+    QStackedWidget, QMessageBox, QApplication, QAbstractButton, QSizePolicy,
 )
 
 from ui.widgets.app_header import AppHeader
@@ -76,14 +76,28 @@ class MainWindow(QMainWindow):
             pass
         # 네이티브 타이틀바 제거 — 창 컨트롤은 헤더가 직접 제공(프레임리스)
         self.setWindowFlag(Qt.FramelessWindowHint, True)
-        self.setMinimumSize(960, 600)
 
+        # ⚠ `config.ini [APP] WIDTH/HEIGHT`는 **시작 크기이자 최소 크기**다(2026-08-06).
+        #   예전엔 최소가 960×600으로 따로 박혀 있어, 설정값과 무관하게 창을 그보다
+        #   작게 줄일 수 있었다. 설정 화면은 좌우 1:1 고정에 부가 기능 제목이 한 줄
+        #   고정이라 칸 최소폭이 520px이고, 창이 1270 밑으로 가면 설정 칸에 가로
+        #   스크롤바가 생긴다 — '레이아웃이 성립하는 최소'와 '줄일 수 있는 최소'가
+        #   달랐던 것이 원인이라 둘을 하나로 묶는다.
+        #   ⚠ 단, 화면보다 큰 최소치는 창을 아예 못 쓰게 만든다(작은 노트북·원격 데스크톱)
+        #     → 사용 가능한 화면 크기로 클램프한다. 그 경우에만 스크롤바가 다시 등장한다.
         self._config = ConfigLoader()
         try:
             w, h = self._config.get_window_size()
         except Exception:
-            w, h = 1240, 800
-        self.resize(max(w, 960), max(h, 600))
+            w, h = 1400, 860
+        min_w, min_h = w, h
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            min_w = min(min_w, avail.width())
+            min_h = min(min_h, avail.height())
+        self.setMinimumSize(min_w, min_h)
+        self.resize(max(w, min_w), max(h, min_h))
 
         self._file_path = ""
         self._options = {}
@@ -207,6 +221,18 @@ class MainWindow(QMainWindow):
         self.file_panel = FilePanel()
         setup_layout.addWidget(self.setup_panel, 1)
         setup_layout.addWidget(self.file_panel, 1)
+        # ⚠ 좌우 1:1 **고정** — stretch(1, 1)만으로는 반반이 되지 않는다.
+        #   QHBoxLayout은 stretch를 나누기 전에 각 칸의 최소폭(minimumSizeHint)을 먼저
+        #   확보하므로, 한쪽 내용이 길어지면 그 칸이 넓어지고 반대쪽이 밀린다.
+        #   실사고: 긴 파일명(줄바꿈 없는 QLabel의 최소폭 = 글자 전체 폭)이 문서 선택
+        #   칸을 밀어 넓혀, 설정 칸이 잘리고 가로 스크롤바가 생겼다.
+        #   가로 정책 Ignored는 sizeHint·최소폭을 0으로 취급시켜 폭이 오직 stretch로만
+        #   결정되게 한다 — 내용은 각 패널 안에서 줄이거나(파일명 말줄임) 스크롤한다.
+        #   ⚠ 세로 정책은 건드리지 말 것(높이는 그대로 채워야 한다).
+        for _panel in (self.setup_panel, self.file_panel):
+            _sp = _panel.sizePolicy()
+            _sp.setHorizontalPolicy(QSizePolicy.Ignored)
+            _panel.setSizePolicy(_sp)
         
         self.main_stage.addWidget(setup_widget) # Index 0: Setup
         

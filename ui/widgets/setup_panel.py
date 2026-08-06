@@ -15,7 +15,8 @@ from PySide6.QtWidgets import (
 )
 
 from ui.widgets.components import (
-    label, sub_label, badge, section_card, make_button, IconLabel, title_label
+    label, sub_label, badge, section_card, make_button, IconLabel, title_label,
+    soft_breakable
 )
 from ui.widgets._toggle import ToggleSwitch
 from ui.styles.theme import restyle
@@ -42,6 +43,27 @@ AUTO_APPLY_ENABLED = False
 #   판단. 기능이 없어서가 아니라 **검증 순서** 때문에 잠근 것 — scope_polish 경로
 #   (prompts.build_polish_prompt / AI_CHUNK_POLISH 등)는 그대로 살려 둔다.
 POLISH_ENABLED = False
+
+
+def _wrap_card_policy() -> QSizePolicy:
+    """줄바꿈(wrap) 라벨을 품은 카드용 size policy.
+
+    ⚠ Qt 함정 **두 개**가 겹쳐 있고, 하나만 고치면 증상이 그대로다(실측).
+      ① 컨테이너 위젯의 sizePolicy는 `hasHeightForWidth()`가 **기본 False**라,
+         wordWrap 라벨이 안에 있어도 부모 레이아웃이 heightForWidth를 묻지 않는다.
+      ② 세로 정책이 `Maximum`이면 위젯의 **최대 높이가 sizeHint 높이로 고정**된다.
+         sizeHint는 폭을 모르는 값(한 줄 기준)이라, 부모가 접힌 높이(104px)를
+         내줘도 카드는 90px에서 잘린다 — 실측으로 확인한 진짜 원인이 이쪽이다.
+         (증상: 교정 범위 카드의 '2차 : AI (Gemini) 분석' 줄이 통째로 사라지고,
+          부가 기능 제목이 설명을 덮었다. 폭이 넉넉하면 안 보여 넓은 창에서만
+          확인하면 놓친다.)
+      → 그래서 세로는 `Preferred`. 원래 `Maximum`을 쓴 의도(남는 세로 공간이
+        카드 안으로 배분돼 제목과 설명 사이가 벌어지는 것 방지)는 카드 레이아웃
+        **맨 끝의 stretch**가 대신 지킨다.
+    """
+    sp = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+    sp.setHeightForWidth(True)
+    return sp
 
 
 class FilePanel(QFrame):
@@ -89,14 +111,35 @@ class FilePanel(QFrame):
         self._file_card = QFrame()
         self._file_card.setProperty("role", "dropzone_selected")
         fc = QVBoxLayout(self._file_card)
-        fc.setAlignment(Qt.AlignCenter)
-        fc.setContentsMargins(40, 40, 40, 40)
+        # ⚠ 세로 가운데 정렬은 **stretch로** 한다. `fc.setAlignment(Qt.AlignCenter)`를
+        #   쓰면 각 줄이 제 sizeHint 폭으로 **줄어든 채** 가운데 놓인다 — 실측: 528px
+        #   카드 안에서 파일명 라벨이 188px밖에 못 받아, 여백을 아무리 넓혀도 파일명이
+        #   좁게 접혔다(줄바꿈 라벨의 sizeHint는 '보기 좋은 비율' 휴리스틱 값이라 더 작다).
+        #   stretch로 바꾸면 각 줄이 카드 폭을 전부 쓰고, 글자는 라벨 자체의
+        #   `setAlignment(Qt.AlignCenter)`가 가운데로 맞춘다.
+        # 좌우 여백은 드롭존(40)보다 좁게 — 긴 파일명이 접힐 폭을 벌어 준다
+        #   (사용자 지정 2026-08-06: "좌우로 더 여유있게 나가도 돼").
+        fc.setContentsMargins(20, 40, 20, 40)
         fc.setSpacing(16)
-        
+
+        fc.addStretch(1)
         fc.addWidget(IconLabel("file-text", role="accent", size=80), alignment=Qt.AlignCenter)
-        
-        self._file_name_lbl = label("", role="h2")
+        fc.addSpacing(12)   # 아이콘 ↔ 파일명 간격(기본 16 + 12 = 28)
+
+        # 파일명은 **줄이지 않고 전부** 보여 준다(사용자 지정 2026-08-06) — 대신 줄바꿈.
+        #   ⚠ 세 가지가 모두 있어야 실제로 접힌다. 하나라도 빠지면 증상이 다르게 나온다.
+        #     ① 가로 정책 `Ignored`: 줄바꿈 라벨이라도 긴 파일명은 칸의 최소폭을 밀어
+        #        올려 좌우 1:1 그리드를 깨뜨린다(실사고). 0으로 취급시켜 못 밀게 한다.
+        #     ② `setHeightForWidth(True)`: 커스텀 정책을 주는 순간 heightForWidth 플래그가
+        #        꺼져, 접힌 만큼 높이가 늘지 않고 아랫줄이 잘린다.
+        #     ③ `soft_breakable`(ZWSP): 파일명엔 공백이 거의 없어 Qt의 줄바꿈 단위가
+        #        문자열 전체가 된다 — 줄바꿈을 켜도 접히지 않는다.
+        self._file_name_lbl = label("", role="h2", wrap=True)
         self._file_name_lbl.setAlignment(Qt.AlignCenter)
+        self._file_name_lbl.setTextFormat(Qt.PlainText)
+        _name_sp = QSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        _name_sp.setHeightForWidth(True)
+        self._file_name_lbl.setSizePolicy(_name_sp)
         fc.addWidget(self._file_name_lbl)
         
         self._file_meta_lbl = sub_label("아래 버튼을 눌러 교정 분석을 시작하세요.")
@@ -108,7 +151,8 @@ class FilePanel(QFrame):
         change_btn.setFixedHeight(40)
         change_btn.setStyleSheet("padding: 6px 12px; margin-top: 20px;")
         fc.addWidget(change_btn, alignment=Qt.AlignCenter)
-        
+        fc.addStretch(1)
+
         self._file_card.setVisible(False)
         lay.addWidget(self._file_card, 1)
 
@@ -146,6 +190,7 @@ class FilePanel(QFrame):
         self._file_path = file_path
         if not file_path:
             self._file_name_lbl.setText("")
+            self._file_name_lbl.setToolTip("")
             self._file_meta_lbl.setText("아래 버튼을 눌러 교정 분석을 시작하세요.")
             self._file_card.setVisible(False)
             self._dropzone.setVisible(True)
@@ -157,7 +202,8 @@ class FilePanel(QFrame):
             meta = f"{size_mb:.1f} MB"
         except OSError:
             meta = ""
-        self._file_name_lbl.setText(name)
+        self._file_name_lbl.setText(soft_breakable(name))
+        self._file_name_lbl.setToolTip(name)   # 복사용 원본(ZWSP 없는 이름)
         self._file_meta_lbl.setText("아래 버튼을 눌러 교정 분석을 시작하세요.")
         self._dropzone.setVisible(False)
         self._file_card.setVisible(True)
@@ -290,8 +336,9 @@ class SetupPanel(QWidget):
         #   손 모양 커서를 주지 않아 '누를 수 있는 것'으로 보이지 않게 한다.
         card.setProperty("locked", "true" if locked else "false")
         card.setCursor(Qt.ArrowCursor if locked else Qt.PointingHandCursor)
-        # 세로로는 내용 높이만 — 늘어나면 제목과 설명 사이가 벌어진다.
-        card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        # 세로로는 내용 높이만 — 늘어나면 제목과 설명 사이가 벌어진다(_wrap_card_policy
+        #   독스트링 참조: 그 역할은 이제 아래 맨 끝 stretch가 맡는다).
+        card.setSizePolicy(_wrap_card_policy())
 
         cl = QVBoxLayout(card)
         cl.setContentsMargins(22, 16, 22, 16)
@@ -309,6 +356,10 @@ class SetupPanel(QWidget):
 
         d = sub_label(desc, wrap=True)
         cl.addWidget(d)
+        # ⚠ 남는 세로 공간은 **여기서** 먹는다. 한 행의 두 카드는 높이가 같아지는데
+        #   (긴 쪽에 맞춰짐), 이 stretch가 없으면 짧은 카드의 제목과 설명 사이가
+        #   벌어진다 — 예전 `Maximum` 정책이 막고 있던 그 증상이다.
+        cl.addStretch(1)
         return card
 
     def _select_apply_mode(self, auto: bool):
@@ -494,11 +545,13 @@ class SetupPanel(QWidget):
         row = QFrame()
         row.setProperty("role", "toggleRow")
         row.setProperty("locked", "true" if locked else "false")
-        row.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        row.setSizePolicy(_wrap_card_policy())
         rl = QHBoxLayout(row)
         rl.setContentsMargins(22, 14, 22, 14)
         rl.setSpacing(10)
-        rl.setAlignment(Qt.AlignVCenter)
+        # ⚠ 세로 가운데 정렬은 **토글에만** 준다(아래 addWidget). 레이아웃 전체에
+        #   AlignVCenter를 걸면 글자 칸(col)까지 sizeHint 높이로 고정돼, 접힌 제목·설명이
+        #   행 높이가 늘어나도 그대로 잘린다 — 카드 쪽 `Maximum` 함정과 같은 원리다.
 
         toggle = ToggleSwitch(on=False if locked else on)
         toggle.toggled.connect(on_change)
@@ -507,12 +560,18 @@ class SetupPanel(QWidget):
         if locked:
             toggle.setEnabled(False)
             toggle.setCursor(Qt.ArrowCursor)
-        rl.addWidget(toggle)
+        rl.addWidget(toggle, 0, Qt.AlignVCenter)
 
         col = QVBoxLayout()
         col.setSpacing(2)
         trow = QHBoxLayout()
         trow.setSpacing(8)
+        # ⚠ 제목은 **항상 한 줄**이다(사용자 지정 2026-08-06 — 두 줄로 접히면 안 됨).
+        #   대가는 알고 쓰는 것: 이 제목들이 설정 칸 **전체의 최소폭**을 붙잡는다
+        #   (실측: 'AI 분석 제외 (대외비 문서용)' 144px + '정오표 자동 생성 (.xlsx)'
+        #   124px → body 최소폭 ~525px). 좌우 1:1 고정이라 창이 좁아 칸이 그보다
+        #   작아지면 설정 칸에 가로 스크롤바가 생긴다(창 폭 ~1290 미만).
+        #   줄바꿈으로 그걸 피하려던 시도는 사용자가 기각했다 — 되돌리지 말 것.
         trow.addWidget(label(title, role="title"))
         if badge_text:
             trow.addWidget(badge(badge_text))

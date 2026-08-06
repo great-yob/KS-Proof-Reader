@@ -734,7 +734,7 @@ class KoreanDictValidator:
                 key = f"{actual}::missing"
                 if key not in seen:
                     seen.add(key)
-                    suspicious.append(f"{actual} (어느 사전에도 없음 — 오탈자 가능성)")
+                    suspicious.append(f"{actual} (사전 미등재 → 오탈자 가능성)")
             else:
                 # opendict 등재 — register가 _NOTABLE인 경우에만 의심 처리
                 if res["source"] == "opendict":

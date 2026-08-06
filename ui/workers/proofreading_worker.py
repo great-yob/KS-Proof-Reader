@@ -58,9 +58,41 @@ class ProofreadingWorker(QThread):
         self.file_path = file_path
         self.options   = options
         self._stop     = threading.Event()
+        self._pct      = 0        # 마지막으로 내보낸 퍼센트(역행 방지)
+        self._pct_msg  = None     # 마지막으로 내보낸 문구(같은 값 반복 방출 차단)
 
     def request_stop(self):
         self._stop.set()
+
+    # ── 진행률 ────────────────────────────────────────
+    #  ⚠ 진행률은 **_emit_pct 한 곳으로만** 내보낸다(2026-08-06).
+    #    예전엔 self.progress.emit(고정값)을 단계마다 흩뿌려, 가장 오래 걸리는 AI 단계가
+    #    40%에서 멈춰 있다가 끝나는 순간 80%로 튀었다(사용자 보고). 구간(band)을 정해
+    #    그 안에서 실제 진행 비율로 채우는 방식으로 바꿨고, 역행·중복 방출은 여기서 막는다.
+    #    ── 구간 배분(합 100) ──
+    #      3~8    추출        8~20   사전 스크리닝
+    #      20~70  AI 분석(가장 김 — 청크 진행률로 채움)
+    #      70~97  병합·일관성·재검증·결정론 패스   97~100  문서 대조 검증·마무리
+    def _emit_pct(self, pct: float, msg: str = ""):
+        """단조 증가 진행률 방출 — 숫자나 문구가 실제로 바뀔 때만 시그널을 보낸다.
+
+        ⚠ 기어가는 진행률은 초당 여러 번 들어온다(AI 호출 중 0.4초 간격). 같은 값을
+          그대로 다시 쏘면 GUI 스레드가 매번 깨어나므로 여기서 걸러 낸다.
+        ⚠ 뒤로 가는 값은 **버린다** — 단계마다 기준이 달라 역행이 섞이면 막대가
+          되감기는 것처럼 보인다.
+        """
+        p = int(max(0, min(100, pct)))
+        if p <= self._pct and msg == self._pct_msg:
+            return
+        if p > self._pct:
+            self._pct = p
+        self._pct_msg = msg
+        self.progress.emit(self._pct, msg)
+
+    def _band(self, lo: int, hi: int, frac: float, msg: str = ""):
+        """구간 [lo, hi]를 frac(0~1)만큼 채운 값으로 방출."""
+        frac = max(0.0, min(1.0, frac))
+        self._emit_pct(lo + (hi - lo) * frac, msg)
 
     def run(self):
         try:
@@ -76,7 +108,7 @@ class ProofreadingWorker(QThread):
 
         # [1] 텍스트 추출 — open/close를 try/finally로 보호 (32비트 워커 누수 방지)
         self.step_changed.emit("extract", "HWP 파일 열기 및 텍스트 추출 중…")
-        self.progress.emit(3, "파일 열기 중…")
+        self._emit_pct(3, "파일 열기 중…")
 
         editor = HwpEditor(self.file_path, logger=log)
         try:
@@ -130,7 +162,7 @@ class ProofreadingWorker(QThread):
                 " 자리의 AI 덧붙임 오탐을 차단합니다.")
         if footnote_lines:
             log(f"  그중 실제 각주 {len(footnote_lines)}줄 — 미리보기에 '각주'로 표시합니다.")
-        self.progress.emit(8, "텍스트 추출 완료")
+        self._emit_pct(8, "텍스트 추출 완료")
 
         # [2] 사전 인프라 준비 + 1차 원문 스크리닝 (항상 ON — 사전이 기본 베이스)
         #     ▸ 사전은 "항상 켜는 기본 도구"다. 원문을 직접 훑어 미등재어(=비단어)를
@@ -167,8 +199,9 @@ class ProofreadingWorker(QThread):
             #   읽을 수 있게 한다(사용자 요청 2026-07-23). 사전을 못 쓰는 경우엔
             #   찍지 않는다 — 위 분기가 '미존재' 사유를 이미 남긴다.
             log("[사전(국립국어원) 분석 시작]")
-            self.progress.emit(10, "사전 스크리닝 중…")
+            self._emit_pct(10, "사전 스크리닝 중…")
             suspicious_words = validator.extract_suspicious_words(text, stop_event=self._stop)
+            self._emit_pct(14, "사전 스크리닝 완료 — 미등재어 확인 중…")
             stats = getattr(validator, "last_stats", {})
             log(
                 f"  → 사전 미등재/비표준 어휘 {len(suspicious_words)}개 발견"
@@ -205,7 +238,12 @@ class ProofreadingWorker(QThread):
         if _use_api and dict_flags and not self._stop.is_set():
             self.step_changed.emit("screening", "우리말샘 사전 API로 미등재어 확인 중…")
             kept_flags, online_hits = [], 0
-            for word, clean, reason in dict_flags:
+            # 직렬 네트워크 조회라 건수에 비례해 오래 걸린다 → 구간 14~17을 채우며 진행.
+            _n_flags = len(dict_flags)
+            for _i, (word, clean, reason) in enumerate(dict_flags):
+                if _i % 5 == 0:
+                    self._band(14, 17, _i / _n_flags,
+                               f"우리말샘 확인 중… {_i}/{_n_flags}")
                 if self._stop.is_set():
                     kept_flags.append((word, clean, reason))
                     continue
@@ -242,6 +280,7 @@ class ProofreadingWorker(QThread):
                 try:
                     futures = {pool.submit(is_registered_onterm, w): c
                                for w, c, _r in targets}
+                    _n_t, _done = len(futures), 0
                     for fut, clean in futures.items():
                         if self._stop.is_set():
                             break
@@ -250,6 +289,10 @@ class ProofreadingWorker(QThread):
                                 rescued.add(clean)
                         except Exception:
                             pass          # graceful — 확인 불가는 기존대로 플래그 유지
+                        _done += 1
+                        if _done % 5 == 0 or _done == _n_t:
+                            self._band(17, 20, _done / _n_t,
+                                       f"온용어 확인 중… {_done}/{_n_t}")
                 finally:
                     # 취소 시 대기 중인 조회를 즉시 버린다(wait=True면 최대 수 초 지연).
                     pool.shutdown(wait=False, cancel_futures=True)
@@ -271,7 +314,7 @@ class ProofreadingWorker(QThread):
             신뢰를 해친다(사용자 피드백). '확인 권장'으로 톤을 낮춘다(AI 프롬프트
             컨텍스트 문자열은 그대로 두어 AI 동작에는 영향 없음)."""
             card_reason = reason.replace(
-                "오탈자 가능성", "확인 권장 (고유명사·전문용어면 무시)")
+                "오탈자 가능성", "확인 권장\n— 고유명사 · 전문용어 등일 수 있습니다.")
             return Correction(
                 original=word, corrected=word,
                 reason=f"[검수] {card_reason}",
@@ -279,7 +322,7 @@ class ProofreadingWorker(QThread):
                 category="검수 필요", confidence="low",
             )
 
-        self.progress.emit(20, "사전 스크리닝 완료")
+        self._emit_pct(20, "사전 스크리닝 완료")
 
         # [3] AI 교정 — Gemini 생성 엔진. API 키가 없으면 사용 불가.
         ai_list = []
@@ -307,7 +350,15 @@ class ProofreadingWorker(QThread):
             label = "·".join(scopes) if scopes else "보완"
 
             self.step_changed.emit("ai", f"AI {label} 분석 중…")
-            self.progress.emit(40, f"AI {label} 분석 중…")
+            self._emit_pct(21, f"AI {label} 분석 준비 중…")
+
+            # AI 단계는 청크당 4.1초 스로틀 + 호출 시간이라 이 파이프라인에서 가장 길다.
+            #   엔진이 청크 진행률을 돌려주므로 20~70 구간을 그 비율로 채운다 — 예전처럼
+            #   시작 40 / 끝 70 두 값만 찍으면 몇 분 동안 숫자가 멈춰 있다.
+            #   ⚠ 메시지에 퍼센트를 넣지 말 것 — 풋터가 이미 '처리 중 (n%)'을 따로
+            #     그리므로 서로 다른 두 숫자가 나란히 보인다(전체 % vs AI 단계 %).
+            def _ai_progress(frac: float):
+                self._band(21, 70, frac, f"AI {label} 분석 중…")
 
             ai_list = engine.check_scope(
                 text, suspicious_words,
@@ -315,6 +366,7 @@ class ProofreadingWorker(QThread):
                 scope_spacing=scope_spacing,
                 scope_polish=scope_polish,
                 logger=log, stop_event=self._stop,
+                progress_cb=_ai_progress,
             )
             log(f"  → AI 교정 제안: {len(ai_list)}건")
 
@@ -410,8 +462,8 @@ class ProofreadingWorker(QThread):
             ai_list = ai_guards.demote_sentence_boundary_change(ai_list, logger=log)
         elif not opts.get("use_ai", True):
             log("  [AI] AI 분석 제외 모드 — Gemini 호출 없이 사전·규칙 검사만 수행합니다.")
-        self.progress.emit(70, "AI 분석 완료" if opts.get("use_ai", True)
-                           else "AI 분석 제외 — 사전·규칙 검사 진행")
+        self._emit_pct(70, "AI 분석 완료" if opts.get("use_ai", True)
+                       else "AI 분석 제외 — 사전·규칙 검사 진행")
 
         if self._stop.is_set():
             self.error.emit("사용자에 의해 취소되었습니다.")
@@ -427,7 +479,7 @@ class ProofreadingWorker(QThread):
         # ─────────────────────────────────────────────────────────
         # [4] 정렬 및 병합
         self.step_changed.emit("merge", "교정 목록 정렬 및 중복 제거 중…")
-        self.progress.emit(72, "교정 병합 중…")
+        self._emit_pct(71, "교정 병합 중…")
         merged = CorrectionMerger.merge([], ai_list)
         log(f"  → 1차 확정 교정 항목: {len(merged)}건")
         # 생성(AI) 구간이 끝나고 검증(사전·결정론 규칙) 구간이 시작되는 경계.
@@ -444,13 +496,13 @@ class ProofreadingWorker(QThread):
                     log(f"  → 일관성 보정: 변형 단어 {added}건 자동 추가")
             except Exception as e:
                 log(f"  [일관성] 후처리 실패 (스킵): {e}")
-            self.progress.emit(76, "일관성 보정 완료")
+            self._emit_pct(73, "일관성 보정 완료")
 
         # [5] 사전 재검증 (3차) — 항상 수행 (DB 사용 가능 시).
         #     AI가 비표준어로 교정하면 confidence=low로 낮춰 과교정을 억제한다.
         if validator and validator.available and not self._stop.is_set():
             self.step_changed.emit("validate", "표준국어대사전 3차 재검증 중…")
-            self.progress.emit(80, "사전 재검증 중…")
+            self._emit_pct(75, "사전 재검증 중…")
             merged = validator.validate(merged, stop_event=self._stop)
             # 조사 변형 간 신뢰도 통일 — 같은 단어인데 bare=low/조사형=high로 갈려
             # 자동적용 시 한쪽만 교정되는 불일치 방지(예: 훗가이도현 vs 훗가이도현의).
@@ -479,6 +531,7 @@ class ProofreadingWorker(QThread):
             except Exception as e:
                 log(f"  [순화] 외래어 순화 제외 스킵: {e}")
 
+        self._emit_pct(77, "사내 용어 페어 검사 중…")
         # [5.6] 사내 용어 결정론 페어 — userdict.db(core.userdict)의 합의·큐레이터
         #     승인된 사내 비표준→표준 매핑(설계 역할 P). norm_map/eomun_pairs와 동일
         #     경로·형상이며 동형이의어 가드는 빌드타임(build_userdict_db.py)에 적용됨.
@@ -542,6 +595,7 @@ class ProofreadingWorker(QThread):
             except Exception as e:
                 log(f"  [사내 용어] 페어 스킵: {e}")
 
+        self._emit_pct(79, "규범표기 정규화 중…")
         # [5.7] 규범표기 정규화 — 우리말샘 '규범 표기' 사전(norm_map)으로 비표준
         #     표기를 결정론적으로 교정한다(컨텐츠→콘텐츠, 수퍼마켓→슈퍼마켓,
         #     초콜렛→초콜릿 …). 비표준형도 사전엔 '등재'라 ②재검증·⑤안전망이 못 잡던
@@ -597,9 +651,9 @@ class ProofreadingWorker(QThread):
                                 #   억제 아님). 빈도는 base 부분문자열 카운트(②와 동일 방식).
                                 freq = text.count(key)
                                 repeated = freq >= _FREQ_INTENTIONAL
-                                reason = f"[규범표기] '{key}'는 비표준 — 규범 표기 '{norm}' 권장"
+                                reason = f"[규범표기] 규범표기인 '{norm}' 권장"
                                 if repeated:
-                                    reason += f" (저자 {freq}회 반복 — 검수 후 결정)"
+                                    reason += f"\n— 저자 '{key}' {freq}회 반복 → 사용자 결정 필요"
                                 net.append(Correction(
                                     original=w, corrected=corrected,
                                     reason=reason,
@@ -619,6 +673,7 @@ class ProofreadingWorker(QThread):
             except Exception as e:
                 log(f"  [규범표기] 정규화 스킵: {e}")
 
+        self._emit_pct(80, "어문 규범 페어 검사 중…")
         # [5.8] 어문 규범 결정론 페어 — eomun.db(core.eomun_rules)의 검증된 비표준→규범
         #     매핑(설계 역할 B). norm_map과 동일 경로·형상이며 동형이의어 가드는 빌드타임에
         #     적용됨. 실증상 외래어·표준어 비표준형은 norm_map이 이미 커버하므로(B는 norm_map에
@@ -713,6 +768,7 @@ class ProofreadingWorker(QThread):
             except Exception as e:
                 log(f"  [맞춤법] 활용 어간 페어 스킵: {e}")
 
+        self._emit_pct(81, "조사 호응 검사 중…")
         # [5.9] 받침 호응 조사 — 괄호 설명 뒤 조사를 괄호 앞 체언의 받침에 호응시킨다
         #     (영상(15초, 30초)는 → 영상(15초, 30초)은). 받침 규칙은 결정론이라 high.
         if not self._stop.is_set():
@@ -782,8 +838,8 @@ class ProofreadingWorker(QThread):
                         continue
                     net_dup.append(Correction(
                         original=orig, corrected=fixed,
-                        reason="[검수] 공동격 조사 중복 의심 — 앞 어절이 이미 '과/와'로 끝남"
-                               " (중복 조사 삭제 제안, 검토 필요)",
+                        reason="[검수] 조사 중복 의심\n"
+                               "— 앞 어절이 이미 '과/와'로 끝남",
                         source="dict", color=HL_DICT,
                         category="맞춤법", confidence="low",
                     ))
@@ -860,6 +916,7 @@ class ProofreadingWorker(QThread):
             except Exception as e:
                 log(f"  [문장부호] 괄호·따옴표 짝 맞추기 스킵: {e}")
 
+        self._emit_pct(82, "사전 안전망 검사 중…")
         # [6] 사전 안전망 — AI(선택 레이어)가 손대지 않은 미등재어를 '검수 필요'
         #     카드로 노출한다. 사전 탐지가 기본 베이스이므로, AI가 미묘한 오타
         #     (예: '상담채녈')를 놓쳐도 반드시 사용자 눈에 띈다. 자동수정이 아니라
@@ -921,7 +978,13 @@ class ProofreadingWorker(QThread):
                 from core.consistency_pass import _strip_josa as _freq_strip
             except Exception:
                 _freq_strip = lambda w: w
-            for word, clean, reason in dict_flags:
+            # 미등재어 한 건마다 kiwi 형태소·빈도 판정이 붙어 건수에 비례해 오래 걸린다
+            #   → 구간 82~86을 채우며 진행(진행률 설계는 _emit_pct 주석 참조).
+            _n_dict = len(dict_flags)
+            for _i_flag, (word, clean, reason) in enumerate(dict_flags):
+                if _i_flag % 10 == 0:
+                    self._band(82, 86, _i_flag / _n_dict,
+                               f"사전 안전망 검사 중… {_i_flag}/{_n_dict}")
                 # AI가 이 어휘를 이미 교정 대상으로 다뤘으면(부분 포함 포함) 카드를 누른다.
                 #   ⚠ 여기서 `continue`로 **버리면 안 된다** — 근거가 된 AI 교정이
                 #   [8](조사 변형 정리)·[9.5](본문·문서 대조)에서 **나중에 드롭될 수 있고**,
@@ -1027,6 +1090,7 @@ class ProofreadingWorker(QThread):
                 merged.extend(net)
                 det_review.append(("사전안전망", len(net)))
 
+        self._emit_pct(87, "띄어쓰기 백스톱 검사 중…")
         # [7] 띄어쓰기 백스톱 — AI가 놓친 '붙여쓰기→띄어쓰기' 누락을 kiwi 자동
         #     띄어쓰기로 재산출해 '검수 필요'(저신뢰) 카드로 노출한다. kiwi.space는
         #     공백만 삽입하고 글자는 바꾸지 않아(환각 0) 과교정 위험이 없다. 자동수정이
@@ -1078,7 +1142,7 @@ class ProofreadingWorker(QThread):
                                 continue
                         sp_cards.append(Correction(
                             original=eojeol, corrected=spaced,
-                            reason="[검수] 띄어쓰기 누락 의심 — 자동 띄어쓰기 제안(검토 필요)",
+                            reason="[검수] 띄어쓰기 교정 → 사용자 검토 필요\n— 형태소 분석에 의한 띄어쓰기 제안",
                             source="spacing", color=HL_TYPO,
                             category="띄어쓰기", confidence="low",
                         ))
@@ -1106,7 +1170,7 @@ class ProofreadingWorker(QThread):
                             continue
                         sp_cards.append(Correction(
                             original=eojeol, corrected=spaced,
-                            reason="[검수] 의존명사 띄어쓰기 — 체언 뒤 '등·말' 등은 띄어 씀(검토 필요)",
+                            reason="[검수] 의존명사 띄어쓰기 → 사용자 검토 필요\n— 체언 뒤 '등·말' 등은 띄어 씀",
                             source="spacing", color=HL_TYPO,
                             category="띄어쓰기", confidence="low",
                         ))
@@ -1122,7 +1186,7 @@ class ProofreadingWorker(QThread):
                             continue
                         sp_cards.append(Correction(
                             original=eojeol, corrected=spaced,
-                            reason="[검수] 기호 뒤 띄어쓰기 — 닫는 기호(’\")]) 뒤 명사는 띄어 씀(검토 필요)",
+                            reason="[검수] 기호 뒤 띄어쓰기 → 사용자 검토 필요\n— 닫는 기호 뒤 명사는 띄어 씀",
                             source="spacing", color=HL_TYPO,
                             category="띄어쓰기", confidence="low",
                         ))
@@ -1259,7 +1323,7 @@ class ProofreadingWorker(QThread):
                             continue
                         sp_cards.append(Correction(
                             original=orig, corrected=fixed,
-                            reason="[검수] 문장부호·영문 띄어쓰기 누락 의심 — 검토 필요",
+                            reason="[검수] 문장부호 · 영문 띄어쓰기 → 사용자 검토 필요\n— 문장부호와 영문 등의 띄어쓰기 누락 의심",
                             source="spacing", color=HL_TYPO,
                             category="띄어쓰기", confidence="low",
                         ))
@@ -1271,7 +1335,7 @@ class ProofreadingWorker(QThread):
                             continue
                         sp_cards.append(Correction(
                             original=orig, corrected=fixed,
-                            reason="[검수] 인용부호 띄어쓰기 — 여는따옴표 앞 띄움/조사 붙임 제안(검토 필요)",
+                            reason="[검수] 인용부호 띄어쓰기 → 사용자 검토 필요\n— 여는따옴표 앞 띄움 / 조사 붙임 제안",
                             source="spacing", color=HL_TYPO,
                             category="띄어쓰기", confidence="low",
                         ))
@@ -1285,8 +1349,8 @@ class ProofreadingWorker(QThread):
                             continue
                         sp_cards.append(Correction(
                             original=orig, corrected=fixed,
-                            reason="[검수] 부호·따옴표 띄어쓰기 — 문장부호 뒤 여는 따옴표는"
-                                   " 띄고, 여는 따옴표는 뒤 내용에 붙임(검토 필요)",
+                            reason="[검수] 부호 · 따옴표 띄어쓰기 → 사용자 검토 필요\n— 문장부호 뒤 여는 따옴표는"
+                                   " 띄고, 여는 따옴표는 뒤 내용에 붙임",
                             source="spacing", color=HL_TYPO,
                             category="띄어쓰기", confidence="low",
                         ))
@@ -1300,7 +1364,7 @@ class ProofreadingWorker(QThread):
                             continue
                         sp_cards.append(Correction(
                             original=orig, corrected=fixed,
-                            reason="[검수] 괄호 붙임 — 인용·보충 괄호는 앞말에 붙여 씀(검토 필요)",
+                            reason="[검수] 괄호 붙임 → 사용자 검토 필요\n— 인용 · 보충 괄호는 앞말에 붙여 씀",
                             source="spacing", color=HL_TYPO,
                             category="띄어쓰기", confidence="low",
                         ))
@@ -1342,6 +1406,7 @@ class ProofreadingWorker(QThread):
             except Exception as e:
                 log(f"  [띄어쓰기] 백스톱 스킵: {e}")
 
+        self._emit_pct(91, "실단어 오타 탐지 중…")
         # [7.5] 실단어 오류 검수 카드 — 오타가 **사전 등재어**에 떨어져 사전 스크리닝이
         #     원리적으로 못 보는 부류('부고 있다'→'보고 있다', '확용하는'→'활용하는').
         #     kiwi 언어모델의 문맥 점수로 후보를 만들고(core/realword.py) **AI가 1회
@@ -1399,6 +1464,7 @@ class ProofreadingWorker(QThread):
             except Exception as e:
                 log(f"  [실단어] 탐지 스킵: {e}")
 
+        self._emit_pct(93, "적용 정합성 정리 중…")
         # [8] 적용 정합성 — 접두 부분문자열로 이미 처리되는 조사 변형 교정 제거.
         #     bare형('뱃지'→'배지')과 조사형('뱃지를'→'배지를')이 공존하면 적용 단계에서
         #     등장 인덱스가 어긋나 '수락 등장 미적용·거절 등장 오적용' 버그가 난다
@@ -1412,6 +1478,7 @@ class ProofreadingWorker(QThread):
             except Exception as e:
                 log(f"  [적용 정합성] 조사 변형 정리 스킵: {e}")
 
+        self._emit_pct(94, "겹치는 교정 합성 중…")
         # [9] 겹치는 교정 합성 — 같은 구간에 '철자(규범표기/맞춤법) 교정'과 '띄어쓰기/문장부호
         #     교정'이 공존하면 띄어쓰기 카드에 철자 교정을 합성해 **한 카드로** 보여준다.
         #     예) '리플렛등→리플렛 등'(띄어쓰기·low) + '리플렛→리플릿'(규범표기·high)
@@ -1449,6 +1516,7 @@ class ProofreadingWorker(QThread):
             except Exception as e:
                 log(f"  [합성] 겹치는 교정 합성 스킵: {e}")
 
+        self._emit_pct(95, "이음매 정합 검사 중…")
         # [9.2] 이음매(junction) 정합 — 중첩 낱말이 같은 띄어쓰기 이음매를 서로 반대로
         #     결정하는 문제를 정리한다(사용자 보고 2026-07-30). '수당수급자'→'수당 수급자'와
         #     '수당수급자확인서'→'수당수급자 확인서'가 각각 정당해 보이지만 함께 수락하면
@@ -1529,7 +1597,7 @@ class ProofreadingWorker(QThread):
             to_check = sorted({c.original for c in merged if c.original != c.corrected})
             if to_check and not self._stop.is_set():
                 self.step_changed.emit("validate", "문서 대조 검증 중…")
-                self.progress.emit(97, f"문서 대조 검증 중… ({len(to_check)}건)")
+                self._emit_pct(96, f"문서 대조 검증 중… ({len(to_check)}건)")
                 try:
                     verifier = HwpEditor(self.file_path, logger=log)
                     try:
@@ -1552,6 +1620,7 @@ class ProofreadingWorker(QThread):
                             log(f"      · '{o}'")
                 except Exception as e:
                     log(f"  [문서 대조] 검증 건너뜀: {e}")
+                self._emit_pct(98, "문서 대조 검증 완료")
 
         # [9.6] 사전 안전망 재개방 — [6]에서 'AI가 이미 교정함'(covered)으로 눌러 둔
         #     미등재어 중, **그 근거가 사라진** 것을 되살린다.
@@ -1604,7 +1673,7 @@ class ProofreadingWorker(QThread):
             log("  → 검수 카드(검토 필요) "
                 + " · ".join(f"{l} {c}" for l, c in det_review if c) + f" = {tot}건")
 
-        self.progress.emit(100, "분석 완료")
+        self._emit_pct(100, "분석 완료")
 
         # JSON 직렬화
         corrections_json = [

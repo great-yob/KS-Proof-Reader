@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 
 from ui.widgets.components import (
     label, sub_label, divider, chip, badge, IconButton,
-    AnimatedGradientBorder
+    AnimatedGradientBorder, soft_breakable as _soft_breakable
 )
 from ui.styles.theme import current_palette, restyle, LIGHT
 
@@ -114,26 +114,7 @@ class _Occupancy:
         self._m[s:e] = b"\x01" * (e - s)
 
 
-_ZWSP = "\u200b"   # ZERO WIDTH SPACE
-
-
-def _soft_breakable(s: str) -> str:
-    """표시 전용 라벨 텍스트에 ZWSP(폭 0 공백)를 끼워 넣어 어디서든 줄바꿈 가능하게.
-
-    '나타난다.정보통신기획평가원(2025a)·…' 같은 무공백 장문은 Qt 줄바꿈 단위가
-    수백 px가 돼 카드 최소 폭을 밀어 올려 가로 스크롤을 만든다(실측 339px).
-    영문·숫자 연속 구간(2025a, OECD 등) 안에는 넣지 않아 토큰 중간이 끊기지 않는다.
-    """
-    if not s:
-        return s
-    out = [s[0]]
-    prev = s[0]
-    for ch in s[1:]:
-        if not (prev.isascii() and prev.isalnum() and ch.isascii() and ch.isalnum()):
-            out.append(_ZWSP)
-        out.append(ch)
-        prev = ch
-    return "".join(out)
+# ZWSP 소프트 줄바꿈은 설정 화면(긴 파일명)도 쓰므로 components.soft_breakable로 옮겼다.
 
 
 class GrowingTextEdit(QTextEdit):

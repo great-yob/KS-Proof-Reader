@@ -24,11 +24,15 @@ class GeminiEngine:
         self._checker = GeminiChecker(api_key)
 
     def check_scope(self, text, suspicious_words=None, *, scope_typo=True,
-                    scope_spacing=True, scope_polish=False, logger=None, stop_event=None):
+                    scope_spacing=True, scope_polish=False, logger=None,
+                    stop_event=None, progress_cb=None):
+        """progress_cb(frac): 0.0~1.0 AI 단계 진행률(선택). 자세한 계약은
+        GeminiChecker.check_scope 독스트링 참조 — 워커의 진행 막대가 쓴다."""
         return self._checker.check_scope(
             text, suspicious_words or [],
             scope_typo=scope_typo, scope_spacing=scope_spacing,
-            scope_polish=scope_polish, logger=logger, stop_event=stop_event)
+            scope_polish=scope_polish, logger=logger, stop_event=stop_event,
+            progress_cb=progress_cb)
 
     def verify_realword(self, candidates, logger=None, stop_event=None):
         """실단어 오류 후보 검증(core/realword.py 결과 판정) — **생성이 아니라 판정**이다.

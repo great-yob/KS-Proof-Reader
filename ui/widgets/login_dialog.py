@@ -82,6 +82,18 @@ class LoginDialog(QDialog):
         row.addWidget(self._btn)
         root.addLayout(row)
 
+        # ⚠ **Enter 키가 앱을 종료시키던 자리**(사용자 보고 2026-08-06, 실측 확인).
+        #   QDialog는 기본 버튼이 지정되지 않으면 **먼저 생성된 첫 autoDefault 버튼**을
+        #   기본 버튼으로 삼는다 → 여기선 '종료'(취소)였다. QLineEdit은 Return을
+        #   소비하지 않고(returnPressed만 쏘고) 이벤트를 다이얼로그로 넘기므로, Enter
+        #   한 번이 `_submit()`과 `reject()`를 **둘 다** 실행했다. 게이트에서 reject는
+        #   곧 `sys.exit(0)`이라 사용자에겐 '로그인하려는데 앱이 꺼짐'으로 보인다.
+        #   (마우스 클릭은 이 경로를 안 타서 증상이 Enter에서만 났다.)
+        #   → 기본 버튼을 '로그인'으로 못 박고, 취소에서는 autoDefault를 뗀다.
+        self._cancel.setAutoDefault(False)
+        self._btn.setAutoDefault(True)
+        self._btn.setDefault(True)
+
         self._id.returnPressed.connect(self._submit)
         self._pw.returnPressed.connect(self._submit)
 
@@ -130,6 +142,12 @@ class LoginDialog(QDialog):
 
     # ── 동작 ──────────────────────────────────────────
     def _submit(self):
+        # ⚠ Enter는 returnPressed와 기본 버튼 클릭을 **둘 다** 유발한다(위 _build_ui 주석).
+        #   busy일 땐 버튼이 비활성이라 대개 막히지만, 그 사이에 워커가 두 개 뜨면
+        #   _worker 참조가 덮여 먼저 뜬 스레드를 아무도 기다리지 못한다 — 실행 중 파괴
+        #   크래시의 씨앗이라 진입점에서 잠근다.
+        if self._worker is not None and self._worker.isRunning():
+            return
         email = self._id.text().strip()
         pw = self._pw.text()
         if not email or not pw:
@@ -179,22 +197,32 @@ class LoginDialog(QDialog):
 
     def closeEvent(self, event):
         # 워커가 살아있는 채로 닫히면 파괴 중 실행 크래시 → 끝날 때까지 대기(로그인은 빠름).
-        for w in (self._worker, self._restore_worker):
-            if w is not None and w.isRunning():
-                w.wait()
+        self._wait_workers()
         event.accept()
 
+    def _wait_workers(self):
+        """살아 있는 워커를 모두 끝낸다 — 다이얼로그가 실행 중 파괴되면 앱이 죽는다.
+
+        ⚠ **두 워커를 모두** 봐야 한다. 예전엔 reject()가 `_restore_worker`만 기다려,
+          로그인 요청이 뜬 직후 닫히는 경로(Enter가 _submit과 reject를 함께 일으키던
+          그 경로)에서 `_worker`가 실행 중인 채 파괴됐다.
+        """
+        for name in ("_worker", "_restore_worker"):
+            w = getattr(self, name, None)
+            if w is None:
+                continue
+            if w.isRunning():
+                try:
+                    w.disconnect()
+                except Exception:
+                    pass
+                w.wait()
+            setattr(self, name, None)
+
     def reject(self):
-        # 게이트에서 사용자가 '종료'를 눌렀는데 세션 확인 워커가 아직 돌고 있으면,
-        #   여기서 기다려 주지 않으면 다이얼로그가 실행 중 파괴돼 앱이 죽는다.
-        w = self._restore_worker
-        if w is not None and w.isRunning():
-            try:
-                w.disconnect()
-            except Exception:
-                pass
-            w.wait()
-            self._restore_worker = None
+        # 게이트에서 사용자가 '종료'를 눌렀는데 워커가 아직 돌고 있으면, 여기서
+        #   기다려 주지 않으면 다이얼로그가 실행 중 파괴돼 앱이 죽는다.
+        self._wait_workers()
         super().reject()
 
 

@@ -137,6 +137,29 @@ def label(text: str, role: str = "", muted: bool = False,
     return lbl
 
 
+_ZWSP = "​"   # ZERO WIDTH SPACE
+
+
+def soft_breakable(s: str) -> str:
+    """표시 전용 라벨 텍스트에 ZWSP(폭 0 공백)를 끼워 넣어 어디서든 줄바꿈 가능하게.
+
+    '나타난다.정보통신기획평가원(2025a)·…' 같은 무공백 장문이나 긴 파일명은 Qt의
+    줄바꿈 단위가 수백 px가 돼, 줄바꿈을 켜도 접히지 않고 칸의 최소 폭을 밀어 올린다
+    (실측 339px). 영문·숫자 연속 구간(2025a, OECD, 260730 등) 안에는 넣지 않아
+    토큰 중간이 끊기지 않는다.
+    """
+    if not s:
+        return s
+    out = [s[0]]
+    prev = s[0]
+    for ch in s[1:]:
+        if not (prev.isascii() and prev.isalnum() and ch.isascii() and ch.isalnum()):
+            out.append(_ZWSP)
+        out.append(ch)
+        prev = ch
+    return "".join(out)
+
+
 def heading(text: str, level: int = 1) -> QLabel:
     return label(text, role="h1" if level == 1 else "h2")
 

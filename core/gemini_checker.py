@@ -5,6 +5,7 @@ core/gemini_checker.py — Gemini AI 교정교열 엔진
 """
 
 import json
+import math
 import re
 import threading
 import time
@@ -222,7 +223,8 @@ class GeminiChecker:
     # ── 공개 메서드 ────────────────────────────────────
 
     def check_typo_integrated(self, text: str, suspicious_words: list,
-                              logger=None, stop_event: threading.Event = None) -> list:
+                              logger=None, stop_event: threading.Event = None,
+                              progress_cb=None) -> list:
         """사전 의심 단어 검증을 포함한 오탈자·띄어쓰기 통합 보완.
 
         청크 간 일관성을 위해 누적 글로서리를 매 청크 프롬프트에 주입.
@@ -267,6 +269,7 @@ class GeminiChecker:
             glossary=glossary,
             fallback_tmpl=fallback_tmpl,
             max_output_tokens=AI_MAX_OUT_TYPO,
+            progress_cb=progress_cb,
         )
 
     def verify_realword_candidates(self, candidates: list,
@@ -323,7 +326,8 @@ class GeminiChecker:
         return out
 
     def check_polish(self, text: str,
-                     logger=None, stop_event: threading.Event = None) -> list:
+                     logger=None, stop_event: threading.Event = None,
+                     progress_cb=None) -> list:
         """출판사 에디터 수준의 전체 윤문"""
         prompt_tmpl = lambda chunk: build_polish_prompt(chunk)
 
@@ -332,28 +336,51 @@ class GeminiChecker:
             set(), "ai_polish", HL_POLISH,
             logger, stop_event,
             max_output_tokens=AI_MAX_OUT_POLISH,
+            progress_cb=progress_cb,
         )
 
     def check_scope(self, text: str, suspicious_words: list,
                     scope_typo: bool = True, scope_spacing: bool = True,
                     scope_polish: bool = False,
-                    logger=None, stop_event=None) -> list:
-        """범위 선택적 교정."""
+                    logger=None, stop_event=None, progress_cb=None) -> list:
+        """범위 선택적 교정.
+
+        progress_cb(frac): 0.0~1.0 **전체 AI 단계** 진행률. 호출 측(워커)이 진행 막대에
+          쓴다 — AI 단계는 청크당 4.1초 스로틀이라 문서 하나에 수십 초~수 분이 걸리고,
+          이 콜백이 없으면 그 구간 전체가 한 숫자에 멈춰 보인다(사용자 보고 2026-08-06).
+          패스가 둘(오탈자·윤문)이면 각 패스를 1/n 구간으로 나눠 이어 붙인다.
+        """
         results = []
         # S9: 실행 단위로 실패 집계 리셋(오탈자+윤문 두 패스 누적)
         self.last_failed_chunks = 0
         self.last_total_chunks  = 0
 
+        passes = int(bool(scope_typo or scope_spacing)) + int(bool(scope_polish))
+        done_passes = 0
+
+        def _pass_cb(idx):
+            """패스 idx(0-based)의 (완료 청크, 전체 청크)를 전체 진행률로 접는다."""
+            if progress_cb is None or passes <= 0:
+                return None
+            def cb(done, total):
+                frac = (idx + (done / total if total else 1.0)) / passes
+                progress_cb(min(1.0, max(0.0, frac)))
+            return cb
+
         if scope_typo or scope_spacing:
             if logger:
                 logger("  [AI] 오탈자·사전 통합 분석 시작…")
-            typo_results = self.check_typo_integrated(text, suspicious_words, logger, stop_event)
+            typo_results = self.check_typo_integrated(
+                text, suspicious_words, logger, stop_event,
+                progress_cb=_pass_cb(done_passes))
             results.extend(typo_results)
+            done_passes += 1
 
         if scope_polish and (not stop_event or not stop_event.is_set()):
             if logger:
                 logger("  [AI] 윤문 분석 시작…")
-            polish_results = self.check_polish(text, logger, stop_event)
+            polish_results = self.check_polish(
+                text, logger, stop_event, progress_cb=_pass_cb(done_passes))
             results.extend(polish_results)
 
         return results
@@ -363,7 +390,7 @@ class GeminiChecker:
     def _run_chunked(self, text, prompt_tmpl, chunk_size,
                      skip_set, source, color, logger, stop_event,
                      glossary: list = None, fallback_tmpl=None,
-                     max_output_tokens: int = None) -> list:
+                     max_output_tokens: int = None, progress_cb=None) -> list:
         """텍스트를 청크로 분할하여 AI 호출, 결과 병합.
 
         glossary 리스트가 주어지면 매 청크의 확정 교정을 누적해
@@ -377,6 +404,25 @@ class GeminiChecker:
         # 글로서리 폭주 방지 — 한 청크 프롬프트에 너무 많이 들어가지 않게 제한
         GLOSSARY_MAX = 50
 
+        # 청크 수가 정해지는 순간 0%를 한 번 알린다 — 첫 호출이 끝나기까지의 몇 초도
+        #   진행 막대가 '직전 단계 값'에 멈춰 있지 않게 하기 위함.
+        # ⚠ 진행 보고는 **단조**여야 한다. 호출 중 기어감·대기 중 기어감·청크 확정이
+        #   서로 다른 기준으로 값을 내면 뒤로 가는 값이 섞여, 받는 쪽이 그걸 버리는
+        #   동안 막대가 멈춘 것처럼 보인다(실측: 호출 시작 후 4.7초간 정지).
+        #   그래서 마지막으로 알린 위치를 들고 다니며 항상 거기서 이어 간다.
+        _last = [0.0]
+
+        def _report(pos: float):
+            if progress_cb is None:
+                return
+            if pos <= _last[0]:
+                return
+            _last[0] = pos
+            progress_cb(pos, total)
+
+        if progress_cb:
+            progress_cb(0, total)
+
         for i, chunk in enumerate(chunks):
             if stop_event and stop_event.is_set():
                 if logger:
@@ -388,10 +434,28 @@ class GeminiChecker:
 
             self.last_total_chunks += 1
             fallback = fallback_tmpl(chunk) if fallback_tmpl is not None else None
-            raw_items = self._call_and_parse(prompt_tmpl(chunk), logger,
-                                             stop_event=stop_event,
-                                             fallback_prompt=fallback,
-                                             max_output_tokens=max_output_tokens)
+            # 호출이 도는 동안에도 진행률이 기어가게 한다 — 청크가 하나뿐인 문서
+            #   (15,000자 미만)는 이게 없으면 AI 단계 내내 숫자가 고정된다.
+            #   ⚠ **다음 청크 몫을 넘지 않는다**: 한 청크 몫의 90%를 상한으로 지수
+            #     감쇠(τ=8초)라 호출이 길어져도 경계를 침범하지 않는다. 실제 완료는
+            #     아래 progress_cb(i+1)이 확정한다 — 기어감은 추정, 확정은 사실.
+            _tick_stop = threading.Event()
+            if progress_cb:
+                def _tick(_from=max(float(i), _last[0]), _to=i + 0.9, _t0=time.time()):
+                    span = _to - _from
+                    while not _tick_stop.wait(0.4):
+                        if span <= 0:
+                            return
+                        _el = time.time() - _t0
+                        _report(_from + span * (1 - math.exp(-_el / 8.0)))
+                threading.Thread(target=_tick, daemon=True).start()
+            try:
+                raw_items = self._call_and_parse(prompt_tmpl(chunk), logger,
+                                                 stop_event=stop_event,
+                                                 fallback_prompt=fallback,
+                                                 max_output_tokens=max_output_tokens)
+            finally:
+                _tick_stop.set()
             if raw_items is None:          # 호출 실패(재시도 소진) — 빈 결과와 구분해 집계
                 self.last_failed_chunks += 1
                 raw_items = []
@@ -415,8 +479,22 @@ class GeminiChecker:
                     if len(glossary) >= GLOSSARY_MAX:
                         break
 
+            _report(i + 1)          # 확정: 이 청크는 실제로 끝났다
+
             if i < total - 1:
-                time.sleep(AI_CALL_DELAY)
+                # 스로틀 대기(4.1초)도 이 단계에서 실제로 흘러가는 시간이라 진행률에
+                #   반영한다 — 청크 경계에서만 알리면 막대가 청크당 한 번씩 '툭' 뛴다.
+                #   ⚠ 다음 청크 몫을 미리 당겨쓰지 않도록 **한 청크 몫의 40%까지만**
+                #     기어간다(대기 4.1초가 한 사이클에서 차지하는 대략의 비중).
+                #     stop_event도 여기서 확인해 취소 반응이 4.1초 늦지 않게 한다.
+                _slept = 0.0
+                while _slept < AI_CALL_DELAY:
+                    if stop_event and stop_event.is_set():
+                        break
+                    _step = min(0.25, AI_CALL_DELAY - _slept)
+                    time.sleep(_step)
+                    _slept += _step
+                    _report(i + 1 + 0.4 * (_slept / AI_CALL_DELAY))
 
         # 중복 제거
         seen, unique = set(), []
