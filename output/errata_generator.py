@@ -104,6 +104,24 @@ _SHEETS = (
 _HEADERS = ["쪽", "수정 전", "수정 후", "교정 이유", "교정 유형"]
 _COL_WIDTHS = {"A": 8, "B": 28, "C": 28, "D": 70, "E": 14}
 
+# PDF 주석 모드에서만 붙는 6번째 칸.
+#   ⚠ **한/글 쪽(prnpageno)과 다른 좌표계**라 한 칸에 섞을 수 없다. 구역마다 쪽 번호를
+#     새로 시작할 수 있어 둘 사이에 고정 오프셋조차 없다(실측: PageCount 17인데 문서 끝
+#     prnpageno 18). 그래서 계산이 아니라 **PDF에서 직접 찾은 값**을 따로 싣는다.
+#   ⚠ 맨 뒤에 붙인다 — 앞 다섯 칸의 자리를 그대로 둬야 다른 모드의 정오표와 같은 모양이
+#     유지되고, 시트를 이어 붙여 쓰는 실무 관행이 깨지지 않는다.
+_PDF_HEADER = "PDF 쪽"
+_PDF_COL = 6
+_PDF_COL_WIDTH = 9
+
+# '교정'(todo) 시트의 부제는 **어떻게 표시했는지**에 따라 달라진다 — 무엇을 보고
+#   반영해야 하는지가 모드마다 다르기 때문.
+_TODO_SUBTITLE = {
+    "errata": "한글 파일은 수정하지 않았습니다 — 아래 쪽을 찾아 직접 반영하세요",
+    "memo":   "한글 파일의 해당 자리에 메모로 표시했습니다 — 메모를 보며 직접 반영하세요",
+    "pdf":    "PDF의 해당 자리에 주석으로 표시했습니다 — 주석을 보며 직접 반영하세요",
+}
+
 
 def generate_errata(
     rows: list,          # 등장 1곳 = 1행짜리 결과 리스트
@@ -135,8 +153,12 @@ def generate_errata(
     wb = Workbook()
     wb.remove(wb.active)  # 기본 시트 제거
 
+    out_mode = (options or {}).get("output_mode", "")
+
     made = 0
     for name, outcomes, subtitle in _SHEETS:
+        if name == "교정":
+            subtitle = _TODO_SUBTITLE.get(out_mode, subtitle)
         part = [r for r in rows if r.get("outcome") in outcomes]
         # ⚠ 비면 시트를 만들지 않는다 — 빈 '확인 필요' 탭은 '확인할 게 있나?'라는
         #   잘못된 신호를 준다. 단, 전부 비면 최소한 '적용' 한 장은 남긴다(아래).
@@ -159,13 +181,20 @@ def _build_sheet(wb: Workbook, title: str, subtitle: str,
                  part: list, all_rows: list, hwp_path: str, options: dict):
     ws = wb.create_sheet(title)
 
+    # PDF 주석 모드에서만 6번째 칸이 붙는다(위 _PDF_HEADER 주석).
+    with_pdf = (options or {}).get("output_mode") == "pdf"
+    headers = list(_HEADERS) + ([_PDF_HEADER] if with_pdf else [])
+    last_col = chr(ord("A") + len(headers) - 1)
+
     for col, width in _COL_WIDTHS.items():
         ws.column_dimensions[col].width = width
+    if with_pdf:
+        ws.column_dimensions["F"].width = _PDF_COL_WIDTH
 
     _write_title_block(ws, title, subtitle, part, all_rows, hwp_path, options)
 
     # ── 헤더 행 (행 4) ────────────────────────────────
-    for col_idx, h in enumerate(_HEADERS, start=1):
+    for col_idx, h in enumerate(headers, start=1):
         cell = ws.cell(row=4, column=col_idx, value=h)
         cell.font      = Font(name="맑은 고딕", bold=True, color=_C["header_fg"], size=10)
         cell.fill      = PatternFill("solid", fgColor=_C["header_bg"])
@@ -173,7 +202,7 @@ def _build_sheet(wb: Workbook, title: str, subtitle: str,
         cell.border    = _thin_border()
     ws.row_dimensions[4].height = 24
     ws.freeze_panes = "A5"
-    ws.auto_filter.ref = f"A4:E{4 + len(part)}"
+    ws.auto_filter.ref = f"A4:{last_col}{4 + len(part)}"
 
     # ── 데이터 행 (행 5~) ─────────────────────────────
     for row_offset, item in enumerate(part):
@@ -227,7 +256,10 @@ def _build_sheet(wb: Workbook, title: str, subtitle: str,
         #     정오표를 통째로 복사·병합해 쓸 수 있다.
         reason = item.get("reason", "") or ""
         note   = item.get("note", "") or ""
-        if note and outcome in ("failed", "applied"):
+        # ⚠ 'todo'도 포함한다 — 메모·PDF 모드에서 **표시조차 못 한 자리**(머리말이라
+        #   한/글이 메모를 거부했거나 PDF에서 원문을 못 찾은 경우)가 여기로 실린다.
+        #   빼면 편집자는 메모가 달린 줄 알고 그 자리를 지나친다.
+        if note and outcome in ("failed", "applied", "todo"):
             reason = f"{reason} ◆ {note}" if reason else note
         _wcell(ws, row, 4, reason, fill, border,
                align=Alignment(horizontal="left", vertical="top", wrap_text=True))
@@ -235,6 +267,16 @@ def _build_sheet(wb: Workbook, title: str, subtitle: str,
         # ⑤ 교정 유형 — 무엇을 고쳤나(맞춤법·띄어쓰기·규범표기…). 비면 출처 라벨.
         _wcell(ws, row, 5, _type_label(item), fill, border,
                align=Alignment(horizontal="center", vertical="top"))
+
+        # ⑥ PDF 쪽 — PDF 주석 모드에서만. ①의 한/글 쪽과 **다른 좌표계**다.
+        if with_pdf:
+            pp = item.get("pdf_page")
+            pcell = _wcell(ws, row, _PDF_COL, pp if isinstance(pp, int) else "—",
+                           fill, border,
+                           align=Alignment(horizontal="center", vertical="top"))
+            pcell.font = (Font(name="맑은 고딕", size=10, bold=True)
+                          if isinstance(pp, int) else
+                          Font(name="맑은 고딕", size=9, color=_C["muted_fg"]))
 
         ws.row_dimensions[row].height = _row_height(
             item.get("original", ""), corrected, reason)
@@ -264,13 +306,18 @@ def _build_sheet(wb: Workbook, title: str, subtitle: str,
         ws.row_dimensions[r].height = 16
 
     note_row = legend_row + 1 + len(legends) + 1
-    nc = ws.cell(row=note_row, column=1,
-                 value="※ '쪽'은 한/글 쪽 번호입니다 — 한/글에서 Alt+G(쪽 찾아가기)에 "
-                       "그대로 입력하면 해당 위치로 이동합니다. "
-                       "'—'는 쪽 번호를 확인하지 못한 항목입니다.")
+    note_txt = ("※ '쪽'은 한/글 쪽 번호입니다 — 한/글에서 Alt+G(쪽 찾아가기)에 "
+                "그대로 입력하면 해당 위치로 이동합니다. "
+                "'—'는 쪽 번호를 확인하지 못한 항목입니다.")
+    if with_pdf:
+        # ⚠ 두 쪽 번호가 다르다는 것을 **정오표 안에서** 말해 준다. 안 그러면 편집자가
+        #   둘이 어긋난 것을 도구의 오류로 읽는다.
+        note_txt += ("  'PDF 쪽'은 변환된 PDF의 물리 쪽 번호로, 한/글 쪽 번호와 "
+                     "다를 수 있습니다(구역마다 쪽 번호를 새로 시작하는 문서).")
+    nc = ws.cell(row=note_row, column=1, value=note_txt)
     nc.font      = Font(name="맑은 고딕", size=8, color="FF666666")
     nc.alignment = Alignment(vertical="center")
-    ws.merge_cells(f"A{note_row}:E{note_row}")
+    ws.merge_cells(f"A{note_row}:{last_col}{note_row}")
 
 
 def _write_title_block(ws, title: str, subtitle: str, part: list, all_rows: list,

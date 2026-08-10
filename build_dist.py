@@ -415,6 +415,12 @@ def build(console: bool, clean: bool) -> int:
         "--exclude-module", "kiwipiepy_model",
         # SVG 아이콘 렌더링에 필요(CLAUDE.md: QtSvg + qsvg 이미지 플러그인).
         "--hidden-import", "PySide6.QtSvg",
+        # PDF 주석 결과물(output_mode="pdf"). pypdfium2는 네이티브 pdfium DLL을 들고
+        #   있어 바이너리까지 함께 모아야 한다 — 모듈만 넣으면 배포본에서 import 시점에
+        #   DLL을 못 찾는다. output/pdf_annotator는 지연 import + graceful이라 실패해도
+        #   앱은 뜨지만, 그러면 PDF 모드만 조용히 죽는다.
+        "--collect-all", "pypdfium2",
+        "--hidden-import", "pypdf",
         # COM 브리지가 지연 import하는 모듈들(32비트 워커 쪽과 별개로 64비트에서도 필요).
         "--hidden-import", "pythoncom",
         "--hidden-import", "pywintypes",

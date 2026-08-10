@@ -30,6 +30,7 @@ ui/widgets/result_panel.py — 교정 완료 보고서 패널 (글래스 대시�
 
 import html
 import math
+import os
 import time
 import datetime
 
@@ -44,10 +45,10 @@ from PySide6.QtGui import (
 )
 from PySide6.QtCore import (
     Qt, QRectF, QPoint, QPointF, QVariantAnimation, QEasingCurve,
-    QTimer,
+    QTimer, Signal,
 )
 
-from ui.widgets.components import IconLabel
+from ui.widgets.components import IconLabel, IconButton
 from ui.styles.theme import current_palette, current_mode
 
 
@@ -1021,6 +1022,12 @@ class BarListChart(QWidget):
 # ══════════════════════════════════════════════════════════════
 
 class ResultPanel(QWidget):
+    # ── 추가 산출물 ───────────────────────────────
+    #   결과 화면에서 **검토를 다시 거치지 않고** 다른 결과물을 하나 더 만든다.
+    #   패널은 요청만 내보내고 실행은 MainWindow가 한다(패널은 워커를 모른다).
+    extra_output_requested = Signal(str)   # mode: "hwp"|"memo"|"pdf"|"errata"
+    output_open_requested  = Signal(str)   # 산출물 경로 — 그 파일이 있는 폴더 열기
+
     # 유리 뒤 배경 샘플용 저해상도 버퍼 폭 — 리샘플이 곧 블러이므로 작을수록 프로스트감↑.
     _MESH_W = 160
     # 패널 배경(책 이미지 합성)의 중간 해상도 폭 — 이 폭을 넘으면 다운스케일해 성능 확보.
@@ -1031,7 +1038,8 @@ class ResultPanel(QWidget):
     # 등장 스케줄(ms) — 카드가 한 장씩 천천히 떠오른다.
     _T_CARD1, _T_CARD2, _T_CARD3 = 350, 700, 1050
     _T_CH1, _T_CH2, _T_CH3 = 1450, 1700, 1950
-    _T_BOT1, _T_BOT2 = 2250, 2500
+    _T_OUT = 2150
+    _T_BOT1, _T_BOT2 = 2400, 2650
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1045,6 +1053,10 @@ class ResultPanel(QWidget):
         self._animate = False
         self._glass_cards = []
         self._anims = []
+        # 추가 산출물이 만들어지는 중인가 — 값이 있으면 그 모드(문자열). 렌더될 때마다
+        #   버튼을 새로 만들므로 상태는 패널이 들고 있어야 한다.
+        self._extra_busy = ""
+        self._extra_status = ""
         # 배경 — 위상 드리프트 타이머(표시 중에만 동작)
         self._t0 = time.time()
         self._bg_cache = None              # ((bw, bh), QImage) — 패널 배경(책 합성)
@@ -1355,6 +1367,34 @@ class ResultPanel(QWidget):
         self._animate = True
         self._render()
 
+    def update_result(self, result: dict = None):
+        """결과 dict가 바뀌었을 때의 **정적** 재렌더(추가 산출물·정오표 생성 등).
+
+        ⚠ `show_result`를 쓰면 대시보드 전체가 다시 카운트업·차트 애니메이션을 재생한다
+          — 산출물 한 줄이 늘었을 뿐인데 화면이 통째로 다시 시작하는 것처럼 보인다.
+          그래서 이 경로는 `refresh_theme`과 같은 '애니메이션 없이 최종값' 렌더다.
+
+        결과가 갱신됐다는 것은 진행 중이던 추가 산출물 실행이 끝났다는 뜻이므로
+        진행 표시도 함께 해제한다(렌더를 두 번 하지 않기 위해 한 곳에서 처리).
+        """
+        if result is not None:
+            self._result = result
+        self._extra_busy = ""
+        self._extra_status = ""
+        self._animate = False
+        self._render()
+
+    def set_extra_busy(self, mode: str = "", status: str = ""):
+        """추가 산출물 실행 상태 표시(빈 문자열이면 해제) — 버튼 잠금 + 상태 문구.
+
+        ⚠ 대시보드를 통째로 다시 그린다. **진행률마다 부르지 말 것** — 시작/종료
+          두 번만 부르고, 퍼센트는 하단 상태바(StatusFooter)가 맡는다.
+        """
+        self._extra_busy = mode or ""
+        self._extra_status = status or ""
+        self._animate = False
+        self._render()
+
     def refresh_theme(self):
         self._bg_cache = None
         self._mesh_cache = None
@@ -1400,6 +1440,10 @@ class ResultPanel(QWidget):
         self._col.addWidget(self._build_charts(
             review_mode, applied, flagged, n_prop, n_rule, n_ai, rate, cors,
             errata_only, to_apply))
+
+        outputs = self._build_outputs()
+        if outputs is not None:
+            self._col.addWidget(self._rise(outputs, self._T_OUT))
 
         bottom = QHBoxLayout()
         bottom.setSpacing(22)
@@ -1452,6 +1496,194 @@ class ResultPanel(QWidget):
         self._anims.append((riser, delay))
         return riser
 
+    # ── 결과물 모드 ───────────────────────────────
+    #   ⚠ `errata_only`(불리언)는 '한글 파일을 고치지 않았다'까지만 말해 준다. 어느
+    #     산출물인지는 `output_mode`만 안다 — 라벨을 그 값으로 고른다.
+    _OUT_CARD3 = {
+        "errata": ("정오표",   "한글 파일 미수정 · 수동 반영"),
+        "memo":   ("메모",     "본문 글자 무변경 · 메모로 표시"),
+        "pdf":    ("PDF 주석", "원본 무변경 · PDF에 주석 표시"),
+    }
+    _MARK_LABEL = {"errata": "기록", "memo": "메모", "pdf": "주석"}
+
+    def _out_mode(self) -> str:
+        r = self._result or {}
+        m = r.get("output_mode")
+        if m in ("hwp", "errata", "memo", "pdf"):
+            return m
+        return "errata" if r.get("errata_only") else "hwp"
+
+    def _marked_count(self) -> int:
+        """이 모드가 실제로 '표시한' 자리 수(곳). 정오표만 모드는 표시 개념이 없다."""
+        r = self._result or {}
+        return int((r.get("memoed") if self._out_mode() == "memo"
+                    else r.get("annotated") if self._out_mode() == "pdf"
+                    else 0) or 0)
+
+    # ── 추가 산출물 ───────────────────────────────
+    #   (아이콘, 설정 화면과 같은 이름, 산출 파일 이름, 한 줄 설명, 짧은 꼬리표)
+    #   ⚠ 이름은 설정 화면(`setup_panel._OUTPUT_CARDS`)과 **같은 말**을 쓴다 — 같은
+    #     선택지를 두 화면이 다르게 부르면 사용자는 다른 기능이라고 읽는다.
+    #   ⚠ 짧은 꼬리표는 `main_window._extra_errata_path`가 붙이는 파일명 괄호와 **같은
+    #     말**이어야 한다 — 화면에는 '정오표 (메모)', 파일은 `…_정오표(메모).xlsx`.
+    _OUT_META = {
+        "hwp":    ("clipboard-check", "HWP (빨간색)",  "교정본",
+                   "원고에 반영 + 빨간색 표시", "교정본"),
+        "memo":   ("file-text",       "HWP (메모)",    "메모본",
+                   "글자 무변경 + 메모로 표시", "메모"),
+        "pdf":    ("file-down",       "PDF (주석)",    "PDF 주석본",
+                   "PDF 변환 + 형광펜·주석", "PDF"),
+        "errata": ("table",           "Excel (정오표)", "정오표",
+                   "쪽·수정 전·수정 후 기록", "정오표만"),
+    }
+    _OUT_ORDER = ("hwp", "memo", "pdf", "errata")
+
+    def _produced_modes(self) -> set:
+        """이미 만들어진 결과물 — 1차 실행 + 추가 실행 + 동봉된 정오표."""
+        r = self._result or {}
+        done = {self._out_mode()}
+        for e in (r.get("extra_outputs") or []):
+            if e.get("mode"):
+                done.add(e["mode"])
+        # 정오표는 어느 모드에서든 곁들여 나온다 — 파일이 있으면 '이미 있음'이다.
+        if r.get("errata_path"):
+            done.add("errata")
+        return done
+
+    @staticmethod
+    def _mode_summary(mode: str, d: dict) -> str:
+        """산출물 한 줄 요약 — 각 모드가 **자기 칸의 수치**로만 말한다.
+        ⚠ `applied`(본문 글자를 실제로 바꾼 건수)를 다른 모드에 빌려주지 않는다."""
+        d = d or {}
+        if mode == "hwp":
+            return (f"적용 {int(d.get('applied', 0)):,}건 "
+                    f"· 본문 {int(d.get('occurrences', 0)):,}곳")
+        if mode == "memo":
+            s = f"메모 {int(d.get('memoed', 0)):,}곳"
+            if d.get("memo_blocked"):
+                s += f" · 메모 불가 {int(d['memo_blocked']):,}곳"
+            return s
+        if mode == "pdf":
+            s = f"주석 {int(d.get('annotated', 0)):,}곳"
+            if d.get("pdf_missing"):
+                s += f" · 미탐 {int(d['pdf_missing']):,}건"
+            return s
+        rows = d.get("errata_rows")
+        return f"{len(rows):,}행" if rows else ""
+
+    def _artifact_rows(self) -> list:
+        """만들어진 파일 목록 — [(라벨, 경로, 요약), …]. 1차 실행분이 먼저."""
+        r = self._result or {}
+        primary = self._out_mode()
+        rows = []
+        if r.get("hwp_path"):
+            rows.append((self._OUT_META.get(primary, (None, None, "한글 산출물"))[2],
+                         r["hwp_path"], self._mode_summary(primary, r)))
+        if r.get("pdf_path"):
+            rows.append((self._OUT_META["pdf"][2], r["pdf_path"],
+                         self._mode_summary("pdf", r)))
+        if r.get("errata_path"):
+            rows.append((self._OUT_META["errata"][2], r["errata_path"],
+                         self._mode_summary("errata", r)))
+        for e in (r.get("extra_outputs") or []):
+            m = e.get("mode", "")
+            meta = self._OUT_META.get(m)
+            if e.get("path"):
+                rows.append((meta[2] if meta else "산출물", e["path"],
+                             self._mode_summary(m, e)))
+            # 추가 실행이 자기 정오표를 따로 냈을 때만(같은 파일이면 위에서 이미 실렸다)
+            if e.get("errata_path") and e["errata_path"] != r.get("errata_path"):
+                rows.append((f"정오표 ({meta[4] if meta else m})", e["errata_path"],
+                             self._mode_summary("errata", e)))
+        return rows
+
+    def _artifact_row_widget(self, label: str, path: str, summary: str) -> QWidget:
+        pal = current_palette()
+        dark = current_mode() == "dark"
+        item = QFrame()
+        item.setObjectName("outInset")
+        ins_bg = _rgba("#000000", 0.24) if dark else _rgba("#0F172A", 0.05)
+        ins_bd = _rgba("#FFFFFF", 0.07) if dark else _rgba("#FFFFFF", 0.65)
+        item.setStyleSheet(
+            f"QFrame#outInset {{ background:{ins_bg}; border:1px solid {ins_bd}; "
+            "border-radius:12px; }}")
+        row = QHBoxLayout(item)
+        row.setContentsMargins(16, 11, 12, 11)
+        row.setSpacing(12)
+
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        head = QLabel(
+            f'<span style="color:{pal["text"]};font-weight:700;">{html.escape(label)}</span>'
+            f'<span style="color:{pal["text_muted"]};">  {html.escape(os.path.basename(path))}</span>')
+        head.setStyleSheet("font-size:14px; background:transparent; border:none;")
+        head.setWordWrap(True)
+        col.addWidget(head)
+        if summary:
+            col.addWidget(_ctext(summary, px=13, color="text_sub", weight=500))
+        row.addLayout(col, 1)
+
+        # ⚠ `clicked`는 checked(bool)를 슬롯에 넘긴다 — PySide6는 람다가 받을 수 있는
+        #   만큼 인자를 채우므로 `lambda p=path:`로 쓰면 p가 **True로 덮인다**.
+        btn = IconButton("folder-open", text="폴더 열기", variant="ghost",
+                         role="text_sub", size=14,
+                         on_click=lambda *_a, p=path: self.output_open_requested.emit(p))
+        row.addWidget(btn, 0, Qt.AlignVCenter)
+        return item
+
+    def _build_outputs(self):
+        """산출물 카드 — 만들어진 파일 목록 + **결과물 추가** 버튼.
+
+        ★검토를 다시 거치지 않고 다른 결과물을 하나 더 만드는 자리다. 예전엔 다른
+          결과물이 필요하면 초기화 → 옵션 선택 → 같은 검토를 처음부터 다시 해야 했다
+          (사용자 요구 2026-08-07). 결정(수락/거절·부분 거절)은 이미 확정돼 있으므로
+          그대로 재사용하면 될 일이다.
+
+        ⚠ 추가 산출물은 **언제나 원본 파일**에서 만든다(MainWindow._start_extra_output).
+          교정본 위에 메모·주석을 달면 원문 문자열이 이미 바뀌어 찾을 수 없다.
+        """
+        if not self._result:
+            return None
+        arts = self._artifact_rows()
+        remaining = [m for m in self._OUT_ORDER if m not in self._produced_modes()]
+        if not arts and not remaining:
+            return None
+
+        frame, lay = self._section("산출물", "folder-open",
+                                   shine_delay=self._T_OUT + 560)
+        for label, path, summary in arts:
+            lay.addWidget(self._artifact_row_widget(label, path, summary))
+
+        if remaining:
+            lay.addSpacing(4)
+            lay.addWidget(_hline())
+            lay.addSpacing(2)
+            if self._extra_busy:
+                meta = self._OUT_META.get(self._extra_busy)
+                lay.addWidget(_ctext(
+                    self._extra_status or f"{meta[2] if meta else '산출물'} 만드는 중…",
+                    px=14, color="accent", weight=600, wrap=True))
+            else:
+                lay.addWidget(_ctext(
+                    "결과물 추가 — 지금 검토 결과를 그대로 써서 다른 형태로 한 번 더 만듭니다"
+                    " (검토 다시 하지 않음)",
+                    px=13, color="text_sub", weight=500, wrap=True))
+            btn_row = QHBoxLayout()
+            btn_row.setSpacing(8)
+            for m in remaining:
+                icon, name, _file, desc, _tag = self._OUT_META[m]
+                b = IconButton(icon, text=name, variant="ghost",
+                               role="text_sub", size=15, tooltip=desc,
+                               on_click=lambda *_a, mm=m:
+                                   self.extra_output_requested.emit(mm))
+                b.setEnabled(not self._extra_busy)
+                btn_row.addWidget(b)
+            btn_row.addStretch()
+            wrap = _twidget()
+            wrap.setLayout(btn_row)
+            lay.addWidget(wrap)
+        return frame
+
     # ── 헤더 ─────────────────────────────────────
     def _build_header(self, review_mode, flagged,
                       errata_only=False, to_apply=0) -> QWidget:
@@ -1485,7 +1717,15 @@ class ResultPanel(QWidget):
             saved_txt = ""
         saved = f" · 수작업 대비 {saved_txt} 절약" if saved_txt else ""
         if errata_only:
-            detail = f"정오표 생성 완료 · 반영 필요 {to_apply}건 (한글 파일 미수정)"
+            m = self._out_mode()
+            if m == "memo":
+                detail = (f"메모본 생성 완료 · 메모 {self._marked_count()}곳 "
+                          f"(본문 글자 무변경)")
+            elif m == "pdf":
+                detail = (f"PDF 주석 완료 · 주석 {self._marked_count()}곳 "
+                          f"(원본 무변경)")
+            else:
+                detail = f"정오표 생성 완료 · 반영 필요 {to_apply}건 (한글 파일 미수정)"
         elif review_mode:
             detail = f"검수 완료 · 정오표 {flagged}건 기록 (HWP 미수정)"
         else:
@@ -1611,16 +1851,28 @@ class ResultPanel(QWidget):
         row.addWidget(self._rise(f2, self._T_CARD2), 1)
         row.addWidget(self._connector(self._T_CARD3))
 
-        # 03 적용(또는 정오표/검수) — 히어로 숫자(강조색 + accent/시안 글로우 글래스)
+        # 03 적용(또는 정오표/메모/주석/검수) — 히어로 숫자(강조색 글래스)
         if errata_only:
-            # ⚠ '적용'이라 쓰지 않는다 — 이 모드는 문서를 고치지 않았고, 반영은
-            #   사람이 정오표를 보고 한다. 숫자는 '반영해야 할 건수'다.
-            f3, v3 = self._stage_card("03", "정오표", "한글 파일 미수정 · 수동 반영",
+            # ⚠ '적용'이라 쓰지 않는다 — 이 세 모드는 문서 글자를 고치지 않았고,
+            #   반영은 사람이 한다. 숫자는 '반영해야 할 건수'다.
+            title, sub = self._OUT_CARD3.get(
+                self._out_mode(), self._OUT_CARD3["errata"])
+            f3, v3 = self._stage_card("03", title, sub,
                                       tint="accent", shine_delay=self._T_CARD3 + 560)
             v3.addLayout(self._unit_row(
                 self._num(to_apply, px=58, color=pal["accent"],
                           delay=self._T_CARD3 + 380, duration=1700), "건", unit_px=18))
             meta = f"{to_apply_occ:,}곳 반영 필요"
+            # 표시한 자리 수 — 메모·주석은 '몇 곳에 실제로 달렸는지'가 산출물의 알맹이다.
+            marked = self._marked_count()
+            if marked:
+                meta += f"  |  {self._MARK_LABEL[self._out_mode()]} {marked:,}곳"
+            # ⚠ 표시하지 못한 자리는 반드시 드러낸다 — 메모가 달린 줄 알고 지나치면
+            #   그 교정은 통째로 사라진다. `unmarked`가 그 자리를 한 숫자로 모은다
+            #   (메모 불가·PDF 미탐·문서에서 못 찾은 등장). 교정본의 '실패'에 해당한다.
+            unmarked = int((self._result or {}).get("unmarked", 0) or 0)
+            if unmarked:
+                meta += f"  |  표시 못 함 {unmarked:,}곳"
             if flagged:
                 meta += f"  |  검수 {flagged:,}건"
             self._card_meta(v3, meta)
@@ -1642,6 +1894,12 @@ class ResultPanel(QWidget):
                 extra.append(f"실패 : {failed}")
             if consumed:
                 extra.append(f"제외 : {consumed}")
+            # ⚠ 검수 항목(고칠 말이 없는 '확인 필요')은 **교정본에 표시되지 않는다** —
+            #   빨강은 '고친 자리'라는 뜻이라 안 고친 자리에 칠하면 뜻이 흐려진다.
+            #   메모·PDF 모드는 이 자리에도 표시가 붙으므로, 세 산출물의 표시 수가
+            #   이만큼 다르다. 숫자를 여기 적어 두어야 그 차이가 설명된다.
+            if flagged:
+                extra.append(f"검수 : {flagged} (정오표만)")
             if extra:
                 meta += "  |  " + "  |  ".join(extra)
             self._card_meta(v3, meta)
@@ -1742,6 +2000,9 @@ class ResultPanel(QWidget):
         # 3) 적용률(정오표만 모드에서는 수락률) 게이지
         #    ⚠ 제목까지 바꾼다 — 문서를 고치지 않았는데 '적용률'이라 쓰면 그 비율이
         #      무엇의 비율인지 거짓이 된다. 이 모드의 분모/분자는 제안 대비 수락이다.
+        # ⚠ 메모·PDF 모드에서도 제목은 '교정 수락률'이다 — 이 게이지가 실제로 세는 것이
+        #   제안 대비 **수락**이기 때문. '메모 표시율'처럼 쓰면 숫자와 이름이 어긋난다
+        #   (메모를 몇 곳에 달았는지는 카드 03의 메타가 말한다).
         fr2, l2 = self._section("교정 수락률" if errata_only else "교정 적용률",
                                 shine_delay=self._T_CH3 + 560, hero_title=True)
         fr2.setMinimumWidth(_CHART_CARD_MIN_W)

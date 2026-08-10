@@ -274,6 +274,87 @@ class HwpEditor:
 
         return stats_total, detail_total
 
+    # 메모는 등장 1곳당 0.08초(실측 2026-08-07 · 본문 20곳 1.5초)라 치환보다 무겁다.
+    #   배치를 작게 잡아 취소 반응성을 유지한다(브리지 명령 하나는 중단할 수 없다).
+    _MEMO_BATCH = 5
+
+    def insert_memos(self, corrections: list, progress_cb=None,
+                     stop_event: threading.Event = None,
+                     mark_anchor: bool = False) -> tuple:
+        """수락 교정을 **한/글 메모**로 기록한다 — 원고를 바꾸지 않는다(글자도 서식도).
+
+        ⚠ `mark_anchor`(앵커 글자색)는 기본 **꺼짐** — 사용자 지정 2026-08-07.
+
+        `corrections`는 dict 목록이며 `memo_text`(메모 본문)와 `occ_total`(그 낱말의
+        총 등장 수)을 추가로 담는다. 반환 스키마는 `apply_corrections`와 같다
+        (stats, detail) — 정오표 조립 코드를 공유하기 위함이다.
+
+        ★**정렬은 apply와 정반대인 '짧은 원문 우선'이다.** apply의 '긴 원문 우선'은
+          치환이 서로를 오염시키지 않게 하는 장치인데, 메모는 글자를 바꾸지 않으므로
+          그 이유가 없다. 대신 정반대의 이유가 생긴다 — **메모 본문이 원문을 인용하기
+          때문**이다. 긴 '고려해야한다'에 메모를 먼저 달면 그 본문에 '해야한다'가 새로
+          생기고, 다음 항목의 찾기가 **자기 메모 안의 글자를 원고의 등장으로 오인**해
+          그 자리에 메모를 달려다 실패한다(실측 2026-08-08: '해야한다' 단독 14/14 성공 /
+          중첩 3항목과 함께면 실패, 실패 자리의 스토리가 앞서 만든 메모의 서브스토리).
+          짧은 것부터 달면 이미 달린 메모의 원문은 항상 **더 짧으므로** 뒤에 오는 긴
+          원문을 품을 수 없다 — 이 부류가 원리적으로 사라진다.
+          A/B 실측(05.hwp · 22항목 · 정오표 37행): 긴 원문 우선 = 메모 31곳·교정본과
+          6행 차이(그 6건이 사용자가 보고한 미반영 항목과 일치) / **짧은 원문 우선 =
+          메모 32곳·3행 차이**. 되돌리려면 이 측정을 먼저 다시 할 것.
+        ⚠ 항목 순서는 **등장 인덱스에 영향을 주지 않는다** — 브리지 memo는 항목마다
+          문서 처음부터 다시 훑으므로(MoveDocBegin) 좌표계는 apply/locate와 그대로 같다.
+        """
+        corr_data = [c for c in corrections if isinstance(c, dict)]
+        corr_data.sort(key=lambda c: len(c.get("original") or ""))
+
+        stats_total  = {"memo": 0, "blocked": 0, "fail": 0}
+        detail_total = []
+        total = len(corr_data)
+        done  = 0
+
+        for i in range(0, total, self._MEMO_BATCH):
+            if stop_event is not None and stop_event.is_set():
+                break
+            batch = corr_data[i:i + self._MEMO_BATCH]
+
+            batch_cb = None
+            if progress_cb is not None:
+                def batch_cb(pct, _t, _done=done, _blen=len(batch)):
+                    frac = min(max(pct, 0), 100) / 100.0
+                    progress_cb(_done + _blen * frac, total)
+
+            result = self._send_cmd({
+                "cmd": "memo",
+                "corrections": batch,
+                "mark_anchor": bool(mark_anchor),
+            }, progress_cb=batch_cb, total=total)
+
+            if not result.get("ok"):
+                raise RuntimeError(f"메모 달기 실패: {result.get('error')}")
+
+            for k, v in (result.get("stats") or {}).items():
+                stats_total[k] = stats_total.get(k, 0) + v
+            detail_total.extend(result.get("detail") or [])
+            done += len(batch)
+            if progress_cb is not None:
+                progress_cb(done, total)
+
+        return stats_total, detail_total
+
+    def export_pdf(self, output_path: str) -> str:
+        """현재 문서를 PDF로 내보낸다(문서 무변경). 반환: 실제 저장 경로.
+
+        ⚠ 한/글의 PDF 변환은 대용량 문서에서 수십 초가 걸릴 수 있어(17쪽 1MB 문서
+          실측 4.7초) 유휴 타임아웃을 넉넉히 준다. 브리지는 진행률을 내지 않는다.
+        """
+        result = self._send_cmd({
+            "cmd": "export_pdf",
+            "output_path": os.path.abspath(output_path),
+        }, timeout=600)
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error") or "PDF 변환 실패")
+        return result.get("pdf") or output_path
+
     def verify_originals(self, originals: list) -> dict:
         """각 원문 문자열이 문서 '찾기'로 도달 가능한지 검증 (치환 없음 — 문서 무변경).
 

@@ -112,6 +112,12 @@ class MainWindow(QMainWindow):
         self._result = {}
         self._worker = None
         self._apply_worker = None
+        # 결과 화면의 '결과물 추가' 실행 — 1차 적용과 같은 ApplyWorker를 쓰되 별도
+        #   슬롯에 둔다(1차 결과 dict를 덮어쓰면 안 되므로 완료 핸들러가 다르다).
+        self._extra_worker = None
+        self._extra_mode = ""
+        # 1차 적용에 넘긴 등장별 결정 스냅숏 — 추가 산출물이 **같은 결정**을 쓰게 한다.
+        self._applied_occ_rows = None
         self._sync_workers = []   # 공유 용어 뇌 동기화 워커(단명, fire-and-forget)
         self._phase = "setup"
 
@@ -286,6 +292,9 @@ class MainWindow(QMainWindow):
 
         self.review_panel.counts_changed.connect(self._on_review_counts)
         self.review_panel.consistency_counts_changed.connect(self._on_consistency_counts)
+
+        self.result_panel.extra_output_requested.connect(self._start_extra_output)
+        self.result_panel.output_open_requested.connect(self._open_path_folder)
 
         self.footer.primary_clicked.connect(self._on_primary)
         self.footer.cancel_clicked.connect(self._on_cancel)
@@ -676,9 +685,12 @@ class MainWindow(QMainWindow):
         # 등장(occurrence)별 결정을 함께 넘긴다 — 정오표가 '등장 1곳 = 1행'이라
         #   skip_occurrences만으로는 복원할 수 없는 구분(사용자 거절 ↔ 애초에 등장이
         #   아닌 자리)이 필요하다. ReviewPanel.get_occurrence_rows 주석 참조.
+        #   ⚠ 스냅숏으로 들고 있는다 — 결과 화면의 '결과물 추가'가 **같은 결정**을
+        #     써야 하는데, 그때 패널을 다시 물으면 그 사이 상태가 달라졌을 수 있다.
+        self._applied_occ_rows = self.review_panel.get_occurrence_rows()
         self._apply_worker = ApplyWorker(self._file_path, self._corrections,
                                          self._options,
-                                         occ_rows=self.review_panel.get_occurrence_rows(),
+                                         occ_rows=self._applied_occ_rows,
                                          parent=self)
         self._apply_worker.progress.connect(self._on_worker_progress)
         self._apply_worker.log_message.connect(self.activity.log)
@@ -861,8 +873,10 @@ class MainWindow(QMainWindow):
             char_count=char_count,
             page_count=getattr(self, "_page_count", None),
             file_name=os.path.basename(self._file_path) if self._file_path else "")
-        if result.get("errata_only"):
-            # 결과물 '정오표만' — 한글 파일을 열되 고치지 않았다(쪽 번호 수집만).
+        out_mode = result.get("output_mode") or (
+            "errata" if result.get("errata_only") else "hwp")
+        if out_mode != "hwp":
+            # 한글 파일을 열되 고치지 않은 결과물 3종(정오표만·메모·PDF 주석).
             #   ⚠ 여기서 '적용'이라는 말을 쓰면 안 된다. 반영은 사람이 한다.
             n = result.get("to_apply", 0)
             occ_n = result.get("to_apply_occ", 0)
@@ -871,9 +885,24 @@ class MainWindow(QMainWindow):
             # ⚠ ' — '를 쓰지 말 것. 화면 로그는 34자를 넘으면 **' — ' 앞에서 자른다**
             #   (activity_panel._condense) — 그러면 '정오표 생성 완료'만 남고 수치가
             #   통째로 사라진다(실측 확인). 규약: 수치를 앞에, 구분은 ' · '로.
-            self.activity.log(
-                f"✓ 정오표 생성 완료 · 반영 필요 {n}건{occ_part}{flag_part} (한글 파일 미수정)")
-            self.rail.set_step_result("done", f"정오표 : {n}건")
+            if out_mode == "memo":
+                marked = result.get("memoed", 0)
+                blocked = result.get("memo_blocked", 0)
+                blk = f" · 메모 불가 {blocked}곳" if blocked else ""
+                self.activity.log(
+                    f"✓ 메모본 생성 완료 · 메모 {marked}곳{blk}{flag_part} (본문 글자 무변경)")
+                self.rail.set_step_result("done", f"메모 : {marked}곳")
+            elif out_mode == "pdf":
+                annot = result.get("annotated", 0)
+                miss = result.get("pdf_missing", 0)
+                miss_part = f" · 미탐 {miss}건" if miss else ""
+                self.activity.log(
+                    f"✓ PDF 주석 완료 · 주석 {annot}곳{miss_part}{flag_part} (원본 무변경)")
+                self.rail.set_step_result("done", f"주석 : {annot}곳")
+            else:
+                self.activity.log(
+                    f"✓ 정오표 생성 완료 · 반영 필요 {n}건{occ_part}{flag_part} (한글 파일 미수정)")
+                self.rail.set_step_result("done", f"정오표 : {n}건")
         elif flagged > 0 and applied == 0:
             # 적용할 교정이 없어 치환이 0건이었던 실행(옵션이 아니라 상태).
             self.activity.log(f"✓ 검수 완료 — 검수 {flagged}건 정오표 기록 (HWP 미수정)")
@@ -887,6 +916,150 @@ class MainWindow(QMainWindow):
         self.running_panel.set_animating(False)
         self._show_phase("result")
 
+    # ══════════════════════════════════════════════
+    # 결과물 추가 — 검토를 다시 거치지 않고 산출물을 하나 더
+    # ══════════════════════════════════════════════
+    #   ★사용자가 결과물 하나를 받아 본 뒤 "다른 형태도 필요하다"고 할 때, 예전엔
+    #     초기화 → 옵션 선택 → **같은 검토를 처음부터 다시**가 유일한 길이었다
+    #     (사용자 요구 2026-08-07). 수락/거절·부분 거절은 이미 확정된 값이므로
+    #     그대로 재사용하면 되는 일이다.
+    #
+    #   ⚠ 불변식 넷 — 하나라도 깨면 조용히 틀린 산출물이 나온다.
+    #     ① **언제나 원본 파일**에서 만든다. 교정본(_교정본.hwp) 위에 메모·주석을 달면
+    #        원문 문자열이 이미 바뀌어 있어 **찾을 수가 없다**. 원본은 어느 모드에서도
+    #        수정되지 않는다(save_as는 새 파일로 저장, close는 Quit — 덮어쓰기 없음).
+    #     ② **결정은 다시 묻지 않는다** — `self._corrections`(상태·skip_occurrences)와
+    #        1차 적용에 넘긴 `_applied_occ_rows`를 그대로 넘긴다.
+    #     ③ **1차 실행의 수치를 덮어쓰지 않는다** — `applied`가 "본문 글자를 실제로
+    #        바꾼 건수"라는 뜻을 넓히지 않기 위해, 추가분은 `extra_outputs` 목록에 싣는다.
+    #     ④ **기존 정오표를 덮어쓰지 않는다** — 모드 이름을 붙인 새 파일로 낸다.
+    _EXTRA_LABEL = {"hwp": "교정본", "memo": "메모본",
+                    "pdf": "PDF 주석본", "errata": "정오표"}
+
+    def _start_extra_output(self, mode: str):
+        if mode not in self._EXTRA_LABEL:
+            return
+        if self._phase in ("running", "apply_running", "extra_running"):
+            return
+        if self._extra_worker is not None and self._extra_worker.isRunning():
+            return
+        if not self._file_path or not os.path.exists(self._file_path):
+            self._warn_popup("원본 파일 없음",
+                             "결과물을 추가하려면 원본 한글 파일이 그대로 있어야 합니다.\n"
+                             "파일이 이동·삭제되었는지 확인해 주세요.")
+            return
+        if not self._corrections:
+            self._warn_popup("교정 결과 없음", "재사용할 교정 결과가 없습니다.")
+            return
+
+        label = self._EXTRA_LABEL[mode]
+        opts = dict(self._options)
+        opts["output_mode"] = mode
+        # 정오표 잠금 규율(setup_panel._sync_errata_lock)을 여기서도 곱한다 — 한글을
+        #   고치지 않는 모드는 '표시하지 못한 자리'를 적을 곳이 정오표뿐이다.
+        opts["gen_errata"] = True if mode != "hwp" else self._options.get("gen_errata", True)
+        opts["errata_output_path"] = self._extra_errata_path(mode)
+
+        self._extra_mode = mode
+        self._phase = "extra_running"
+        # ⚠ 화면 로그 규약: 수치는 괄호 밖에 — `_condense`가 괄호 절을 통째로 지운다
+        #   (실측: '… 재사용 (교정 412건)' → '건'이 사라진 채 표시됨).
+        self.activity.log(f"[추가] {label} 생성 시작 · 교정 {len(self._corrections)}건 "
+                          f"재사용 · 검토 생략")
+        self.result_panel.set_extra_busy(mode, f"{label} 만드는 중… "
+                                               f"진행률은 아래 상태바에 표시됩니다")
+        self.footer.set_busy(f"{label} 생성 중…", "생성 중")
+
+        self._cleanup_worker("_extra_worker")
+        self._extra_worker = ApplyWorker(
+            self._file_path, self._corrections, opts,
+            occ_rows=self._applied_occ_rows,
+            # 1차 실행이 뜬 쪽 번호를 그대로 — 같은 원본의 같은 장면이다.
+            known_pages=self._result.get("pages_by_original") or {},
+            parent=self)
+        self._extra_worker.progress.connect(self._on_worker_progress)
+        self._extra_worker.log_message.connect(self.activity.log)
+        self._extra_worker.finished.connect(self._on_extra_done)
+        self._extra_worker.error.connect(self._on_extra_error)
+        self._extra_worker.start()
+
+    def _extra_errata_path(self, mode: str) -> str:
+        """추가 실행이 쓸 정오표 경로. 기존 정오표가 있으면 모드 이름을 붙여 **비켜간다**.
+
+        ⚠ 같은 이름으로 덮어쓰면, 사용자가 이미 열어 보거나 손댄 정오표가 말없이
+          사라진다. 모드마다 내용도 다르다(PDF는 'PDF 쪽' 칸이 붙고, 메모는 메모를
+          달지 못한 자리가 주석으로 실린다).
+        """
+        base, _ext = os.path.splitext(self._file_path)
+        default = base + "_정오표.xlsx"
+        cur = self._result.get("errata_path", "")
+        if not os.path.exists(default) and not cur:
+            return ""          # 아직 정오표가 없다 — 기본 이름 그대로(워커가 정한다)
+        # ⚠ 괄호 안 말은 결과 화면의 꼬리표(`ResultPanel._OUT_META[…][4]`)와 **같아야**
+        #   한다 — 화면엔 '정오표 (메모)', 파일은 `…_정오표(메모).xlsx`.
+        name = {"hwp": "교정본", "memo": "메모", "pdf": "PDF", "errata": "정오표만"}[mode]
+        return f"{base}_정오표({name}).xlsx"
+
+    def _on_extra_done(self, result: dict):
+        """추가 산출물 완료 — **1차 결과 dict를 덮어쓰지 않고** 목록에 한 줄 더한다."""
+        mode = result.get("output_mode") or self._extra_mode
+        label = self._EXTRA_LABEL.get(mode, "산출물")
+        path = (result.get("pdf_path") if mode == "pdf"
+                else result.get("hwp_path") if mode in ("hwp", "memo")
+                else "")
+        entry = {
+            "mode":         mode,
+            "path":         path or "",
+            "errata_path":  result.get("errata_path", ""),
+            "applied":      result.get("applied", 0),
+            "occurrences":  result.get("occurrences", 0),
+            "memoed":       result.get("memoed", 0),
+            "memo_blocked": result.get("memo_blocked", 0),
+            "annotated":    result.get("annotated", 0),
+            "pdf_missing":  result.get("pdf_missing", 0),
+            "errata_rows":  result.get("errata_rows") or [],
+        }
+        extras = list(self._result.get("extra_outputs") or [])
+        extras = [e for e in extras if e.get("mode") != mode]   # 같은 모드 재실행은 갱신
+        extras.append(entry)
+        self._result["extra_outputs"] = extras
+        # 1차 실행에 정오표가 아예 없었다면(교정본 모드 + 정오표 끄기) 이번 것이
+        #   그 자리를 채운다 — 푸터의 '정오표 열기'가 가리킬 곳이 생긴다.
+        if not self._result.get("errata_path") and entry["errata_path"]:
+            self._result["errata_path"] = entry["errata_path"]
+
+        detail = {
+            "hwp":  f"적용 {entry['applied']}건 · 본문 {entry['occurrences']}곳",
+            "memo": f"메모 {entry['memoed']}곳"
+                    + (f" · 메모 불가 {entry['memo_blocked']}곳"
+                       if entry["memo_blocked"] else ""),
+            "pdf":  f"주석 {entry['annotated']}곳"
+                    + (f" · 미탐 {entry['pdf_missing']}건"
+                       if entry["pdf_missing"] else ""),
+            "errata": f"{len(entry['errata_rows'])}행 기록",
+        }.get(mode, "")
+        # ⚠ 화면 로그 규약: `[태그]` + 수치를 앞에, 구분은 ' · '(' — '는 잘린다).
+        self.activity.log(f"✓ [추가] {label} 생성 완료 · {detail}")
+        self._finish_extra()
+
+    def _on_extra_error(self, message: str):
+        """추가 산출물 실행 중 오류 — **결과 화면에 머문다**.
+
+        ⚠ 1차 실행용 `_on_error`를 재사용하면 안 된다. 그 핸들러는 설정 화면으로
+          되돌리는데, 여기서 그러면 이미 받아 둔 1차 산출물의 결과 화면이 통째로
+          사라진다(추가 실패가 성공한 작업을 지우는 셈).
+        """
+        self.activity.log(message, level="err")
+        self._finish_extra()
+        QMessageBox.warning(self, "결과물 추가 실패", message)
+
+    def _finish_extra(self):
+        """추가 산출물 실행 종료 — UI를 결과 화면 상태로 되돌린다(멱등).
+        `update_result`가 진행 표시 해제까지 겸한다(렌더 1회)."""
+        self._extra_mode = ""
+        self.result_panel.update_result(self._result)
+        self._show_phase("result")
+
     def _on_footer_errata_clicked(self):
         errata_path = self._result.get("errata_path", "")
         if errata_path and os.path.exists(errata_path):
@@ -895,9 +1068,11 @@ class MainWindow(QMainWindow):
             self._on_generate_errata_requested()
 
     def _on_footer_folder_clicked(self):
-        # '정오표만' 결과물에는 교정본이 없다 — 그때는 정오표가 있는 폴더를 연다.
-        #   버튼 문구가 '폴더 열기'라 어느 쪽이든 어긋나지 않는다.
+        # 결과물이 무엇이든 '그 파일이 있는 폴더'를 연다 — '정오표만'에는 한글 산출물이
+        #   없고, PDF 주석 모드에는 한글 산출물 대신 PDF가 있다. 버튼 문구가 '폴더 열기'라
+        #   어느 쪽이든 어긋나지 않는다.
         path = (self._result.get("hwp_path", "")
+                or self._result.get("pdf_path", "")
                 or self._result.get("errata_path", ""))
         self._open_path_folder(path)
 
@@ -947,7 +1122,10 @@ class MainWindow(QMainWindow):
             )
             self._result["errata_path"] = errata_path
             self.activity.log(f"✓ 정오표 수동 생성 완료: {os.path.basename(errata_path)}")
-            self.result_panel.show_result(self._result, self.activity.get_proofreading_log())
+            # ⚠ show_result가 아니라 update_result — 정오표 한 줄이 늘었을 뿐인데
+            #   대시보드 전체가 카운트업·차트 애니메이션을 다시 재생하면 '새 실행'처럼
+            #   보인다(결과 dict가 같아 완료 시각은 유지되지만 모션은 다시 돈다).
+            self.result_panel.update_result(self._result)
             self.footer.set_result_actions(True, has_errata=True)
             self._open_path_folder(errata_path)
         except Exception as exc:
@@ -967,13 +1145,15 @@ class MainWindow(QMainWindow):
         self._show_phase("setup")
 
     def _apply_running(self) -> bool:
-        w = self._apply_worker
-        return w is not None and w.isRunning()
+        for w in (self._apply_worker, self._extra_worker):
+            if w is not None and w.isRunning():
+                return True
+        return False
 
     def _on_cancel(self):
         self.footer.mark_cancelling()
         self.activity.log("⚠ 취소 요청 — 진행 중인 작업을 중단합니다…")
-        for attr in ("_worker", "_apply_worker"):
+        for attr in ("_worker", "_apply_worker", "_extra_worker"):
             w = getattr(self, attr, None)
             if w is not None and w.isRunning() and hasattr(w, "request_stop"):
                 w.request_stop()
@@ -981,6 +1161,9 @@ class MainWindow(QMainWindow):
     def _reset(self):
         self._cleanup_worker("_worker")
         self._cleanup_worker("_apply_worker")
+        self._cleanup_worker("_extra_worker")
+        self._extra_mode = ""
+        self._applied_occ_rows = None
         self._file_path = ""
         self._options = {}
         self._corrections = []
@@ -999,7 +1182,7 @@ class MainWindow(QMainWindow):
 
     # ── 레일 클릭(설정으로 복귀해 재실행) ────────
     def _on_rail_click(self, key: str):
-        if self._phase in ("running", "apply_running"):
+        if self._phase in ("running", "apply_running", "extra_running"):
             return
             
         # 바디 내용만 교체 (푸터와 레일의 진행상태는 마지막 단계 유지)
@@ -1224,6 +1407,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._cleanup_worker("_worker")
         self._cleanup_worker("_apply_worker")
+        self._cleanup_worker("_extra_worker")
         # 업데이트 확인 워커는 순수 네트워크 대기라 중단 수단이 없다 —
         #   _cleanup_worker의 5초 대기를 그대로 쓰면 회선이 먹통일 때 종료가
         #   그만큼 늦어진다. 시그널만 끊고 짧게 기다린 뒤 강제 종료한다

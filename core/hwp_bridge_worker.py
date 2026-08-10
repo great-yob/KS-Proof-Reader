@@ -1435,6 +1435,551 @@ class HwpBridge:
 
         return {"stats": stats, "detail": detail}
 
+    # ══════════════════════════════════════════════════════════
+    # ▌메모 달기 (결과물 축 output_mode="memo")
+    # ══════════════════════════════════════════════════════════
+    #
+    # ★실측으로 확정한 불변식 (2026-08-07, 한/글 2010 8.5.8.1677)
+    #   ① **`HAction.Run("InsertFieldMemo")`만 쓴다.** 최상위 `hwp.Run(...)`은 2010에서
+    #      **아무 일도 하지 않으면서 None을 돌려주는 no-op**이다(`MoveDocBegin`조차 None을
+    #      돌려줘 성공/실패를 구분할 수도 없다). 그걸 성공으로 믿고 InsertText를 하면
+    #      사유 문장이 **원고 본문에 그대로 박힌다** — 실측에서 머리말이 오염됐다.
+    #   ② **반환값만 믿지 않는다.** 메모는 서브스토리를 여는 동작이라 `GetPos()[0]`(story)이
+    #      바뀌어야 진짜 열린 것이다. 안 바뀌었으면 InsertText **금지**(①의 오염과 같은 결과).
+    #   ③ **머리말·꼬리말 스토리에서는 거부된다**(실측: story 9 → False / story 0 → True).
+    #      실패가 아니라 구조적 제약이므로 'blocked'로 따로 세어 정오표에 남긴다 —
+    #      조용히 사라지면 안 된다.
+    #   ④ **등장이 소모되지 않는다.** 치환과 달리 메모는 원문을 그대로 두므로, apply의
+    #      재탐색 패스를 그대로 베끼면 **같은 자리에 메모가 두 번 붙는다.** 그래서 재탐색
+    #      패스는 이미 방문한 등장 수(visited)만큼을 **소비만** 하고 지나간다.
+    #   ⑤ ★메모 삽입 후 커서는 앵커 **앞**(메모 컨트롤 자리)으로 돌아온다. 그대로 두면
+    #      다음 RepeatFind가 **방금 메모를 단 그 낱말을 다시 잡아** 같은 자리에 메모를
+    #      또 단다(사용자 보고 2026-08-07: 한 자리에 메모 2개).
+    #      ⚠ 여기서 **메모 컨트롤은 위치 8칸을 차지한다**(_MEMO_CTRL_SPAN, 실측).
+    #      1칸으로 어림하면 커서가 앵커를 못 넘어 그대로 재발견된다 — 실측:
+    #      '기술동향'이 문단 9의 15~19에 있었는데 메모 삽입 후 23~27로 밀렸고,
+    #      SetPos(20)은 23으로 스냅돼 같은 낱말을 다시 잡았다.
+    #      ⚠⚠ 이 버그는 **개수만 보면 안 보인다** — occ_total 상한이 총량을 맞춰 주기
+    #      때문이다(검증은 '몇 개'가 아니라 '서로 다른 자리 몇 곳'으로 해야 한다).
+    #   ⑥ ★**메모 본문이 원문을 인용하므로 찾기가 자기 메모를 다시 잡는다.**
+    #      RepeatFind는 서브스토리까지 닿는데(각주·표에서 이미 아는 사실) 메모 본문도
+    #      서브스토리다. 메모에 "‘품질특성’ → ‘품질 특성’"이라고 적는 순간 그 안에
+    #      '품질특성'이 새로 생기므로, 다음 찾기가 그것을 **새 등장으로 오인**해 메모를
+    #      또 달고, 그 메모가 또 매치를 만든다 — apply의 self_matching(괄호 증식)과
+    #      똑같은 구조다. 실측(2026-08-07): 15등장짜리 낱말이 상한 100까지 폭주했고
+    #      본문 스캔이 35,997자 → 52,373자로 불었다. 막는 방법 두 겹:
+    #        (a) 우리가 만든 메모 서브스토리 id를 기억해 그 안의 매치는 **등장으로 세지
+    #            않고 건너뛴다**(등장 인덱스가 검수 패널과 어긋나면 부분 거절이 깨진다).
+    #        (b) 파이프라인이 센 등장 수(occ_total)를 **상한**으로 쓴다. (a)가 놓치는
+    #            경로가 있어도 원고의 등장 수를 넘길 수는 없다.
+
+    # 메모 본문 끝에 붙는 등장 표시 — 같은 낱말이 여러 곳이면 어느 자리인지 알려준다.
+    _MEMO_OCC_FMT = "· 이 낱말 {total}곳 중 {k}번째"
+    _MEMO_MAX_OCC = 100
+    _MEMO_MAX_PASSES = 4
+    # 메모 컨트롤 하나가 문단 위치에서 차지하는 칸 수(실측 2026-08-07, 한/글 2010).
+    #   삽입 전 15~19에 있던 4글자 낱말이 삽입 후 23~27로 밀렸다 → 8칸.
+    #   ⚠ 이 값이 틀리면 커서가 앵커를 못 넘어 **같은 자리에 메모가 겹쳐 달린다**.
+    #   그래서 값에만 의존하지 않고 아래 두 겹으로 방어한다(전진 검증 + 재발견 감지).
+    _MEMO_CTRL_SPAN = 8
+
+    def _advance_past_anchor(self, match_pos, original):
+        """메모를 단 직후, 커서를 **앵커 낱말 뒤**로 옮긴다. 반환: 재발견 감지용 좌표.
+
+        메모 삽입 후 커서는 앵커 앞(메모 컨트롤 자리)에 있고, 앵커는 컨트롤 크기만큼
+        뒤로 밀려 있다. 여기서 넘겨 두지 않으면 다음 RepeatFind가 **같은 낱말을 다시
+        잡아 메모를 겹쳐 단다**(사용자 보고 2026-08-07).
+
+        SetPos 한 번으로 끝내되(빠름), 실제로 넘어갔는지 GetPos로 **확인**하고 못 넘었으면
+        MoveRight로 한 칸씩 민다 — `_MEMO_CTRL_SPAN`이 버전에 따라 다르더라도 겹치지
+        않게 하기 위함이다.
+
+        반환: ((story, para), 밀려간 앵커 시작 위치) — 재발견 감지에 쓴다. 실패 시 None.
+        """
+        if not (isinstance(match_pos, tuple) and len(match_pos) >= 3):
+            return None
+        try:
+            p2 = self.hwp.GetPos()          # CloseEx 직후 = 메모 컨트롤 자리
+        except Exception:
+            return None
+        if not (isinstance(p2, tuple) and len(p2) >= 3):
+            return None
+
+        anchor_start = p2[2] + self._MEMO_CTRL_SPAN
+        target = anchor_start + len(original)
+        try:
+            self.hwp.SetPos(p2[0], p2[1], target)
+        except Exception:
+            pass
+        try:
+            now = self.hwp.GetPos()
+        except Exception:
+            now = None
+
+        # 검증 — 같은 문단 안에서 목표보다 앞에 있으면 아직 앵커를 못 넘은 것이다.
+        if (isinstance(now, tuple) and len(now) >= 3
+                and now[0] == p2[0] and now[1] == p2[1] and now[2] < target):
+            for _ in range(len(original) + self._MEMO_CTRL_SPAN):
+                try:
+                    self.hwp.HAction.Run("MoveRight")
+                except Exception:
+                    break
+                try:
+                    now = self.hwp.GetPos()
+                except Exception:
+                    break
+                if not (now[0] == p2[0] and now[1] == p2[1]) or now[2] >= target:
+                    break
+        return ((p2[0], p2[1]), anchor_start)
+
+    def _write_memo_body(self, text):
+        """메모 편집 상태에서 본문을 쓴다. 반환 사유 문자열(빈 문자열이면 성공).
+
+        ⚠ COM 메서드 `hwp.InsertText(...)`를 대체 경로로 쓰지 말 것 — HWP 2010에는
+          **없다**(실측 2026-08-08: `AttributeError: HWPFrame.HwpObject.InsertText`).
+          파라미터셋 경로가 유일하다.
+        """
+        try:
+            iset = self.hwp.HParameterSet.HInsertText
+            self.hwp.HAction.GetDefault("InsertText", iset.HSet)
+            iset.Text = text
+            self.hwp.HAction.Execute("InsertText", iset.HSet)
+            return ""
+        except Exception as exc:
+            return f"메모 본문 입력 실패: {exc}"
+
+    def _normalize_edit_state(self):
+        """서브스토리·선택·편집 상태를 본문 기준으로 되돌린다(실패 뒤 재시도 준비)."""
+        for _ in range(3):
+            try:
+                self.hwp.HAction.Run("CloseEx")
+            except Exception:
+                break
+        try:
+            self.hwp.HAction.Run("Cancel")
+        except Exception:
+            pass
+
+    def _insert_memo_here(self, body, k, occ_total, anchor_color, original=""):
+        """찾기가 선택해 둔 **현재 자리**에 메모 하나를 단다. 반환 (성공, 사유).
+
+        성공하면 만들어진 메모 서브스토리 id를 `self._memo_stories`에 기록한다 —
+        그 안에서 잡히는 매치를 등장으로 세지 않기 위해서다(불변식⑥-a).
+
+        원고 글자는 바뀌지 않는다 — 메모 본문은 필드의 서브스토리에 들어간다
+        (OWPML `<hp:fieldBegin type="MEMO"><hp:subList>…`).
+
+        ⚠ 본문 쓰기가 실패하면 **빈 메모를 지우고 그 자리에서 한 번 더 시도한다.**
+          이 실패는 비결정적이라(위 `_write_memo_body` 주석) 한 번의 실패로 자리를
+          버리면 세 산출물의 반영 자리가 갈린다.
+        """
+        # 앵커 강조(글자색)는 **기본으로 끈다** — 사용자 지정 2026-08-07: "해당 글자
+        #   색상은 변환하지 말아줘". 메모 모드의 약속은 '원고를 손대지 않는다'이고,
+        #   글자색도 원고의 서식이다. 켜려면 호출부가 명시적으로 색을 넘겨야 한다.
+        #   ⚠ 켤 때는 **메모보다 먼저** 해야 한다 — RepeatFind가 남긴 선택이 살아
+        #     있을 때만 글자색을 입힐 수 있고, 메모 삽입이 그 선택을 소비하기 때문.
+        if anchor_color is not None:
+            try:
+                cset = self.hwp.HParameterSet.HCharShape
+                self.hwp.HAction.GetDefault("CharShape", cset.HSet)
+                cset.TextColor = int(anchor_color)
+                self.hwp.HAction.Execute("CharShape", cset.HSet)
+            except Exception:
+                pass
+
+        try:
+            before = self.hwp.GetPos()
+        except Exception:
+            before = None
+
+        try:
+            opened = bool(self.hwp.HAction.Run("InsertFieldMemo"))   # ★불변식①
+        except Exception as exc:
+            return False, f"메모 삽입 예외: {exc}"
+        if not opened:
+            sid = before[0] if isinstance(before, tuple) and before else "?"
+            return False, (f"이 자리에는 메모를 달 수 없습니다 "
+                           f"(머리말·꼬리말 등 story {sid})")
+
+        try:
+            after = self.hwp.GetPos()
+        except Exception:
+            after = None
+        # ★불변식② — 서브스토리 진입 실패면 본문에 쓰지 않고 물러난다.
+        if (not isinstance(before, tuple) or not isinstance(after, tuple)
+                or not before or not after or after[0] == before[0]):
+            try:
+                self.hwp.HAction.Run("CloseEx")
+            except Exception:
+                pass
+            return False, "메모 편집 상태로 진입하지 못했습니다 (본문 오염 방지로 건너뜀)"
+
+        # ★불변식⑥-a — 이 메모의 서브스토리 id를 기억해 둔다. 메모 본문이 원문을
+        #   인용하므로, 기억하지 않으면 다음 찾기가 이 메모 안의 글자를 '새 등장'으로
+        #   오인해 메모를 또 달고 무한 증식한다.
+        self._memo_stories.add(after[0])
+
+        text = body
+        if occ_total > 1:
+            text = f"{body}\r{self._MEMO_OCC_FMT.format(total=occ_total, k=k + 1)}"
+        # ⚠ 실패 사유에 **앵커가 있던 스토리**를 적는다 — 본문(0)인지 각주·표 같은
+        #   서브스토리인지가 사유의 전부이고, 없으면 진단할 길이 없다.
+        where = f" (앵커 story {before[0]} → 메모 story {after[0]})"
+        err = self._write_memo_body(text)
+        if err:
+            err += where
+        # 메모 편집 상태는 **반드시** 빠져나온다 — 남으면 다음 찾기가 메모 안을 돈다.
+        try:
+            self.hwp.HAction.Run("CloseEx")
+        except Exception:
+            pass
+        if not err:
+            return True, ""
+
+        # ── 실패 — 빈 메모를 지우고 **그 자리에서 한 번 더** ──────────────────
+        # ⚠ 본문을 못 넣었으면 **빈 메모가 문서에 남는다.** 그대로 두면 편집자에게
+        #   내용 없는 말풍선이 보이고, 그게 무엇인지 알 길이 없다 — 반드시 지운다.
+        try:
+            self.hwp.HAction.Run("DeleteFieldMemo")
+        except Exception:
+            pass
+        self._memo_stories.discard(after[0])
+        self._normalize_edit_state()
+        # ★같은 자리에 다시 넣으면 **똑같이 실패한다**(실측: 비결정이 아니라 결정적).
+        #   원인은 앞 항목이 박아 둔 **메모 컨트롤이 이 낱말의 시작 자리를 먹고 있는 것**
+        #   이다 — 중첩 원문에서 특히 잦다('고려해야한다'에 메모를 달면 그 안의
+        #   '해야한다' 앵커가 컨트롤 경계에 걸린다). 실측 2026-08-08: 중첩 3항목을 뺀
+        #   같은 낱말 집합은 36곳 전부 성공(파일 실측 36개), 넣으면 9곳이 실패했다.
+        #   그래서 재시도는 **낱말 한 칸 안쪽**에서 한다 — 편집자에게는 같은 낱말의
+        #   같은 자리이고, 컨트롤 경계는 확실히 벗어난다.
+        nudge = 1 if len(original or "") > 1 else 0
+        try:
+            self.hwp.SetPos(before[0], before[1], before[2] + nudge)
+        except Exception:
+            return False, err
+
+        try:
+            reopened = bool(self.hwp.HAction.Run("InsertFieldMemo"))
+            again = self.hwp.GetPos() if reopened else None
+        except Exception:
+            return False, err
+        if not reopened or not isinstance(again, tuple) or not again \
+                or again[0] == before[0]:
+            return False, err
+        self._memo_stories.add(again[0])
+        err2 = self._write_memo_body(text)
+        try:
+            self.hwp.HAction.Run("CloseEx")
+        except Exception:
+            pass
+        if not err2:
+            return True, ""
+        try:
+            self.hwp.HAction.Run("DeleteFieldMemo")
+        except Exception:
+            pass
+        self._memo_stories.discard(again[0])
+        self._normalize_edit_state()
+        return False, err2 + where
+
+    def memo(self, corrections, mark_anchor=False):
+        """수락된 교정을 **한/글 메모**로 기록한다 (원고 무변경 — 글자도 서식도).
+
+        ⚠ `mark_anchor`는 기본 **꺼짐**이다(사용자 지정 2026-08-07: 앵커 글자색을 바꾸지
+          말 것). 메모 모드의 약속은 원고를 손대지 않는 것이고 글자색도 원고의 서식이다.
+
+        corrections: [{"original", "corrected", "memo_text", "occ_total",
+                       "skip_occurrences", "color", …}, …]
+        반환: {"stats": {...}, "detail": [...]}  — detail 스키마는 apply와 호환된다
+              (`replaced`/`occ_pages`를 그대로 쓰므로 정오표 조립 코드를 공유한다).
+        """
+        stats = {"memo": 0, "blocked": 0, "fail": 0}
+        detail = []
+        # 이번 호출에서 만든 메모 서브스토리 id — 항목이 바뀌어도 유지해야 한다.
+        #   앞 항목의 메모 본문에서 뒤 항목의 원문이 잡히는 교차 오염도 같은 방식으로 막힌다.
+        self._memo_stories = set()
+
+        try:
+            self.hwp.HAction.Run("MoveDocBegin")
+        except Exception:
+            pass
+
+        # apply와 같은 '긴 원문 우선' 정렬 — 메모는 글자를 바꾸지 않아 오염 위험은 없지만,
+        #   등장 인덱스 좌표계를 apply/locate와 같게 유지해야 정오표가 맞물린다.
+        corrections = sorted(
+            corrections, key=lambda c: len(c.get("original") or ""), reverse=True
+        )
+        total = len(corrections)
+
+        for idx, item in enumerate(corrections):
+            original_user  = item["original"]
+            corrected_user = item.get("corrected", "")
+            original = _clean((original_user or "").replace("\n", "\r"))
+            body     = _clean((item.get("memo_text") or "")).replace("\n", "\r")
+            occ_total = int(item.get("occ_total") or 0)
+            skip_occ  = set(item.get("skip_occurrences") or [])
+            color     = item.get("color", 255)
+
+            if not original or not body:
+                continue
+
+            inserted = blocked = 0
+            err_msg = ""
+            occ_pages = []
+            visited = 0          # 이 원문에서 지금까지 '지나친' 등장 수(문서 순)
+            # ★불변식⑥-b — 원고의 등장 수를 넘길 수는 없다. occ_total을 모르면
+            #   (전자동 모드 등) 안전 상한으로 떨어진다.
+            #
+            # ★상한의 기준은 **doc_occ(치환 전 문서에서 locate가 실제로 센 등장 수)**가
+            #   먼저다. occ_total은 검수 패널이 **추출 텍스트**에서 센 수라 문서 찾기
+            #   결과와 어긋날 수 있고, 그 차이가 곧 산출물 간 불일치가 된다.
+            #   실측(2026-08-08 · 05.hwp): '지속가능항공유'가 추출 텍스트 5곳인데
+            #   문서 찾기로는 4곳 — 상한이 5라서 메모만 **한 곳을 더** 달았고,
+            #   교정본 3곳 · PDF 3곳 · 메모 4곳으로 세 산출물이 갈렸다
+            #   (사용자 보고: "반영된 항목이 다 다르다 — 신뢰성에 치명적").
+            #   doc_occ는 아무것도 바꾸지 않은 문서를 같은 RepeatFind로 센 값이라
+            #   메모가 만든 매치에 부풀 수도 없다 — occ_total보다 엄격히 낫다.
+            doc_occ = int(item.get("doc_occ") or 0)
+            occ_cap = doc_occ or occ_total or self._MEMO_MAX_OCC
+            occ_cap = min(occ_cap, self._MEMO_MAX_OCC)
+            # 메모 본문에 적을 '이 낱말 N곳' — 상한이 안전 상한(100)일 때는 적지 않는다.
+            occ_show = doc_occ or occ_total or 0
+
+            try:
+                for _pass in range(self._MEMO_MAX_PASSES):
+                    # 앞 항목/앞 메모가 남긴 서브스토리 편집 상태 정규화(apply와 동일)
+                    for _ in range(3):
+                        try:
+                            if not self.hwp.HAction.Run("CloseEx"):
+                                break
+                        except Exception:
+                            break
+                    self.hwp.HAction.Run("MoveDocBegin")
+                    try:
+                        self.hwp.SetMessageBoxMode(0x2FFF1)
+                    except Exception:
+                        pass
+
+                    pset = self.hwp.HParameterSet.HFindReplace
+                    self.hwp.HAction.GetDefault("FindDlg", pset.HSet)
+                    self.hwp.HAction.Execute("FindDlg", pset.HSet)
+                    pset.FindString    = original
+                    pset.IgnoreMessage = 1
+                    pset.Direction     = 0
+                    for prop, val in (
+                        ("WholeWordOnly", 0), ("CaseSensitive", 0), ("MatchCase", 0),
+                        ("FindRegExp", 0), ("UseWildCards", 0), ("SeveralWords", 0),
+                        ("AllWordForms", 0), ("HanjaFromHangul", 0), ("FindJaso", 0),
+                        ("IgnoreFindString", 0), ("IgnoreReplaceString", 1),
+                        ("AutoSpell", 0),
+                    ):
+                        try:
+                            setattr(pset, prop, val)
+                        except Exception:
+                            pass
+
+                    # ★불변식④ — 이미 방문한 등장은 원문 그대로 남아 다시 잡힌다.
+                    #   문서 순서상 미방문 등장보다 항상 앞이므로 앞에서부터 소비만 한다.
+                    reskip_left = visited
+                    pass_done = 0
+                    prev_pos = None
+                    # 방금 메모를 단 앵커가 밀려 가 있는 자리 — 다음 매치가 여기면
+                    #   같은 등장을 다시 잡은 것이다(불변식⑤의 안전망).
+                    reanchor = None
+
+                    while visited < occ_cap:
+                        if not self.hwp.HAction.Execute("RepeatFind", pset.HSet):
+                            break
+                        try:
+                            cur = self.hwp.GetPos()
+                        except Exception:
+                            cur = None
+                        # ★불변식⑤ — 커서가 제자리면 같은 등장을 도는 것이다.
+                        if cur is not None and cur == prev_pos:
+                            break
+                        prev_pos = cur
+
+                        # ★불변식⑥-a — 우리가 만든 메모 본문 안에서 잡힌 매치는
+                        #   원고의 등장이 아니다. **visited를 늘리지 않고** 지나간다 —
+                        #   여기서 세면 등장 인덱스가 검수 패널과 어긋나 부분 거절이 깨진다.
+                        if (isinstance(cur, tuple) and cur
+                                and cur[0] in self._memo_stories):
+                            continue
+
+                        # ★불변식⑤ 안전망 — 방금 메모를 단 앵커를 다시 잡은 것이면
+                        #   등장이 아니다. 앵커는 메모 컨트롤만큼 뒤로 밀려 있으므로
+                        #   시작 위치가 정확히 예측된다(다음 '진짜' 등장은 그보다 최소
+                        #   낱말 길이만큼 뒤라, 인접 등장을 잘못 삼킬 일이 없다).
+                        #   ⚠ _MEMO_CTRL_SPAN 값이 틀려도 이 검사가 겹침을 막아 준다.
+                        if (reanchor is not None and isinstance(cur, tuple)
+                                and len(cur) >= 3
+                                and (cur[0], cur[1]) == reanchor[0]
+                                and cur[2] - len(original) <= reanchor[1]):
+                            self._advance_past_anchor(cur, original)
+                            continue
+
+                        if reskip_left > 0:
+                            reskip_left -= 1
+                            continue
+
+                        k  = visited
+                        pg = self._page_no()
+
+                        if k in skip_occ:      # 부분 거절 — 메모도 달지 않는다
+                            occ_pages.append({"i": k, "page": pg, "ok": False})
+                            visited += 1
+                            continue
+
+                        # ⚠ 진행률을 **등장마다** 보낸다. 항목 단위로만 보내면 등장이
+                        #   수십 곳인 낱말 하나에서 수십 초 동안 출력이 끊기고, 부모의
+                        #   유휴 타임아웃(_send_cmd)이 그걸 '한/글 행업'으로 오판해
+                        #   프로세스를 죽인다(실측: 96등장 낱말에서 120초 타임아웃).
+                        if visited % 5 == 0:
+                            _send_progress(
+                                int(((idx + visited / max(1, occ_total or 1))
+                                     / max(1, total)) * 100),
+                                f"메모 다는 중… {idx + 1}/{total} ({visited}곳)")
+
+                        # ⚠ 메모 본문의 '이 낱말 N곳 중 k번째'는 **실제로 도는 자리 수**를
+                        #   써야 한다. occ_total(추출 텍스트 기준)을 쓰면 문서에 4곳뿐인데
+                        #   "5곳 중 3번째"라고 적혀 편집자가 없는 자리를 찾게 된다.
+                        ok, why = self._insert_memo_here(
+                            body, k, occ_show, color if mark_anchor else None,
+                            original=original)
+                        if ok:
+                            inserted += 1
+                            pass_done += 1
+                            occ_pages.append({"i": k, "page": pg, "ok": True})
+                        else:
+                            blocked += 1
+                            occ_pages.append({"i": k, "page": pg, "ok": False,
+                                              "blocked": True, "note": why})
+                            if not err_msg:
+                                err_msg = why
+                        visited += 1
+
+                        # ★불변식⑤ — 앵커 **뒤**로 커서를 옮긴다.
+                        if ok:
+                            reanchor = self._advance_past_anchor(cur, original)
+                        elif isinstance(cur, tuple) and len(cur) >= 3:
+                            # 삽입이 없었으면 밀림도 없다 — 커서는 매치 끝 그대로 둔다.
+                            reanchor = None
+
+                    # 새로 단 메모가 없으면 더 볼 게 없다(정상 종료 또는 전부 차단).
+                    if pass_done == 0:
+                        break
+            except Exception as exc:
+                err_msg = err_msg or f"메모 달기 실패: {exc}"
+
+            # ⚠ 상한에 걸려 멈춘 것은 '정상 종료'가 아니다 — 커서 전진이 실패해 같은
+            #   자리를 맴돌았을 때 총량만 맞춰 주는 것이 이 상한이라, 걸렸다는 사실
+            #   자체가 신호다. 조용히 넘어가면 겹쳐 달린 메모를 아무도 모른다.
+            if visited >= occ_cap and occ_total and inserted < occ_total:
+                _send_log(f"[메모] '{original}' 등장 상한 {occ_cap}에 도달 "
+                          f"— 자리 확인 필요")
+
+            if inserted > 0:
+                stats["memo"] += 1
+            elif blocked > 0:
+                stats["blocked"] += 1
+            else:
+                stats["fail"] += 1
+
+            detail.append({
+                "original":  original_user, "corrected": corrected_user,
+                "reason":    item.get("reason", ""),
+                "source":    item.get("source", "dict"),
+                "color":     color,
+                # apply와 키를 맞춘다 — 정오표 조립(_build_errata_rows)이 공유 코드다.
+                "applied":   inserted > 0,
+                "replaced":  inserted,
+                "occ_pages": occ_pages,
+                "memoed":    inserted,
+                "blocked":   blocked,
+                "error":     err_msg or ("" if inserted else
+                                         "메모를 달 수 있는 등장을 찾지 못했습니다"),
+                "path":      "InsertFieldMemo",
+            })
+
+            if (idx + 1) % 5 == 0 or idx == total - 1:
+                _send_progress(int(((idx + 1) / max(1, total)) * 100),
+                               f"메모 다는 중… {idx + 1}/{total}")
+
+        try:
+            self.hwp.HAction.Run("MoveDocBegin")
+        except Exception:
+            pass
+        return {"stats": stats, "detail": detail}
+
+    # ══════════════════════════════════════════════════════════
+    # ▌PDF 내보내기 (결과물 축 output_mode="pdf")
+    # ══════════════════════════════════════════════════════════
+    def export_pdf(self, output_path):
+        """현재 문서를 PDF로 내보낸다 (문서 무변경).
+
+        ⚠★**선택 영역이 살아 있으면 그 부분만 저장된다.** 실측(2026-08-07): 찾기 직후
+          (선택 상태)에 저장했더니 17쪽 문서가 **1쪽 12,854B**로 나왔는데 반환값은
+          정상과 똑같은 True였다. 예외도 경고도 없는 조용한 손실이라, 저장 직전
+          서브스토리 탈출 + `MoveDocBegin`으로 **선택을 반드시 해제**한다.
+        """
+        for _ in range(3):
+            try:
+                if not self.hwp.HAction.Run("CloseEx"):
+                    break
+            except Exception:
+                break
+        try:
+            self.hwp.HAction.Run("MoveDocBegin")     # ★선택 해제 — 위 경고 참조
+        except Exception:
+            pass
+        try:
+            self.hwp.HAction.Run("Cancel")
+        except Exception:
+            pass
+
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except Exception:
+                pass
+
+        # 한/글 2010에서 세 경로 모두 17쪽 전체를 정상 출력했다(실측). 앞의 것이
+        #   실패하는 버전이 있을 수 있어 순서대로 폴백한다.
+        attempts = (
+            ("FileSaveAs_S",  0),
+            ("FileSaveAsPdf", 16384),
+        )
+        last = ""
+        for action, attrs in attempts:
+            try:
+                pset = self.hwp.HParameterSet.HFileOpenSave
+                self.hwp.HAction.GetDefault(action, pset.HSet)
+                pset.filename = output_path
+                pset.Format   = "PDF"
+                try:
+                    pset.Attributes = attrs
+                except Exception:
+                    pass
+                self.hwp.HAction.Execute(action, pset.HSet)
+            except Exception as exc:
+                last = f"{action}: {exc}"
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                _send_log(f"[PDF] {action} 성공 — {os.path.getsize(output_path)}B")
+                return {"pdf": output_path, "size": os.path.getsize(output_path)}
+
+        try:
+            self.hwp.SaveAs(output_path, "PDF", "")
+        except Exception as exc:
+            last = f"SaveAs: {exc}"
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            _send_log(f"[PDF] SaveAs 성공 — {os.path.getsize(output_path)}B")
+            return {"pdf": output_path, "size": os.path.getsize(output_path)}
+
+        raise RuntimeError(
+            "PDF로 저장하지 못했습니다. 한/글에 PDF 변환 기능(한컴 PDF)이 설치돼 "
+            f"있는지 확인하세요. 마지막 오류: {last or '알 수 없음'}"
+        )
+
     def save_as(self, output_path):
         # HWP 버전별 SaveAs 시그니처 차이를 흡수.
         # HWP 2010 (8.5.x)은 `SaveAs(Path, Format, arg)` 3개 인자를 요구하며,
@@ -1532,6 +2077,11 @@ def main():
                 result = bridge.get_text()
             elif cmd == "apply":
                 result = bridge.apply(req["corrections"])
+            elif cmd == "memo":
+                result = bridge.memo(req["corrections"],
+                                     mark_anchor=req.get("mark_anchor", True))
+            elif cmd == "export_pdf":
+                result = bridge.export_pdf(req["output_path"])
             elif cmd == "verify":
                 result = bridge.verify(req["originals"])
             elif cmd == "locate":

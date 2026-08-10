@@ -961,7 +961,17 @@ class ReviewPanel(QWidget):
               "status": "accepted"|"rejected"|"pending",
               "excluded": bool,   # 등장이 아님 → 정오표에서 제외할 것
               "shadowed": bool,   # 더 긴 교정에 가려짐 → 그쪽 행이 대표하므로 제외할 것
-              "found": bool}, …]  # 본문에서 위치를 못 찾은 합성 항목이면 False
+              "found": bool,      # 본문에서 위치를 못 찾은 합성 항목이면 False
+              "pos": int|None, "end": int|None}, …]   # 추출 텍스트에서의 자리
+
+        ★`pos`/`end`(추출 텍스트 기준 구간)를 함께 내보내는 이유는 **교정본 모드의
+          등장 좌표계 보정** 때문이다. apply는 '긴 원문 우선'으로 치환하므로, 더 긴
+          교정에 먹히는 등장은 그 교정이 적용되는 순간 **문서에서 사라진다**. 그러면
+          남은 등장의 번호가 앞으로 밀려 `skip_occurrences`가 엉뚱한 자리를 가리킨다
+          (실측 2026-08-08: '해야한다' 14곳 중 5곳이 '고려해야한다' 등에 먹혀 남은 9곳의
+          번호가 밀렸고, 멀쩡한 2곳이 건너뛰어져 교정본에만 미반영으로 남았다).
+          어느 등장이 사라지는지는 **구간 겹침**으로만 알 수 있어 위치가 필요하다
+          (`ApplyWorker._plan_occurrences` 참조).
         """
         rows, seen = [], {}
         for o in self._occ:
@@ -975,6 +985,8 @@ class ReviewPanel(QWidget):
                 "excluded": bool(o.get("excluded")),
                 "shadowed": bool(o.get("shadowed")),
                 "found":    o.get("pos") is not None,
+                "pos":      o.get("pos"),
+                "end":      o.get("end"),
             })
         return rows
 

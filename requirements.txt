@@ -11,6 +11,15 @@ PySide6>=6.6.0
 # ── 정오표 출력 ───────────────────────
 openpyxl>=3.1.0
 
+# ── PDF 주석 결과물(output_mode="pdf") ──
+# pypdfium2: PDF 텍스트 검색 + 좌표(rect) / pypdf: 주석 쓰기.
+# ⚠ PyMuPDF(fitz)로 갈아타지 말 것 — 둘을 혼자 다 하지만 **AGPL-3.0**이다.
+#   이 둘은 BSD-3/Apache-2.0이라 배포본에 넣을 수 있다.
+# ⚠ FreeText 주석은 쓰지 말 것(한글이 렌더되지 않음) — output/pdf_annotator.py 헤더 참조.
+# 미설치 시 앱은 정상 동작하되 'PDF 주석' 결과물만 비활성(graceful).
+pypdfium2>=4.30.0
+pypdf>=5.0.0
+
 # ── 형태소 분석 (활용형→기본형 복원, 사전 검증 정밀화) ──
 # 순수 C++ · JVM 불필요 · Windows 휠 제공. 모델은 kiwipiepy_model로 자동 동봉(~88MB).
 # 미설치 시 앱은 동작하되 활용형 보정만 비활성(graceful).

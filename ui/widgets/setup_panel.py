@@ -225,18 +225,23 @@ class SetupPanel(QWidget):
         self._gen_errata   = True
         # AI 분석 제외 — Gemini 호출 없이 사전·규칙 파이프라인만 수행(오프라인 가능).
         self._no_ai        = False
-        # ★결과물 축 — '한글 파일을 고칠 것인가'(2026-08-05 사용자 결정).
-        #   False = 교정본 생성(현행: 본문 치환 + 빨강 표시 + _교정본 파일)
-        #   True  = 정오표만(한글 파일 무수정 — 진짜 '검수 모드')
-        #   ⚠ 이건 '교정 방식'(항목별 검토/자동 일괄)의 3번째 값이 **아니라 직교 축**이다.
-        #     정오표만 모드에서도 사용자는 검토 단계에서 수락/거절을 해야 한다 — 그래야
-        #     정오표가 [교정]/[거절]로 갈린다. 두 축을 한 묶음으로 만들면 검토 단계의
+        # ★결과물 축 — '한글 파일을 어떻게 돌려줄 것인가'(2026-08-05 도입 → 08-07 4값 확장).
+        #     "hwp"    = 교정본: 본문 치환 + 빨강 표시 + `_교정본` 파일
+        #     "errata" = 정오표만: 한글 파일 무수정(진짜 '검수 모드')
+        #     "memo"   = 메모본: 글자는 그대로 두고 각 자리에 한/글 메모 + 앵커 강조
+        #     "pdf"    = PDF 주석본: 원본을 PDF로 뽑아 그 위에만 형광+스티커 주석
+        #   ⚠ 이건 '교정 방식'(항목별 검토/자동 일괄)의 값이 **아니라 직교 축**이다.
+        #     어느 값이든 사용자는 검토 단계에서 수락/거절을 해야 한다 — 그래야 무엇을
+        #     반영·기록·주석할지 정해진다. 두 축을 한 묶음으로 만들면 검토 단계의
         #     의미가 무너진다.
-        #   ⚠ 과거엔 이 모드가 **우연히** 도달하는 상태였다(수락한 치환이 0건일 때
+        #   ⚠ 과거엔 'errata'가 **우연히** 도달하는 상태였다(수락한 치환이 0건일 때
         #     apply_worker가 분기). 사용자가 의도할 수도 재현할 수도 없는 산출물이라
         #     옵션으로 끌어올렸다. docs/proofreading-architecture.md Phase 2b의
         #     'AI scope 0개 → 검수 모드' 진입 경로는 현행 UI에서 도달 불가능한 잔재다.
-        self._errata_only  = False
+        #   ⚠ `errata_only`(bool)는 **파생값으로만** 남긴다 — 값이 넷이 된 뒤로는
+        #     "한글 파일을 안 고친다"만 뜻하며, 어느 산출물인지는 구분하지 못한다.
+        #     새 분기를 bool로 만들지 말고 `output_mode`를 볼 것.
+        self._output_mode  = "hwp"
         # 사전 원문 스크리닝은 이제 항상 켜지는 기본 동작이다(옵트인 토글 폐지).
         self._build_ui()
 
@@ -263,7 +268,7 @@ class SetupPanel(QWidget):
         main_card = card("section")
         main_lay = QVBoxLayout(main_card)
         main_lay.setContentsMargins(27, 21, 27, 21)
-        main_lay.setSpacing(40)
+        main_lay.setSpacing(30)
 
         # 네 섹션 모두 **가로 2단**이라 세로로는 내용만큼만 차지하면 된다.
         #   ⚠ 여기에 stretch를 주면 남는 세로 공간이 카드 안으로 배분돼 제목과 설명
@@ -378,11 +383,32 @@ class SetupPanel(QWidget):
         self.options_changed.emit()
 
     # ── 결과물 ─────────────────────────────────
-    def _build_output_section(self) -> QVBoxLayout:
-        """'한글 파일을 고칠 것인가' 축 — 교정본 생성 / 정오표만(진짜 검수 모드).
+    #   카드 정의를 한곳에 모아 둔다 — 카드·선택·요약·옵션이 같은 목록을 보게 해서
+    #   값을 하나 더 늘릴 때 고칠 자리가 하나로 유지되게 하는 것이 목적.
+    _OUTPUT_CARDS = (
+        # (mode, icon, 제목, 설명, 요약 문구)
+        ("hwp",    "clipboard-check", "HWP (빨간색)",
+         "한글 원고에 교정안을 반영하고\n해당 자리를 빨간색으로 표시합니다.",
+         "HWP (빨간색)"),
+        ("memo",   "file-text",       "HWP (메모)",
+         "한글 원고에 교정안을 반영하지 않고\n해당 자리에 메모로 교정안을 표시합니다.",
+         "HWP (메모)"),
+        ("pdf",    "file-down",       "PDF (주석)",
+         "한글 원고를 PDF로 변환한 뒤\n형광펜과 주석으로 교정안을 표시합니다.",
+         "PDF (주석)"),
+        ("errata", "table",           "Excel (정오표)",
+         "한글 원고에 교정안을 반영하지 않고\n교정안과 해당 페이지만 기록합니다.",
+         "Excel (정오표)"),
+    )
 
-        ⚠ 교정 방식(항목별 검토/자동 일괄)과 **직교**한다 — 클래스 상단 `_errata_only`
-          주석 참조. 그래서 같은 섹션에 3번째 카드로 넣지 않고 섹션을 따로 둔다.
+    def _build_output_section(self) -> QVBoxLayout:
+        """'한글 파일을 어떻게 돌려줄 것인가' 축 — 네 값 중 하나.
+
+        ⚠ 교정 방식(항목별 검토/자동 일괄)과 **직교**한다 — 클래스 상단 `_output_mode`
+          주석 참조. 그래서 그 섹션에 값을 더 붙이지 않고 섹션을 따로 둔다.
+        ⚠ 다른 세 섹션은 한 줄 2칸인데 여기만 **2×2**다. `_pair_row()`를 두 번 써서
+          두 줄을 만든다 — 한 줄에 4칸을 넣으면 카드 폭이 설명 두 줄을 못 버틴다
+          (설정 칸 최소폭 함정: memory `setup-panel-equal-grid-qt-traps`).
         """
         lay = QVBoxLayout()
         lay.setContentsMargins(0, 0, 0, 0)
@@ -397,40 +423,40 @@ class SetupPanel(QWidget):
         hdr.addStretch()
         lay.addLayout(hdr)
 
-        row = self._pair_row()
-
-        self._card_out_hwp = self._make_choice_card(
-            "clipboard-check", "교정본 + 정오표", None,
-            "한글 파일에 교정을 반영하고\n고친 항목을 빨간색으로 표시합니다.", True)
-        self._card_out_errata = self._make_choice_card(
-            "table", "정오표만", None,
-            "한글 파일에 교정을 반영하지 않고\n교정 내용과 해당 페이지만 기록합니다.", False)
-
-        self._card_out_hwp.mousePressEvent = lambda _e: self._select_output_mode(False)
-        self._card_out_errata.mousePressEvent = lambda _e: self._select_output_mode(True)
-
-        row.addWidget(self._card_out_hwp, 1)
-        row.addWidget(self._card_out_errata, 1)
-        lay.addLayout(row, 1)
+        self._out_cards = {}
+        row = None
+        for i, (mode, icon, title, desc, _sum) in enumerate(self._OUTPUT_CARDS):
+            if i % 2 == 0:
+                row = self._pair_row()
+                lay.addLayout(row, 1)
+            card = self._make_choice_card(icon, title, None, desc,
+                                          mode == self._output_mode)
+            # ⚠ 람다 기본값으로 mode를 묶는다 — 늦은 바인딩이면 네 카드가 전부
+            #   마지막 값을 고르게 된다.
+            card.mousePressEvent = lambda _e, m=mode: self._select_output_mode(m)
+            self._out_cards[mode] = card
+            row.addWidget(card, 1)
         return lay
 
-    def _select_output_mode(self, errata_only: bool):
-        if self._errata_only == errata_only:
+    def _select_output_mode(self, mode: str):
+        if mode not in self._out_cards or self._output_mode == mode:
             return
-        self._errata_only = errata_only
-        self._set_card_selected(self._card_out_hwp, not errata_only)
-        self._set_card_selected(self._card_out_errata, errata_only)
+        self._output_mode = mode
+        for m, card in self._out_cards.items():
+            self._set_card_selected(card, m == mode)
         self._sync_errata_lock()
         self.options_changed.emit()
 
     def _sync_errata_lock(self):
-        """'정오표만'이면 정오표 생성 토글을 강제 ON + 잠금.
+        """한글 파일을 고치지 않는 모드에서는 정오표 생성 토글을 강제 ON + 잠금.
 
-        ⚠ 이 잠금이 없으면 **산출물이 0개인 조합**이 만들어진다(한글 파일도 안 고치고
-          정오표도 안 만듦). 윤문·자동 일괄 적용과 같은 잠금 관용구다 — 토글을 끄는
+        ⚠ 이 잠금이 없으면 **산출물이 반쪽인 조합**이 만들어진다. 'errata'는 아예
+          산출물이 0개가 되고, 'memo'·'pdf'는 파일은 나오지만 **메모·주석을 달지 못한
+          자리**(머리말·꼬리말처럼 한/글이 메모를 거부하는 스토리, PDF에서 못 찾은 원문)를
+          확인할 곳이 사라진다. 윤문·자동 일괄 적용과 같은 잠금 관용구다 — 토글을 끄는
           경로를 UI에서 막고, `get_options`에서 한 번 더 곱해 새어 나가지 못하게 한다.
         """
-        lock = self._errata_only
+        lock = self._output_mode != "hwp"
         tg = self._tog_errata
         if lock:
             tg.set_on(True, emit=False)
@@ -443,7 +469,7 @@ class SetupPanel(QWidget):
             restyle(row)
         desc = getattr(tg, "_desc", None)
         if desc is not None:
-            desc.setText("‘정오표만’ 선택\n- 항상 생성됩니다." if lock else
+            desc.setText("한글 미반영 결과물 선택\n- 항상 생성됩니다." if lock else
                          "교정내용을 Excel로 출력\n- 불필요시 끄세요.")
 
     # ── 교정 범위 ───────────────────────────────
@@ -607,7 +633,8 @@ class SetupPanel(QWidget):
         #   포함하므로 '오탈자 · 띄어쓰기 / 윤문'처럼 둘 다 나열하면 중복이다.
         scope_text = "윤문" if self._polish_on() else "오탈자 · 띄어쓰기"
         mode_text = "자동 일괄 적용" if (self._auto_apply and AUTO_APPLY_ENABLED) else "항목별 검토"
-        out_text = "정오표만" if self._errata_only else "교정본 + 정오표"
+        out_text = next((s for m, _i, _t, _d, s in self._OUTPUT_CARDS
+                         if m == self._output_mode), "교정본 + 정오표")
         no_ai = " / AI 제외" if self._no_ai else ""
         return f"{scope_text} / {mode_text} / {out_text}{no_ai}"
 
@@ -622,13 +649,16 @@ class SetupPanel(QWidget):
             # ⚠ 잠금 플래그를 여기서 한 번 더 곱한다(이중 안전장치). UI 상태가 어떤 경로로
             #   틀어져도 워커·적용 단계로 True가 새어 나가지 않게 하는 마지막 관문이다.
             "scope_polish":   self._scope_polish and POLISH_ENABLED,
-            # ⚠ '정오표만'이면 강제 True — 이게 없으면 산출물 0개 조합이 생긴다
-            #   (UI 잠금과 이중 안전장치. _sync_errata_lock 주석 참조).
-            "gen_errata":     self._gen_errata or self._errata_only,
+            # ⚠ 한글 미반영 모드면 강제 True — 이게 없으면 산출물이 반쪽인 조합이
+            #   생긴다(UI 잠금과 이중 안전장치. _sync_errata_lock 주석 참조).
+            "gen_errata":     self._gen_errata or self._output_mode != "hwp",
             "deep_screening": True,   # 사전 원문 스크리닝은 항상 수행됨
             "auto_apply":     self._auto_apply and AUTO_APPLY_ENABLED,
-            # 결과물 축 — True면 한글 파일을 열되 **수정하지 않는다**(쪽 번호 수집만).
-            "errata_only":    self._errata_only,
+            # ★결과물 축 — 새 분기는 **이 값**을 볼 것(클래스 상단 주석 참조).
+            "output_mode":    self._output_mode,
+            # 파생값(하위 호환) — "한글 파일을 고치지 않는다"만 뜻한다. 어느 산출물인지
+            #   구분하지 못하므로 새 분기에 쓰지 말 것.
+            "errata_only":    self._output_mode != "hwp",
         }
 
     def refresh_theme(self):
