@@ -89,7 +89,7 @@ class MainWindow(QMainWindow):
         try:
             w, h = self._config.get_window_size()
         except Exception:
-            w, h = 1400, 860
+            w, h = 1400, 900
         min_w, min_h = w, h
         screen = QApplication.primaryScreen()
         if screen is not None:
@@ -984,17 +984,19 @@ class MainWindow(QMainWindow):
         self._extra_worker.start()
 
     def _extra_errata_path(self, mode: str) -> str:
-        """추가 실행이 쓸 정오표 경로. 기존 정오표가 있으면 모드 이름을 붙여 **비켜간다**.
+        """추가 실행이 쓸 정오표 경로 — **언제나** 모드 이름을 붙인다.
 
-        ⚠ 같은 이름으로 덮어쓰면, 사용자가 이미 열어 보거나 손댄 정오표가 말없이
-          사라진다. 모드마다 내용도 다르다(PDF는 'PDF 쪽' 칸이 붙고, 메모는 메모를
-          달지 못한 자리가 주석으로 실린다).
+        ⚠ 기본 이름(`…_정오표.xlsx`)을 쓰면 1차 실행의 정오표를 말없이 덮어쓴다.
+          모드마다 내용도 다르다(PDF는 'PDF 쪽' 칸이 붙고, 메모는 메모를 달지 못한
+          자리가 사유로 실린다).
+        ⚠ 예전엔 "1차가 정오표를 안 만들었으면 기본 이름을 쓴다"는 예외가 있었다.
+          그 경로에서 실제로 사고가 났다(2026-08-10 사용자 보고): 1차(교정본)에서 정오표
+          토글을 끈 실행에 메모본을 추가하자 메모 실행의 정오표가 `…_정오표.xlsx`로
+          저장됐고, 결과 화면은 그것을 1차 산출물처럼 '정오표'로만 표시해 사용자는
+          **'정오표(메모)가 생성되지 않았다'**고 읽었다 — 메모 불가 150곳의 사유가
+          그 파일 안에 있는데도 찾을 길이 없었다. 이름은 항상 출처를 말해야 한다.
         """
         base, _ext = os.path.splitext(self._file_path)
-        default = base + "_정오표.xlsx"
-        cur = self._result.get("errata_path", "")
-        if not os.path.exists(default) and not cur:
-            return ""          # 아직 정오표가 없다 — 기본 이름 그대로(워커가 정한다)
         # ⚠ 괄호 안 말은 결과 화면의 꼬리표(`ResultPanel._OUT_META[…][4]`)와 **같아야**
         #   한다 — 화면엔 '정오표 (메모)', 파일은 `…_정오표(메모).xlsx`.
         name = {"hwp": "교정본", "memo": "메모", "pdf": "PDF", "errata": "정오표만"}[mode]
@@ -1015,6 +1017,9 @@ class MainWindow(QMainWindow):
             "occurrences":  result.get("occurrences", 0),
             "memoed":       result.get("memoed", 0),
             "memo_blocked": result.get("memo_blocked", 0),
+            # ★수락했는데 표시하지 못한 자리 — 화면 수치가 정오표의 수락 행 수와
+            #   맞아떨어지게 하는 값이다(`_mode_summary` 주석).
+            "unmarked":     result.get("unmarked", 0),
             "annotated":    result.get("annotated", 0),
             "pdf_missing":  result.get("pdf_missing", 0),
             "errata_rows":  result.get("errata_rows") or [],
@@ -1025,14 +1030,18 @@ class MainWindow(QMainWindow):
         self._result["extra_outputs"] = extras
         # 1차 실행에 정오표가 아예 없었다면(교정본 모드 + 정오표 끄기) 이번 것이
         #   그 자리를 채운다 — 푸터의 '정오표 열기'가 가리킬 곳이 생긴다.
+        #   ⚠ 다만 **누가 만든 것인지**를 함께 남긴다. 안 남기면 산출물 목록이 그것을
+        #     1차 정오표인 양 '정오표'로만 적고 1차 실행의 행 수까지 붙여, 사용자가
+        #     '이 모드의 정오표는 안 만들어졌다'고 읽는다(2026-08-10 사용자 보고).
         if not self._result.get("errata_path") and entry["errata_path"]:
             self._result["errata_path"] = entry["errata_path"]
+            self._result["errata_from_extra"] = mode
 
         detail = {
             "hwp":  f"적용 {entry['applied']}건 · 본문 {entry['occurrences']}곳",
             "memo": f"메모 {entry['memoed']}곳"
-                    + (f" · 메모 불가 {entry['memo_blocked']}곳"
-                       if entry["memo_blocked"] else ""),
+                    + (f" · 표시 못 함 {entry['unmarked'] or entry['memo_blocked']}곳"
+                       if (entry["unmarked"] or entry["memo_blocked"]) else ""),
             "pdf":  f"주석 {entry['annotated']}곳"
                     + (f" · 미탐 {entry['pdf_missing']}건"
                        if entry["pdf_missing"] else ""),

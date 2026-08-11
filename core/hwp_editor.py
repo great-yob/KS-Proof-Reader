@@ -126,10 +126,25 @@ class HwpEditor:
         #   (apply/verify는 진행률을 주기적으로 쏘므로 '총 시간'이 아닌 '무응답 시간'으로
         #    재야 대용량 문서에서 거짓 타임아웃이 나지 않는다.)
         self._last_activity = time.time()
+        # 메모 재색인이 만드는 중간 저장본(아래 `_reindex_document`). 끝나면 지운다.
+        self._stage_file = None
+        self._reindexing = False
 
     def open(self):
         """32비트 서브프로세스를 시작하고 HWP 파일을 엽니다."""
         cmd = _bridge_command()
+        # 재개(재색인) 시에도 drain 스레드가 돌아야 한다 — close가 세워 둔 정지
+        #   플래그를 내려 두지 않으면 새 스레드가 첫 루프에서 바로 끝난다.
+        self._stderr_stop.clear()
+        # ⚠ 앞 프로세스가 남긴 큐 내용도 버린다. EOF 센티널(None)이 남아 있으면 새
+        #   프로세스의 첫 명령이 그것을 먼저 읽고 **'브리지 응답 없음(프로세스
+        #   종료됨)'**으로 실패한다(실측 2026-08-10: 첫 재색인만 실패했다).
+        for q in (self._stdout_queue, self._stderr_queue):
+            while True:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
 
         if self.logger:
             self.logger(f"  HWP 브리지 시작: {os.path.basename(cmd[0])}")
@@ -278,6 +293,64 @@ class HwpEditor:
     #   배치를 작게 잡아 취소 반응성을 유지한다(브리지 명령 하나는 중단할 수 없다).
     _MEMO_BATCH = 5
 
+    # ★이 항목 수마다 문서를 **저장→닫기→다시 열기**로 재색인한다(`_reindex_document`).
+    #   25는 실측으로 고른 값이다(아래 표). 더 잘게 자르면 열고 닫는 값이 커지고,
+    #   크게 잡으면 재색인 전에 실패가 다시 쌓인다.
+    _MEMO_REINDEX_ITEMS = 25
+    # ★★그리고 **메모 수**로도 끊는다 — 색인이 낡는 속도는 항목 수가 아니라 **그 사이
+    #   문서에 박은 메모 수**에 달렸다. 실측 2026-08-10(25항목 묶음 6개, 묶음별 메모 수 →
+    #   실패 수): 24곳→0 · 40곳→0 · 49곳→2 · 51곳→0 · 58곳→12 · 97곳→11.
+    #   **50곳 근처에서 급격히 나빠진다.** 등장이 36곳인 낱말 하나가 묶음 예산을 통째로
+    #   써 버리는 일이 잦아, 항목 수 기준만으로는 이 경계를 지킬 수 없다.
+    _MEMO_REINDEX_MEMOS = 40
+
+    def _reindex_document(self, log=None):
+        """★한/글의 '찾기 색인'을 새로 만든다 — 저장 → 닫기 → 다시 열기.
+
+        ★왜 필요한가(실측 2026-08-10 · 실파일 고독사 · 152항목 · 등장 360곳):
+          메모 컨트롤은 문단 안에서 자리를 차지하는데, **같은 세션에서는 이후의
+          `RepeatFind`가 그 변화를 반영하지 못한다.** 그래서 이미 메모를 단 자리와
+          겹치거나 맞닿은 낱말을 찾으면, 찾기는 '옛 본문' 기준으로 매치를 돌려주고
+          그 자리에 메모를 열면 `InsertText`가 `RPC_E_SERVERFAULT`로 죽는다. 한 번
+          죽은 자리는 그 세션에서 **어떤 재시도로도 살아나지 않는다**(재열기·삭제 후
+          재시도·뒤쪽 좌표·대기·항목 끝 재시도 전부 실패, 102곳 중 1곳만 회복).
+          이등분으로 특정한 최소 재현: '키메세지'(36곳)에 메모를 단 뒤 '메세지를'
+          (‘키메세지를’ 속)을 달면 죽는다 — 같은 항목 집합에서 '키메세지'만 빼면 12/12 성공.
+          문서를 저장해 다시 열면 색인이 새로 만들어져 그 자리도 정상 동작한다.
+
+          실측(같은 원고 152항목 · 등장 360곳 · 메모 성공 자리 수 / 소요):
+            재색인 없음        116곳 / 68초   ← 사용자가 겪은 '메모 다량 유실'
+            25항목마다 재색인  302곳 / 68초   ← 현재 설계(저장본 빈 메모 0)
+          여는 값이 공짜는 아니지만, 죽을 자리에 쏟던 시간이 사라져 총 소요는 같다.
+          ⚠ 재색인해도 남는 30곳은 대부분 '이미 메모가 있는 자리와 겹쳐 찾기에서
+            사라진 등장'이라, 정오표에 '표시하지 못함'으로 남는다(조용히 사라지지 않는다).
+
+        ⚠ 중간 저장본은 **캐시 폴더**에 둔다. 원고 옆에 두면 사용자가 산출물로 오해하고,
+          읽기 전용 설치 폴더에서는 쓸 수도 없다.
+        ⚠ 재색인 사이의 `close()`는 중간 저장본을 지우면 안 된다(바로 다시 열 파일이다).
+          `_reindexing` 플래그가 그것을 가른다.
+        """
+        ext = os.path.splitext(self.file_path)[1] or ".hwp"
+        try:
+            from datapaths import cache_dir
+            stage_dir = cache_dir()
+        except Exception:
+            import tempfile
+            stage_dir = tempfile.gettempdir()
+        stage = os.path.join(stage_dir, "_ks_memo_stage" + ext)
+
+        self._reindexing = True
+        try:
+            self.save_as(stage)
+            self.close()
+            self.file_path = stage
+            self._stage_file = stage
+            self.open()
+        finally:
+            self._reindexing = False
+        if log:
+            log("  [메모] 문서 재색인 — 이어서 답니다")
+
     def insert_memos(self, corrections: list, progress_cb=None,
                      stop_event: threading.Event = None,
                      mark_anchor: bool = False) -> tuple:
@@ -305,16 +378,35 @@ class HwpEditor:
           문서 처음부터 다시 훑으므로(MoveDocBegin) 좌표계는 apply/locate와 그대로 같다.
         """
         corr_data = [c for c in corrections if isinstance(c, dict)]
+        # ⚠ **'진짜 오탈자를 먼저' 정렬은 실측으로 기각됐다**(2026-08-10). 뒤로 갈수록
+        #   실패가 는다는 관찰에서 나온 발상이었으나, 실제로는 실패가 **자리에 붙어 있어**
+        #   순서를 바꿔도 같은 항목이 그대로 실패했고 총량만 나빠졌다
+        #   (312/335 → 305/336). 재시도하지 말 것.
         corr_data.sort(key=lambda c: len(c.get("original") or ""))
 
         stats_total  = {"memo": 0, "blocked": 0, "fail": 0}
         detail_total = []
         total = len(corr_data)
         done  = 0
+        # ★재색인 경계(`_reindex_document`의 실측 근거 참조). 마지막 묶음 뒤에는 안 한다.
+        next_reindex = self._MEMO_REINDEX_ITEMS
+        memos_since  = 0            # 마지막 재색인 이후 실제로 단 메모 수
 
         for i in range(0, total, self._MEMO_BATCH):
             if stop_event is not None and stop_event.is_set():
                 break
+            due = (i >= next_reindex
+                   or memos_since >= self._MEMO_REINDEX_MEMOS)
+            if due and i < total:
+                next_reindex = i + self._MEMO_REINDEX_ITEMS
+                memos_since = 0
+                try:
+                    self._reindex_document(self.logger)
+                except Exception as exc:
+                    # 재색인은 품질 장치이지 필수 경로가 아니다 — 실패하면 그대로 잇는다
+                    #   (그 뒤로는 실패가 늘겠지만, 지금까지 단 메모는 살아 있다).
+                    if self.logger:
+                        self.logger(f"  [메모] 문서 재색인 실패 — 그대로 진행: {exc}")
             batch = corr_data[i:i + self._MEMO_BATCH]
 
             batch_cb = None
@@ -334,11 +426,19 @@ class HwpEditor:
 
             for k, v in (result.get("stats") or {}).items():
                 stats_total[k] = stats_total.get(k, 0) + v
-            detail_total.extend(result.get("detail") or [])
+            batch_detail = result.get("detail") or []
+            detail_total.extend(batch_detail)
+            memos_since += sum(d.get("memoed", 0) for d in batch_detail)
             done += len(batch)
             if progress_cb is not None:
                 progress_cb(done, total)
 
+        # ⚠ **못 단 자리를 재색인 뒤 다시 도는 스윕을 넣지 말 것**(실측 2026-08-10:
+        #   35곳 재시도 → 회복 0곳, 재색인 한 번 값 ~10초만 더 든다). 재색인은 색인을
+        #   되살리지만 그 자리는 **되살리지 못한다** — 남은 실패는 이미 메모가 달린
+        #   앵커와 겹쳐 문서 재열기 뒤에는 아예 찾기에서 사라지는 등장들이고, 등장
+        #   인덱스로 다시 겨눌 수도 없다(가리키던 자리가 없어져 번호가 밀린다).
+        #   이 자리들은 정오표에 '표시하지 못함' 사유로 남는 것이 정직한 결말이다.
         return stats_total, detail_total
 
     def export_pdf(self, output_path: str) -> str:
@@ -443,6 +543,15 @@ class HwpEditor:
                 th.join(timeout=2)
             setattr(self, th_attr, None)
         self._proc = None
+
+        # 재색인 중간 저장본 정리 — 재색인 **사이의** close에서는 지우지 않는다
+        #   (바로 다시 열 파일이다).
+        if self._stage_file and not self._reindexing:
+            try:
+                os.remove(self._stage_file)
+            except OSError:
+                pass
+            self._stage_file = None
 
     # ── 내부 통신 ────────────────────────────────
 

@@ -919,7 +919,7 @@ class ProofreadingWorker(QThread):
                 if net_r:
                     merged.extend(net_r)
                     det_review.append(("따옴표방향", len(net_r)))
-                    log(f"  [문장부호] 따옴표 방향 오류 {len(net_r)}건 검수 카드")
+                    log(f"  [문장부호] 따옴표 방향 반대 {len(net_r)}건 추가")
             except Exception as e:
                 log(f"  [문장부호] 괄호·따옴표 짝 맞추기 스킵: {e}")
 

@@ -285,6 +285,9 @@ class HwpBridge:
         self._temp_file = None
         # 창 깜빡임 억제 워처
         self._hider = None
+        # 우리가 만든 메모 서브스토리 id — **문서 단위**로 누적한다(memo() 주석 참조).
+        #   None이면 아직 문서를 열지 않았다는 뜻.
+        self._memo_stories = None
 
     def _dispatch_hwp(self, file_path):
         """확장자에 맞는 HWP 버전을 우선 Dispatch.
@@ -326,6 +329,8 @@ class HwpBridge:
 
     def open(self, file_path, visible=False):
         pythoncom.CoInitialize()
+        # 새 문서 = 우리가 만든 메모가 하나도 없는 상태.
+        self._memo_stories = set()
         # 창 깜빡임 억제: Dispatch 직전 hwp.exe 스냅샷을 찍고, 이후 새로 뜨는
         # 창을 워처 스레드가 즉시 SW_HIDE. (visible=True 면 숨기지 않음.)
         if not visible:
@@ -1470,11 +1475,22 @@ class HwpBridge:
     #      본문 스캔이 35,997자 → 52,373자로 불었다. 막는 방법 두 겹:
     #        (a) 우리가 만든 메모 서브스토리 id를 기억해 그 안의 매치는 **등장으로 세지
     #            않고 건너뛴다**(등장 인덱스가 검수 패널과 어긋나면 부분 거절이 깨진다).
+    #            ⚠ 이 집합은 **문서 단위**로 누적해야 한다 — `memo` 명령은 항목 5개씩
+    #            여러 번 오므로(HwpEditor._MEMO_BATCH) 호출마다 비우면 앞 묶음이 만든
+    #            메모를 잊는다(memo() 본문 주석의 실측 사고).
     #        (b) 파이프라인이 센 등장 수(occ_total)를 **상한**으로 쓴다. (a)가 놓치는
     #            경로가 있어도 원고의 등장 수를 넘길 수는 없다.
+    #   ⑦ ★★**메모 컨트롤은 같은 세션의 '찾기'에 반영되지 않는다.** 이미 메모를 단 자리와
+    #      겹치거나 맞닿은 낱말을 찾으면 찾기는 **옛 본문 기준**으로 매치를 돌려주고, 그
+    #      자리에 메모를 열면 `InsertText`가 `RPC_E_SERVERFAULT`로 죽는다. 죽은 자리는
+    #      그 세션 안에서 회복되지 않는다(재열기·삭제 후 재시도·좌표 이동·대기 전부 실패).
+    #      → 해법은 이 파일이 아니라 호출 측에 있다: **문서를 저장했다 다시 열어 색인을
+    #        새로 만든다**(`HwpEditor._reindex_document`). 실측(실파일 고독사 152항목):
+    #        재색인 없음 116곳 → 25항목마다 재색인 **302곳**(빈 메모 0).
 
-    # 메모 본문 끝에 붙는 등장 표시 — 같은 낱말이 여러 곳이면 어느 자리인지 알려준다.
-    _MEMO_OCC_FMT = "· 이 낱말 {total}곳 중 {k}번째"
+    # ⚠ 예전엔 메모 본문 끝에 '· 이 낱말 N곳 중 k번째'를 붙였다. 사용자 지정으로
+    #   **제거**했다(2026-08-10) — 반복 횟수는 정오표가 등장 1곳 = 1행으로 말하고,
+    #   말풍선에 또 적으면 편집자가 읽을 것만 늘어난다. 되살리려면 그 결정부터 확인할 것.
     _MEMO_MAX_OCC = 100
     _MEMO_MAX_PASSES = 4
     # 메모 컨트롤 하나가 문단 위치에서 차지하는 칸 수(실측 2026-08-07, 한/글 2010).
@@ -1548,6 +1564,14 @@ class HwpBridge:
         except Exception as exc:
             return f"메모 본문 입력 실패: {exc}"
 
+    # ⚠ **같은 자리에서 메모를 다시 여는 재시도를 넣지 말 것**(실측 2026-08-10).
+    #   `InsertText`가 죽은 자리는 그 세션 안에서 살아나지 않는다 — `CloseEx` 뒤 재열기,
+    #   `DeleteFieldMemo` 뒤 재열기, 매치 뒤쪽 좌표에서 재열기, 0.3초 대기, 항목을 끝낸
+    #   뒤 재시도까지 전부 시험했고 회복률은 102곳 중 1곳이었다. 게다가 재열기는 **빈
+    #   메모를 하나 더 남긴다**(실측: 302곳 성공 · 빈 메모 92개가 저장본에 실렸다).
+    #   원인은 이 자리가 아니라 문서 색인이며, 해법은 문서를 다시 여는 것이다 —
+    #   `HwpEditor._reindex_document` 참조.
+
     def _normalize_edit_state(self):
         """서브스토리·선택·편집 상태를 본문 기준으로 되돌린다(실패 뒤 재시도 준비)."""
         for _ in range(3):
@@ -1560,7 +1584,7 @@ class HwpBridge:
         except Exception:
             pass
 
-    def _insert_memo_here(self, body, k, occ_total, anchor_color, original=""):
+    def _insert_memo_here(self, body, anchor_color, original=""):
         """찾기가 선택해 둔 **현재 자리**에 메모 하나를 단다. 반환 (성공, 사유).
 
         성공하면 만들어진 메모 서브스토리 id를 `self._memo_stories`에 기록한다 —
@@ -1619,9 +1643,10 @@ class HwpBridge:
         #   오인해 메모를 또 달고 무한 증식한다.
         self._memo_stories.add(after[0])
 
+        # ⚠ '이 낱말 N곳 중 k번째' 줄은 **넣지 않는다**(사용자 지정 2026-08-10).
+        #   메모는 그 자리에서 무엇을 무엇으로 고칠지만 말하면 되고, 반복 횟수는 정오표가
+        #   등장 1곳 = 1행으로 이미 말한다. 말풍선마다 붙으면 읽을 것만 늘어난다.
         text = body
-        if occ_total > 1:
-            text = f"{body}\r{self._MEMO_OCC_FMT.format(total=occ_total, k=k + 1)}"
         # ⚠ 실패 사유에 **앵커가 있던 스토리**를 적는다 — 본문(0)인지 각주·표 같은
         #   서브스토리인지가 사유의 전부이고, 없으면 진단할 길이 없다.
         where = f" (앵커 story {before[0]} → 메모 story {after[0]})"
@@ -1695,9 +1720,22 @@ class HwpBridge:
         """
         stats = {"memo": 0, "blocked": 0, "fail": 0}
         detail = []
-        # 이번 호출에서 만든 메모 서브스토리 id — 항목이 바뀌어도 유지해야 한다.
-        #   앞 항목의 메모 본문에서 뒤 항목의 원문이 잡히는 교차 오염도 같은 방식으로 막힌다.
-        self._memo_stories = set()
+        # 우리가 만든 메모 서브스토리 id — 항목이 바뀌어도, **호출이 바뀌어도** 유지한다.
+        #   앞 항목의 메모 본문에서 뒤 항목의 원문이 잡히는 교차 오염을 막는 유일한 근거다.
+        #
+        # ★⚠ 예전엔 여기서 `set()`으로 **초기화**했다. 그런데 `HwpEditor.insert_memos`는
+        #   항목을 5개씩 잘라 `memo` 명령을 여러 번 보내므로(_MEMO_BATCH), 그 초기화는
+        #   **앞 묶음이 만든 메모를 통째로 잊는 것**이었다. 그러면 뒤 묶음의 찾기가 앞
+        #   묶음 메모 본문 속 원문을 '원고의 등장'으로 오인해 **메모 안에 메모를 달려
+        #   든다.** 실측 2026-08-10(실파일 고독사): 실패 146건 중 26건이 앵커 story 0이
+        #   아닌 **서브스토리**였고, 그중 21건이 '메모 story = 앵커 story + 2' — 메모
+        #   안에서 메모를 연 자국이다.
+        #   ⚠ 다만 **이것만 고쳐서는 수치가 변하지 않았다**(고쳐도 116곳 그대로). 메모본이
+        #     반쪽만 나오던 주된 원인은 따로 있다 — 찾기 색인이 낡는 것이고, 해법은
+        #     `HwpEditor._reindex_document`다. 여기 것은 그와 별개인 교차 오염 방어다.
+        #   ⚠ 그래서 이 집합은 **문서 단위**다 — 새 문서를 열 때만 비운다(`open`).
+        if getattr(self, "_memo_stories", None) is None:
+            self._memo_stories = set()
 
         try:
             self.hwp.HAction.Run("MoveDocBegin")
@@ -1742,8 +1780,6 @@ class HwpBridge:
             doc_occ = int(item.get("doc_occ") or 0)
             occ_cap = doc_occ or occ_total or self._MEMO_MAX_OCC
             occ_cap = min(occ_cap, self._MEMO_MAX_OCC)
-            # 메모 본문에 적을 '이 낱말 N곳' — 상한이 안전 상한(100)일 때는 적지 않는다.
-            occ_show = doc_occ or occ_total or 0
 
             try:
                 for _pass in range(self._MEMO_MAX_PASSES):
@@ -1840,11 +1876,8 @@ class HwpBridge:
                                      / max(1, total)) * 100),
                                 f"메모 다는 중… {idx + 1}/{total} ({visited}곳)")
 
-                        # ⚠ 메모 본문의 '이 낱말 N곳 중 k번째'는 **실제로 도는 자리 수**를
-                        #   써야 한다. occ_total(추출 텍스트 기준)을 쓰면 문서에 4곳뿐인데
-                        #   "5곳 중 3번째"라고 적혀 편집자가 없는 자리를 찾게 된다.
                         ok, why = self._insert_memo_here(
-                            body, k, occ_show, color if mark_anchor else None,
+                            body, color if mark_anchor else None,
                             original=original)
                         if ok:
                             inserted += 1

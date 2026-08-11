@@ -91,7 +91,8 @@ _XY_TOLERANCE = 1.0        # 좌표 묶음 허용 오차(pt)
 #     그래서 줄바꿈만 흡수하고 띄어쓰기는 엄격히 본다.
 #   ⚠ 남는 모호함 하나: 줄바꿈이 **하필 이음매에서** 일어나면
 #     `'공급사슬\r\n관리'`가 '공급사슬 관리'인지 '공급사슬관리'인지 글자만으로는
-#     가릴 수 없어 양쪽 다 인정한다(자리 하나 규모, 글리프 간격 분석 없이는 불가).
+#     가릴 수 없다 — 그래서 일단 인정하되 `exact=False`로 **표시해 두고**, 자리 수가
+#     어긋날 때 `_drop_ambiguous`가 개수를 근거로 걷어낸다(§_drop_ambiguous).
 _BREAK_RE = re.compile(r"[ \t ]*[\r\n]+[ \t ]*")
 
 
@@ -107,16 +108,44 @@ def _spacing_ok(actual: str, needle: str) -> bool:
 
 
 class _Match:
-    __slots__ = ("page", "rect", "xy_key")
+    __slots__ = ("page", "rect", "xy_key", "exact")
 
-    def __init__(self, page, rect):
+    def __init__(self, page, rect, exact=True):
         self.page = page
         self.rect = rect                       # (left, bottom, right, top)
         self.xy_key = (round(rect[0] / _XY_TOLERANCE),
                        round(rect[1] / _XY_TOLERANCE))
+        # 잡은 글자가 원문과 **글자 그대로** 같았는가. 줄바꿈을 지워야 같아진 매치는
+        #   False — 그 자리는 반대 표기일 수도 있다(위 §띄어쓰기 검증).
+        self.exact = exact
 
     def __repr__(self):
         return f"<Match p{self.page} x{self.rect[0]:.0f} y{self.rect[1]:.0f}>"
+
+
+def _drop_ambiguous(matches, expected):
+    """★줄바꿈에 걸린 **반대 표기**를 걷어낸다. 반환 (매치 목록, 걷어낸 수).
+
+    실측 2026-08-10 (실파일 고독사 · 사용자 보고):
+      '도움요청'→'도움 요청'(문서 4곳)이 PDF에서 **5곳**으로 잡혔다. 다섯째(114쪽)는
+      원고에서 이미 올바른 '도움 요청'인데 하필 '도움'과 '요청' 사이에서 줄이 바뀌어,
+      줄바꿈을 지우면 '도움요청'과 글자가 같아진 자리였다. 개수가 어긋나니 정합이
+      실패로 떨어지고 **네 자리 전부**에 '위치 자동 대조 실패' 경고가 붙은 채 엉뚱한
+      자리까지 형광이 칠해졌다 — 같은 부류가 문서 곳곳에서 반복됐다.
+
+    가릴 근거는 **개수**다. 줄바꿈 매치를 뺀 '글자 그대로' 매치만으로 문서의 등장 수가
+    딱 맞으면, 줄바꿈 매치는 원고에 없는 자리 = 반대 표기다. 반대로 모자라면 그 매치는
+    진짜 등장이므로 그대로 둔다(`'엔\\r\\n진 부품'`은 진짜 '엔진 부품'이다).
+
+    ⚠ **개수가 넘칠 때만** 판정한다. 처음부터 맞으면 건드릴 이유가 없고, 모자랄 때
+      건드리면 멀쩡한 정탐을 잃는다.
+    """
+    if not expected or len(matches) <= expected:
+        return matches, 0
+    exact = [m for m in matches if m.exact]
+    if len(exact) != expected:
+        return matches, 0
+    return exact, len(matches) - len(exact)
 
 
 def _search_all(pdf, tps, needle):
@@ -150,7 +179,7 @@ def _search_all(pdf, tps, needle):
                 except Exception:
                     rect = None
                 if rect:
-                    out.append(_Match(i, rect))
+                    out.append(_Match(i, rect, exact=(actual == needle)))
         finally:
             try:
                 s.close()
@@ -245,25 +274,33 @@ def annotate(pdf_path: str, items: list, out_path: str = None,
         warnings = []
         head_dropped = 0
         space_dropped = 0
+        break_dropped = 0
         pages_by_original = {}
 
         for it in items:
             needle = (it.get("original") or "").strip()
             if not needle:
                 continue
+            occ_total = int(it.get("occ_total") or 0)
+            doc_occ   = int(it.get("doc_occ") or 0)
             matches, sp = _search_all(pdf, tps, needle)
             space_dropped += sp
             matches, dropped = _drop_running_heads(matches)
             head_dropped += dropped
+            # ★줄바꿈에 걸린 반대 표기 걷어내기 — **쪽 목록을 만들기 전**에 한다.
+            #   정오표의 'PDF 쪽' 칸이 이 목록을 등장 인덱스로 훑으므로, 순서를 바꾸는
+            #   판정은 전부 여기서 끝나 있어야 한다.
+            matches, br = _drop_ambiguous(matches, doc_occ or occ_total)
+            break_dropped += br
             if not matches:
                 missing.append(needle)
                 continue
             pages_by_original[needle] = [m.page + 1 for m in matches]
             targets, warn = _align_occurrences(
                 matches,
-                int(it.get("occ_total") or 0),
+                occ_total,
                 set(it.get("skip_occurrences") or []),
-                doc_occ=int(it.get("doc_occ") or 0),
+                doc_occ=doc_occ,
             )
             if warn:
                 warnings.append(f"{needle}: {warn}")
@@ -287,6 +324,10 @@ def annotate(pdf_path: str, items: list, out_path: str = None,
             "· 검색이 공백을 무시해 반대 표기까지 잡음")
     if head_dropped:
         log(f"  [PDF] 머리말·꼬리말 반복 매치 {head_dropped}곳 제외")
+    if break_dropped:
+        # ⚠ 조용한 드롭 금지 — 줄바꿈 때문에 반대 표기가 원문처럼 보인 자리다.
+        log(f"  [PDF] 줄바꿈에 걸린 반대 표기 {break_dropped}곳 제외 "
+            "· 문서 등장 수와 대조해 판정")
 
     # ── 2) 주석 쓰기 ──────────────────────────────────────────────
     writer = pypdf.PdfWriter(clone_from=pdf_path)
@@ -332,6 +373,7 @@ def annotate(pdf_path: str, items: list, out_path: str = None,
         "missing":    missing,
         "warnings":   warnings,
         "spacing_dropped": space_dropped,
+        "break_dropped":   break_dropped,
         "pages_by_original": pages_by_original,
         # {원문: [주석을 실제로 단 등장 인덱스…]} — 정오표가 '못 단 자리'를 적는 근거
         "marked_occ": marked_occ,
@@ -345,39 +387,10 @@ _ANNOT_AUTHOR = "KS-AI Editor"
 
 
 def _memo_body(item: dict, warn: str = "") -> str:
-    """스티커 팝업에 들어갈 본문 — 설계 문서 §3.1의 세 줄 서식.
-
-    ⚠ 화면 로그 규약과 달리 여기엔 **원문·교정문을 그대로 쓴다** — 이건 로그가 아니라
-      산출물이고, 편집자가 그 자리에서 무엇을 무엇으로 고칠지 읽어야 하기 때문이다.
-    """
-    orig = (item.get("original") or "").strip()
-    corr = (item.get("corrected") or "").strip()
-    lines = []
-    if corr and corr != orig:
-        lines.append(f"‘{orig}’ → ‘{corr}’")
-    else:
-        lines.append(f"‘{orig}’ 확인 필요")
-    cat = (item.get("category") or "").strip()
-    reason = _clean_reason(item.get("reason") or "")
-    if cat and reason:
-        lines.append(f"[{cat}] {reason}")
-    elif cat:
-        lines.append(f"[{cat}]")
-    elif reason:
-        lines.append(reason)
-    # ⚠ '이 낱말 N곳'은 **문서에서 실제로 찾은 수**(doc_occ)로 적는다 — 추출 텍스트로
-    #   센 occ_total을 쓰면 문서에 없는 자리까지 세어 편집자가 헛되이 찾는다.
-    total = int(item.get("doc_occ") or 0) or int(item.get("occ_total") or 0)
-    if total > 1:
-        lines.append(f"· 이 낱말 {total}곳")
-    if warn:
-        lines.append(warn)
-    return "\n".join(lines)
+    """주석 하나의 본문 — 문구는 `output.annot_text`가 단일 출처다(메모와 같은 말)."""
+    from .annot_text import annotation_body
+    return annotation_body(item.get("original", ""), item.get("corrected", ""),
+                           item.get("category", ""), item.get("reason", ""),
+                           extra=warn)
 
 
-_WS_RE = re.compile(r"\s+")
-
-
-def _clean_reason(s: str) -> str:
-    """사유 문장을 한 줄로 — 팝업은 좁아서 개행이 많으면 읽기 어렵다."""
-    return _WS_RE.sub(" ", s).strip()[:300]

@@ -148,3 +148,36 @@ class Correction:
 
     def is_valid(self) -> bool:
         return bool(self.original.strip()) and self.original != self.corrected
+
+
+# ══════════════════════════════════════════════════════
+# ▌`skip_occurrences`의 정의 — **단일 출처**
+# ══════════════════════════════════════════════════════
+def occurrence_skipped(occ) -> bool:
+    """이 등장을 문서 반영에서 제외하는가.
+
+    ★`skip_occurrences`를 만드는 곳이 둘이라(검수 패널의 `_derive`, 적용 워커의
+      좌표계 보정 `_plan_occurrences`) **판정식은 반드시 하나여야 한다.** 두 곳이
+      따로 판정하던 동안 실제로 이런 사고가 났다(실측 2026-08-10 · 실파일 고독사):
+
+        · `_derive`      : excluded ⇒ skip           ← 옳다
+        · `_plan_occurrences`: status != accepted 만 봄  ← `excluded`를 놓쳤다
+
+      일관성 통일(`_apply_unify_forward`)은 그룹의 **모든** 등장을 accepted로 찍는데,
+      거기엔 '등장이 아닌 자리'(excluded)도 섞여 있다. 그래서 보정이 한 번이라도
+      발동하면 excluded가 통째로 치환 대상이 됐다 — '고립예방'→'고립 예방'이 검수
+      패널에서 3곳만 수락됐는데 교정본에서는 **10곳 전부** 바뀌었고('고립예방사업'→
+      '고립 예방사업' 등), 같은 결정으로 만든 PDF·메모본은 3곳만 표시해 세 산출물이
+      서로 다른 문서가 됐다.
+
+    판정(둘 다 `_derive` 원문 주석의 근거를 따른다):
+      · `excluded`(더 긴 낱말 속 부분문자열 — '성장단계'⊂'성장단계별') ⇒ **항상 제외**.
+        사용자가 결정한 적 없는 자리이고, 근거 수치에도 안 들어간 자리다.
+      · `shadowed`(더 긴 교정이 대표하는 자리) ⇒ **제외하지 않는다**. 긴 교정이 그
+        자리를 치환하거나(그러면 못 찾아 무해) 부분문자열을 남기거나(그러면 이 교정이
+        정규화해야 한다) 둘 중 하나다. 넣으면 등장 인덱스가 밀려 오적용이 난다.
+      · 그 밖에는 수락하지 않은 등장만 제외.
+    """
+    if occ.get("excluded"):
+        return True
+    return not occ.get("shadowed") and occ.get("status") != "accepted"

@@ -1559,9 +1559,14 @@ class ResultPanel(QWidget):
             return (f"적용 {int(d.get('applied', 0)):,}건 "
                     f"· 본문 {int(d.get('occurrences', 0)):,}곳")
         if mode == "memo":
+            # ⚠ 못 단 자리는 `unmarked`로 적는다 — `memo_blocked`는 한/글이 거부한 자리만
+            #   세어서, **문서에서 등장을 못 찾아** 지나간 자리가 빠진다. 그러면 화면의
+            #   '메모 N곳 + 불가 M곳'이 정오표의 수락 행 수와 맞지 않아, 사용자가 남은
+            #   차이를 산출물 불일치로 읽는다(2026-08-10 사용자 보고).
+            miss = int(d.get("unmarked") or d.get("memo_blocked") or 0)
             s = f"메모 {int(d.get('memoed', 0)):,}곳"
-            if d.get("memo_blocked"):
-                s += f" · 메모 불가 {int(d['memo_blocked']):,}곳"
+            if miss:
+                s += f" · 표시 못 함 {miss:,}곳"
             return s
         if mode == "pdf":
             s = f"주석 {int(d.get('annotated', 0)):,}곳"
@@ -1582,7 +1587,11 @@ class ResultPanel(QWidget):
         if r.get("pdf_path"):
             rows.append((self._OUT_META["pdf"][2], r["pdf_path"],
                          self._mode_summary("pdf", r)))
-        if r.get("errata_path"):
+        # ⚠ 1차 실행이 스스로 만든 정오표일 때만 여기서 적는다. 추가 실행이 채워 준
+        #   것이면 아래 추가 산출물 줄이 **자기 모드 이름과 자기 행 수로** 적는다 —
+        #   여기서 적으면 '정오표 · 1차 행 수'가 되어 출처를 속인다(main_window
+        #   `_on_extra_done`의 `errata_from_extra` 주석).
+        if r.get("errata_path") and not r.get("errata_from_extra"):
             rows.append((self._OUT_META["errata"][2], r["errata_path"],
                          self._mode_summary("errata", r)))
         for e in (r.get("extra_outputs") or []):

@@ -533,6 +533,8 @@ class ReviewPanel(QWidget):
         super().__init__(parent)
         self._corrections = []   # 고유 교정 목록(적용/카운트용)
         self._occ = []           # 등장 위치별 항목(카드 1:1)
+        # 겹침 쌍 캐시(_overlap_pairs) — 등장이 늘거나 새로 만들어지면 비운다.
+        self._ov_pairs = None
         self._cards = []
         self._options = {}
         self._full_text = ""
@@ -1005,6 +1007,7 @@ class ReviewPanel(QWidget):
     # ── 등장 위치별 항목 구성 ─────────────────────
     def _build_occurrences(self):
         self._occ = []
+        self._ov_pairs = None        # 등장이 새로 만들어진다 — 겹침 캐시 무효화
         text = self._full_text
         auto_apply = self._options.get("auto_apply", False)
         
@@ -1621,9 +1624,12 @@ class ReviewPanel(QWidget):
         #     drop_redundant_josa_variants가 별도 제거 — consistency_pass 참조.)
         #   · excluded(어절 base 불일치 복합어, 예 '성장단계별') 등장: 항상 skip. 원문이
         #     부분문자열로 잡히지만 근거 수치(다수결 base)에 포함 안 된 자리라 치환 금지.
+        #   ⚠ 판정식은 `core.models.occurrence_skipped` **하나뿐**이다 — 적용 워커의
+        #     좌표계 보정(`_plan_occurrences`)이 같은 목록을 다시 만들기 때문에, 여기서만
+        #     고치면 그쪽이 조용히 되돌린다(그 함수 주석의 실측 사고 참조).
+        from core.models import occurrence_skipped
         c["skip_occurrences"] = [k for k, o in enumerate(occs)
-                                 if o.get("excluded")
-                                 or (not o.get("shadowed") and o["status"] != "accepted")]
+                                 if occurrence_skipped(o)]
         # 본문 실등장 수 — 적용 후 '수락 등장 수 vs 실제 치환 수' 대조(부분 반영 감지)용.
         #   apply_worker가 (occurrences − skip) > replaced 면 실패 항목으로 표출한다
         #   (수락한 교정이 조용히 일부만 반영되는 치명 오류 방지 — 사용자 보고 2026-07-03).
@@ -1643,6 +1649,101 @@ class ReviewPanel(QWidget):
             groups.setdefault(o["ci"], []).append(o)
         for ci in range(len(self._corrections)):
             self._derive(ci, groups.get(ci, []))
+        return self._compose_overlaps()
+
+    # ══════════════════════════════════════════════
+    # 겹치는 교정의 합성 — **카드가 실제 결과를 보여주게**
+    # ══════════════════════════════════════════════
+    def _overlap_pairs(self) -> list:
+        """겹치는 등장 쌍 [(겉 uid, 겉 ci, 속 ci, 속 pos)…] — **위치는 검수 중 불변**이라
+        한 번만 만들고 캐시한다.
+
+        ⚠ 등장마다 다른 등장을 전수 비교하면 O(등장²)라, 등장 수천 개 문서에서 클릭마다
+          수백 ms가 붙는다(memory: review-card-list-perf). 시작 위치로 정렬한 뒤 스택으로
+          훑으면 O(n log n)이고, 스택 바닥이 곧 **가장 바깥 구간**이다.
+        """
+        cached = getattr(self, "_ov_pairs", None)
+        if cached is not None:
+            return cached
+        spans = []
+        for o in self._occ:
+            s0, e0 = o.get("pos"), o.get("end")
+            if isinstance(s0, int) and isinstance(e0, int) and e0 > s0:
+                spans.append((s0, e0, o["ci"], o["uid"]))
+        spans.sort(key=lambda t: (t[0], -(t[1] - t[0])))
+        pairs, stack = [], []
+        for s0, e0, ci, uid in spans:
+            while stack and stack[-1][1] <= s0:
+                stack.pop()
+            if stack:
+                out = stack[0]                      # 가장 바깥 구간
+                pairs.append((out[3], out[2], ci, s0, uid))
+            stack.append((s0, e0, ci, uid))
+        self._ov_pairs = pairs
+        return pairs
+
+    def _compose_overlaps(self) -> set:
+        """겹치는 교정이 한 자리에서 만들 **최종 문자열**을 겉 카드의 교정값에 반영한다.
+        반환: 값이 바뀐 correction의 id 집합(호출부가 입력칸을 제자리 갱신한다).
+
+        ★왜 필요한가(사용자 보고 2026-08-10):
+          '리플렛등'은 의존명사 띄어쓰기 카드라 교정값이 **'리플렛 등'**으로 만들어진다.
+          그런데 같은 자리에 '리플렛'→'리플릿' 카드가 겹쳐 있어 실제로 문서에 남는 것은
+          **'리플릿 등'**이다. 사용자는 카드에 적힌 '리플렛 등'을 보고 수락하는데 결과는
+          다른 문자열이었다 — **판단의 근거가 틀린 것**이라 산출물 불일치보다 나쁘다.
+
+        ⚠ 합성은 **거절에 따라 되돌아간다.** 안쪽 카드('리플렛'→'리플릿')를 거절하면
+          겉 카드는 다시 '리플렛 등'이 된다. 그래서 원래 값을 `_compose_base`에 간직하고
+          상태가 바뀔 때마다(`_derive_all`) 다시 계산한다.
+        ⚠ 사용자가 교정값을 직접 고친 카드(`_edited`)는 **건드리지 않는다** — 사람의
+          입력을 자동 계산이 덮어쓰면 안 된다.
+        ⚠ 한 교정의 등장들이 서로 다른 결과를 내면 합성하지 않는다 — 카드 하나가 두
+          문자열을 보여줄 수 없고, 하나만 고르면 나머지 자리에서 거짓말이 된다.
+        """
+        occ_by_uid = {o["uid"]: o for o in self._occ}
+
+        def alive(o):
+            return (o is not None and o.get("status") != "rejected"
+                    and o["c"].get("status") != "rejected")
+
+        # 겉 등장(uid)별로 그 안에 든 속 교정들을 모은다 — 살아 있는 것만.
+        by_outer, part_n = {}, {}
+        for out_uid, out_ci, in_ci, in_pos, in_uid in self._overlap_pairs():
+            if alive(occ_by_uid.get(out_uid)) and alive(occ_by_uid.get(in_uid)):
+                by_outer.setdefault((out_uid, out_ci), []).append((in_pos, in_ci))
+        for o in self._occ:
+            if alive(o) and isinstance(o.get("pos"), int):
+                part_n[o["ci"]] = part_n.get(o["ci"], 0) + 1
+
+        per_ci = {}
+        for (_uid, ci), ins in by_outer.items():
+            cur = (self._corrections[ci].get("_compose_base")
+                   or self._corrections[ci].get("corrected", ""))
+            for _pos, ci2 in sorted(ins, key=lambda t: t[0]):
+                io_ = self._corrections[ci2].get("original", "")
+                ic_ = self._corrections[ci2].get("corrected", "")
+                if io_ and io_ in cur:
+                    cur = cur.replace(io_, ic_, 1)
+            per_ci.setdefault(ci, []).append(cur)
+
+        changed = set()
+        for ci, c in enumerate(self._corrections):
+            if c.get("_edited"):
+                continue
+            base = c.get("_compose_base") or c.get("corrected", "")
+            composed = per_ci.get(ci) or []
+            vals = set(composed)
+            # 겹치지 않는 등장이 하나라도 있으면 그 자리는 base 그대로다.
+            if part_n.get(ci, 0) > len(composed):
+                vals.add(base)
+            want = vals.pop() if len(vals) == 1 else base
+            if want != c.get("corrected", ""):
+                c.setdefault("_compose_base", base)
+                c["corrected"] = want
+                changed.add(id(c))
+        if changed:
+            self._sync_corrected_widgets(changed)
+        return changed
 
     # ══════════════════════════════════════════════
     # 용어 일관성 통일 (일관성 카드 = 문서 전체 표기 선택)
@@ -2086,6 +2187,7 @@ class ReviewPanel(QWidget):
         #    ⚠ _build_occurrences 전체 재구성은 다른 카드의 부분 수락/거절(occ 단위)
         #    상태를 지우므로 쓰지 않는다 — occ 상태를 보존한 채 판정만 다시 돈다.
         if grew:
+            self._ov_pairs = None    # 역방향 교정의 등장이 합류했다 — 캐시 무효화
             self._occ.sort(key=lambda o: (o["pos"] is None, o["pos"] or 0))
             self._reindex_occ()
             self._mark_stem_boundary_skips()   # 새 등장만 계산(_stem_done 메모)
