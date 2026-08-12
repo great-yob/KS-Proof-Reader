@@ -31,7 +31,6 @@ ui/widgets/result_panel.py — 교정 완료 보고서 패널 (글래스 대시�
 
 import html
 import math
-import os
 import time
 import datetime
 
@@ -150,6 +149,17 @@ def _hline(on_glass: bool = True) -> QFrame:
     return d
 
 
+def _vline() -> QFrame:
+    """세로 구분선 — `_hline`의 세로판(같은 톤). 2단 그리드의 칸 사이에 쓴다."""
+    d = QFrame()
+    d.setFixedWidth(1)
+    dark = current_mode() == "dark"
+    d.setStyleSheet(
+        f"background:{_rgba('#FFFFFF', 0.13) if dark else _rgba('#1A1D23', 0.10)};"
+        " border:none;")
+    return d
+
+
 class _MinimalChevron(QWidget):
     """파이프라인 카드 사이의 진행 표시 — 미니멀 쉐브런(">"). 얇은 2획 스트로크만
     그린다(채움·그라디언트·글로우 없음). 등장 시(start) 옅게 페이드인만 한다."""
@@ -231,7 +241,6 @@ class _SavedTimeClock(QWidget):
         self._card_gap = 4.0          # 같은 그룹(시/분) 내 자릿수 사이 간격
         self._group_gap = 11.0        # 시-분 그룹 사이(콜론 자리)
         self._label_gap = 10.0
-        self.setToolTip("페이지 수 기준 수작업 예상 시간(1인 8시간=100쪽) 대비 절약된 시간")
         fm = QFontMetrics(self._label_font())
         label_w = fm.horizontalAdvance("절약한 시간")
         digits_w = self._card_w * 4 + self._card_gap * 2 + self._group_gap
@@ -837,8 +846,8 @@ class RadialGauge(QWidget):
         self._caption = caption
         self._center_text = center_text     # 지정 시 % 대신 고정 텍스트
         self._bubble_label = bubble_label
-        self._fill_color = fill_color       # 채워진 아크/수락 버블 색(미지정 시 pal["accent"])
-        self._reject_color = reject_color   # 남은 트랙/거절 버블 색(미지정 시 기존 회색 트랙)
+        self._fill_color = fill_color       # 수락 구간/버블 색(미지정 시 pal["accent"])
+        self._reject_color = reject_color   # 거절 구간/버블 색(미지정 시 회색 트랙색)
         self._bubble_labels = bubble_labels  # (수락 텍스트, 거절 텍스트)
         self._ring_size = size              # 링 지름(캔버스가 커져도 링 자체 크기는 고정)
         self._p = 1.0
@@ -872,17 +881,30 @@ class RadialGauge(QWidget):
         size = self._ring_size - 18     # 캔버스가 버블용으로 커져도 링 지름은 고정.
         rect = QRectF((w - size) / 2, (h - size) / 2, size, size)
 
+        # ★도넛(DonutChartWidget)과 **같은 방식**으로 그린다 — 빈 트랙을 깔고, 두
+        #   구간(수락·거절)이 각자 제 몫만큼 12시부터 시계방향으로 이어 붙는다.
+        #   예전에는 거절 색으로 원을 통째로 칠한 뒤 그 위에 수락 아크를 덮어썼다.
+        #   결과 그림은 비슷해도 **자라는 방식이 달라** 두 차트가 다른 물건처럼
+        #   보였고(사용자 지적 2026-08-12), 거절 100%에서 수락이 잠식하는 모양이라
+        #   '거절이 기본값'처럼 읽혔다. 이제 둘 다 0에서 함께 자란다.
+        #   ⚠ 버블 앵커각(_bubble_at의 `fraction/2`, `(1+fraction)/2`)은 이 배치를
+        #     전제로 계산돼 있다 — 구간 순서를 바꾸면 앵커도 같이 바꿀 것.
         reject = self._reject_color or _track_color()
-        pen = QPen(QColor(reject), 13, Qt.SolidLine, Qt.RoundCap)
+        fill = self._fill_color or pal["accent"]
+
+        pen = QPen(_track_color(), 13, Qt.SolidLine, Qt.RoundCap)
         painter.setPen(pen)
         painter.drawArc(rect, 0, 360 * 16)
 
-        fill = self._fill_color or pal["accent"]
-        span = -int(self._fraction * self._p * 360 * 16)
-        if span:
-            pen.setColor(QColor(fill))
-            painter.setPen(pen)
-            painter.drawArc(rect, 90 * 16, span)
+        cum = 0.0
+        for frac, color in ((self._fraction, fill), (1.0 - self._fraction, reject)):
+            start_angle = int((90 - cum * 360) * 16)
+            span = -int(frac * 360 * self._p * 16)
+            if span:
+                pen.setColor(QColor(color))
+                painter.setPen(pen)
+                painter.drawArc(rect, start_angle, span)
+            cum += frac
 
         font = painter.font()
         font.setBold(True)
@@ -1448,6 +1470,11 @@ class ResultPanel(QWidget):
             self._col.addWidget(self._rise(outputs, self._T_OUT))
 
         bottom = QHBoxLayout()
+        # ⚠ 마진을 0으로 **명시**해야 한다. 위젯에 붙지 않은 QLayout은 스타일 기본
+        #   마진(9px)을 갖기 때문에, 이 행만 좌우로 9px씩 밀려 로그 카드가 위쪽
+        #   카드들보다 좁아 보였다(실측: 다른 카드 x=0 w=928, 로그 x=9 w=910 —
+        #   사용자 보고 2026-08-12 "교정 진행 요약 카드만 가로 사이즈가 다르다").
+        bottom.setContentsMargins(0, 0, 0, 0)
         bottom.setSpacing(22)
         log = self._build_log()
         fails = self._build_fails()
@@ -1536,23 +1563,34 @@ class ResultPanel(QWidget):
         "hwp":    ("hwp",   "HWP (빨간색)",  "교정본",
                    "원고에 반영 + 빨간색 표시", "교정본"),
         "memo":   ("memo",  "HWP (메모)",    "메모본",
-                   "글자 무변경 + 메모로 표시", "메모"),
+                   "원고에 미반영 + 메모로 표시", "메모"),
         "pdf":    ("pdf",   "PDF (주석)",    "PDF 주석본",
-                   "PDF 변환 + 형광펜·주석", "PDF"),
+                   "PDF 변환 + 형광펜 · 주석", "PDF"),
         "errata": ("excel", "Excel (정오표)", "정오표",
-                   "쪽·수정 전·수정 후 기록", "정오표만"),
+                   "페이지 + 수정 전 · 후 기록", "정오표만"),
     }
     _OUT_ORDER = ("hwp", "memo", "pdf", "errata")
 
     def _produced_modes(self) -> set:
-        """이미 만들어진 결과물 — 1차 실행 + 추가 실행 + 동봉된 정오표."""
+        """이미 만들어진 결과물 — 1차 실행 + 추가 실행 + 1차가 동봉한 정오표.
+
+        ★'errata'가 produced인 조건은 **이 실행의 정오표가 따로 있는가**이지,
+          "어딘가에 정오표 파일이 있는가"가 아니다(사용자 보고 2026-08-12:
+          "정오표 미생성으로 돌렸는데 결과 화면에 정오표 생성 버튼이 없다").
+          정오표를 끄고 교정본만 뽑은 뒤 메모본을 추가하면, 그 메모 실행이 낸
+          `_정오표(메모).xlsx`가 `result["errata_path"]`의 빈자리를 채운다
+          (`main_window._on_extra_done`) — 예전 판정은 그걸 보고 '정오표 있음'으로
+          단정해 **Excel(정오표) 버튼을 지워** 버렸다. 그 정오표는 메모본에 딸린
+          것이고, 교정본에 대한 정오표는 여전히 없다.
+        ⚠ 그래서 `errata_from_extra`(누가 만들었는지)를 함께 본다. 이 값이 있으면
+          그 정오표는 아래 산출물 목록에서 **자기 실행 줄에 합쳐져** 표시된다.
+        """
         r = self._result or {}
         done = {self._out_mode()}
         for e in (r.get("extra_outputs") or []):
             if e.get("mode"):
                 done.add(e["mode"])
-        # 정오표는 어느 모드에서든 곁들여 나온다 — 파일이 있으면 '이미 있음'이다.
-        if r.get("errata_path"):
+        if r.get("errata_path") and not r.get("errata_from_extra"):
             done.add("errata")
         return done
 
@@ -1563,57 +1601,94 @@ class ResultPanel(QWidget):
         d = d or {}
         if mode == "hwp":
             return (f"적용 {int(d.get('applied', 0)):,}건 "
-                    f"· 본문 {int(d.get('occurrences', 0)):,}곳")
+                    f"· 본문 {int(d.get('occurrences', 0)):,}항목")
         if mode == "memo":
             # ⚠ 못 단 자리는 `unmarked`로 적는다 — `memo_blocked`는 한/글이 거부한 자리만
             #   세어서, **문서에서 등장을 못 찾아** 지나간 자리가 빠진다. 그러면 화면의
             #   '메모 N곳 + 불가 M곳'이 정오표의 수락 행 수와 맞지 않아, 사용자가 남은
             #   차이를 산출물 불일치로 읽는다(2026-08-10 사용자 보고).
             miss = int(d.get("unmarked") or d.get("memo_blocked") or 0)
-            s = f"메모 {int(d.get('memoed', 0)):,}곳"
+            s = f"메모 {int(d.get('memoed', 0)):,}항목"
             if miss:
-                s += f" · 표시 못 함 {miss:,}곳"
+                s += f" · 표시 못 함 {miss:,}항목"
             return s
         if mode == "pdf":
-            s = f"주석 {int(d.get('annotated', 0)):,}곳"
+            s = f"주석 {int(d.get('annotated', 0)):,}항목"
             if d.get("pdf_missing"):
-                s += f" · 미탐 {int(d['pdf_missing']):,}건"
+                s += f" · 미탐 {int(d['pdf_missing']):,}항목"
             return s
         rows = d.get("errata_rows")
         return f"{len(rows):,}행" if rows else ""
 
     def _artifact_rows(self) -> list:
-        """만들어진 파일 목록 — [(라벨, 경로, 요약), …]. 1차 실행분이 먼저."""
+        """만들어진 파일 목록 — [{"icons","title","path","summary"}, …]. 1차 실행분이 먼저.
+
+        ★**추가 실행 한 번 = 목록 한 줄**이다(사용자 지시 2026-08-12). 추가 산출물은
+          정오표가 항상 함께 나오므로(`main_window._start_extra_output`이 `gen_errata`를
+          켠다) 둘을 따로 적으면 한 번 누른 결과가 두 줄로 불어나, 무엇이 무엇에 딸린
+          것인지 흐려진다 — '메모본 + 정오표 (메모)' 한 줄로 묶는다.
+        ⚠ 1차 실행은 묶지 않는다. 그쪽 정오표는 **끌 수 있는 별개 산출물**이고
+          (부가 기능 토글), 없을 수도 있기 때문이다.
+        """
         r = self._result or {}
         primary = self._out_mode()
         rows = []
         if r.get("hwp_path"):
-            rows.append((self._OUT_META.get(primary, (None, None, "한글 산출물"))[2],
-                         r["hwp_path"], self._mode_summary(primary, r)))
+            rows.append(self._row(primary,
+                                  self._OUT_META.get(primary,
+                                                     (None, None, "한글 산출물"))[2],
+                                  r["hwp_path"], self._mode_summary(primary, r)))
         if r.get("pdf_path"):
-            rows.append((self._OUT_META["pdf"][2], r["pdf_path"],
-                         self._mode_summary("pdf", r)))
+            rows.append(self._row("pdf", self._OUT_META["pdf"][2], r["pdf_path"],
+                                  self._mode_summary("pdf", r)))
         # ⚠ 1차 실행이 스스로 만든 정오표일 때만 여기서 적는다. 추가 실행이 채워 준
         #   것이면 아래 추가 산출물 줄이 **자기 모드 이름과 자기 행 수로** 적는다 —
         #   여기서 적으면 '정오표 · 1차 행 수'가 되어 출처를 속인다(main_window
         #   `_on_extra_done`의 `errata_from_extra` 주석).
         if r.get("errata_path") and not r.get("errata_from_extra"):
-            rows.append((self._OUT_META["errata"][2], r["errata_path"],
-                         self._mode_summary("errata", r)))
+            rows.append(self._row("errata", self._OUT_META["errata"][2],
+                                  r["errata_path"], self._mode_summary("errata", r)))
         for e in (r.get("extra_outputs") or []):
             m = e.get("mode", "")
             meta = self._OUT_META.get(m)
+            name = meta[2] if meta else "산출물"
+            tag = meta[4] if meta else m
+            err_path = e.get("errata_path", "")
+            err_sum = self._mode_summary("errata", e)
             if e.get("path"):
-                rows.append((meta[2] if meta else "산출물", e["path"],
-                             self._mode_summary(m, e)))
-            # 추가 실행이 자기 정오표를 따로 냈을 때만(같은 파일이면 위에서 이미 실렸다)
-            if e.get("errata_path") and e["errata_path"] != r.get("errata_path"):
-                rows.append((f"정오표 ({meta[4] if meta else m})", e["errata_path"],
-                             self._mode_summary("errata", e)))
+                title, icons, summary = name, [m], self._mode_summary(m, e)
+                if err_path:
+                    # 한 줄로 합치기 — 아이콘도 둘, 요약도 둘(각 파일이 제 수치를 말한다).
+                    #   ⚠ 정오표 쪽 수치엔 이름을 붙인다 — 그냥 '68행'만 이어 붙이면
+                    #     앞의 메모 수치와 한 덩어리로 읽혀 무엇의 68행인지 흐려진다.
+                    title = f"{name} + 정오표 ({tag})"
+                    icons = [m, "errata"]
+                    summary = " · ".join(
+                        x for x in (summary, f"정오표 {err_sum}" if err_sum else "") if x)
+                rows.append(self._row(m, title, e["path"], summary, icons=icons))
+            elif err_path:
+                # '정오표만' 추가 실행 — 산출물이 정오표 하나뿐이라 꼬리표를 붙이지
+                #   않는다(1차가 정오표를 냈다면 이 모드는 애초에 제안되지 않는다).
+                rows.append(self._row("errata", self._OUT_META["errata"][2],
+                                      err_path, err_sum))
         return rows
 
-    def _artifact_row_widget(self, label: str, path: str, summary: str) -> QWidget:
-        pal = current_palette()
+    @staticmethod
+    def _row(mode: str, title: str, path: str, summary: str, icons=None) -> dict:
+        return {"mode": mode, "title": title, "path": path,
+                "summary": summary, "icons": icons or [mode]}
+
+    def _artifact_row_widget(self, row: dict) -> QWidget:
+        """산출물 한 줄 — [형식 아이콘] 산출물명 / 서브 내용 · 우측 '폴더 열기'.
+
+        ⚠ 파일명은 적지 않는다(사용자 지시 2026-08-12). 산출물명이 이미 무엇인지
+          말하고, 파일 이름은 폴더를 열면 보인다 — 좁은 왼쪽 칸에서 긴 파일명이
+          두 줄로 접혀 줄 높이만 들쭉날쭉하게 만들었다.
+        ⚠ 합쳐진 줄(메모본 + 정오표)은 아이콘이 둘이고 파일도 둘이지만 **폴더 열기는
+          하나**다 — 두 파일이 원본과 같은 폴더에 나란히 놓이므로 여는 곳이 같다.
+        """
+        label, path, summary = row["title"], row["path"], row["summary"]
+        icon_names = row.get("icons") or []
         dark = current_mode() == "dark"
         item = QFrame()
         item.setObjectName("outInset")
@@ -1623,26 +1698,55 @@ class ResultPanel(QWidget):
             f"QFrame#outInset {{ background:{ins_bg}; border:1px solid {ins_bd}; "
             "border-radius:12px; }}")
         row = QHBoxLayout(item)
-        row.setContentsMargins(16, 11, 12, 11)
-        row.setSpacing(12)
+        # ⚠ 안쪽 중첩 레이아웃(col·head·icons)에도 마진 0을 명시한다 — 스타일 기본
+        #   9px이 얹히면 이 줄의 실제 여백이 좌 23·상 20이 되어, 선언한 값(14/11)과
+        #   달라지고 줄마다 높이가 커진다.
+        row.setContentsMargins(16, 12, 12, 12)
+        row.setSpacing(10)
 
         col = QVBoxLayout()
-        col.setSpacing(2)
-        head = QLabel(
-            f'<span style="color:{pal["text"]};font-weight:700;">{html.escape(label)}</span>'
-            f'<span style="color:{pal["text_muted"]};">  {html.escape(os.path.basename(path))}</span>')
-        head.setStyleSheet("font-size:14px; background:transparent; border:none;")
-        head.setWordWrap(True)
-        col.addWidget(head)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(3)
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(8)
+        # 설정·완료 화면과 같은 원색 형식 아이콘(`_OUT_META` 주석) — 무엇이 나왔는지를
+        #   글자보다 먼저 말한다. 합쳐진 줄은 파일 수만큼(모드 + 정오표).
+        icons = QHBoxLayout()
+        icons.setContentsMargins(0, 0, 0, 0)
+        icons.setSpacing(3)
+        for name in icon_names:
+            meta = self._OUT_META.get(name)
+            if meta:
+                icons.addWidget(IconLabel(meta[0], size=19), 0, Qt.AlignVCenter)
+        if icons.count():
+            head.addLayout(icons)
+        name = _ctext(label, px=14, color="text", weight=700)
+        head.addWidget(name, 0, Qt.AlignVCenter)
+        head.addStretch()
+        col.addLayout(head)
         if summary:
             col.addWidget(_ctext(summary, px=13, color="text_sub", weight=500))
         row.addLayout(col, 1)
 
         # ⚠ `clicked`는 checked(bool)를 슬롯에 넘긴다 — PySide6는 람다가 받을 수 있는
         #   만큼 인자를 채우므로 `lambda p=path:`로 쓰면 p가 **True로 덮인다**.
-        btn = IconButton("folder-open", text="폴더 열기", variant="ghost",
-                         role="text_sub", size=14,
+        btn = IconButton("folder-open", text="폴더 열기", variant="primary",
+                         role="accent_fg", size=14,
                          on_click=lambda *_a, p=path: self.output_open_requested.emit(p))
+        # 눈에 띄게(사용자 지시 2026-08-12) — 채운 accent 버튼.
+        # ⚠ per-instance 스타일시트는 전역 QSS의 `[variant="primary"]` 규칙을 **대체**한다
+        #   (설정하지 않은 속성이 그 규칙에서 상속되지 않는다 — 크기만 주면 배경이 빠져
+        #   인셋 위 흐린 글자가 됐다. 실측). 그래서 색까지 여기서 전부 선언한다.
+        # ⚠ 높이는 QSS `min-height`로 — 전역 `QPushButton{min-height:18px}`가
+        #   `setMinimumHeight()`를 이긴다(`_extra_add_button` 주석의 함정과 같다).
+        pal = current_palette()
+        btn.setStyleSheet(
+            f"QPushButton {{ background:{pal['accent']}; color:{pal['accent_fg']}; "
+            "border:none; border-radius:9px; min-height:32px; padding:0 15px; "
+            "font-size:13px; font-weight:700; }"
+            f"QPushButton:hover {{ background:{pal['accent_hover']}; }}"
+            f"QPushButton:pressed {{ background:{pal['accent_press']}; }}")
         row.addWidget(btn, 0, Qt.AlignVCenter)
         return item
 
@@ -1660,33 +1764,66 @@ class ResultPanel(QWidget):
         if not self._result:
             return None
         arts = self._artifact_rows()
-        remaining = [m for m in self._OUT_ORDER if m not in self._produced_modes()]
+        produced = self._produced_modes()
+        remaining = [m for m in self._OUT_ORDER if m not in produced]
         if not arts and not remaining:
             return None
 
         frame, lay = self._section("산출물", "folder-open",
                                    shine_delay=self._T_OUT + 560)
-        for label, path, summary in arts:
-            lay.addWidget(self._artifact_row_widget(label, path, summary))
 
-        if remaining:
-            if self._extra_busy:
-                meta = self._OUT_META.get(self._extra_busy)
-                lay.addWidget(_ctext(
-                    self._extra_status or f"{meta[2] if meta else '산출물'} 만드는 중…",
-                    px=14, color="accent", weight=600, wrap=True))
-            else:
-                lay.addWidget(_ctext(
-                    "결과물 추가 — 다른 형태의 결과물이 필요하면 선택하세요.",
-                    px=13, color="text_sub", weight=500, wrap=True))
-            btn_row = QHBoxLayout()
-            btn_row.setSpacing(10)
-            for m in remaining:
-                btn_row.addWidget(self._extra_add_button(m))
-            btn_row.addStretch()
-            wrap = _twidget()
-            wrap.setLayout(btn_row)
-            lay.addWidget(wrap)
+        # ── 2단 그리드 — 왼쪽 '만들어진 것' / 오른쪽 '더 만들 수 있는 것'
+        #   (사용자 지시 2026-08-12). 한 열로 쌓으면 이미 만든 목록과 추가 버튼이
+        #   같은 흐름으로 읽혀, 아래쪽 버튼이 '또 만들어진 것'처럼 보였다.
+        grid = QHBoxLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(20)
+
+        left = QVBoxLayout()
+        # ⚠ 위 `bottom`과 같은 함정 — 마진 0을 명시하지 않으면 두 칸이 스타일 기본
+        #   9px씩 안쪽으로 밀려, 카드 제목('산출물')보다 목록·버튼이 더 들어가 보인다
+        #   (실측: 제목 x=28, 줄 x=37 — 사용자 보고 "카드 내부 여백이 다르다").
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(8)
+        for row in arts:
+            left.addWidget(self._artifact_row_widget(row))
+        left.addStretch(1)
+        lw = _twidget()
+        lw.setLayout(left)
+        grid.addWidget(lw, 5)
+        # 두 칸을 가르는 세로 구분선 — '만들어진 것'과 '더 만들 것'이 다른 성격의
+        #   목록임을 여백만으로 말하기엔 약했다(사용자 지시 2026-08-12).
+        grid.addWidget(_vline())
+
+        # ★네 가지 결과물 버튼을 **항상 전부** 세워 두고, 만들 수 있는 것만 활성화한다
+        #   (사용자 지시 2026-08-12). 예전엔 만들어진 모드의 버튼이 목록에서 빠졌는데,
+        #   그러면 누를 때마다 버튼이 사라져 자리가 밀리고("방금 누른 게 어디 갔지"),
+        #   무엇을 이미 만들었는지도 오른쪽만 봐선 알 수 없었다. 비활성 버튼이 곧
+        #   '이건 이미 있다'는 표시가 된다.
+        right = QVBoxLayout()
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(8)
+        if self._extra_busy:
+            meta = self._OUT_META.get(self._extra_busy)
+            right.addWidget(_ctext(
+                self._extra_status or f"{meta[2] if meta else '산출물'} \n생성하는 중…",
+                px=14, color="accent", weight=600, wrap=True))
+        else:
+            right.addWidget(_ctext(
+                "산출물 추가\n— 다른 형태의 파일이 필요하면 선택하세요."
+                if remaining else "산출물 추가\n— 가능한 파일을 모두 만들었습니다.",
+                px=13, color="text_sub", weight=500, wrap=True))
+            right.addSpacing(2)
+        for m in self._OUT_ORDER:
+            right.addWidget(self._extra_add_button(m, done=m in produced))
+        right.addStretch(1)
+        rw = _twidget()
+        rw.setLayout(right)
+        grid.addWidget(rw, 3)
+
+        wrap = _twidget()
+        wrap.setLayout(grid)
+        lay.addWidget(wrap)
         return frame
 
     # 아이콘 22px + 이름 한 줄('Excel (정오표)')이 접히지 않는 크기.
@@ -1697,15 +1834,19 @@ class ResultPanel(QWidget):
     _ADD_BTN_H = 46
     _ADD_BTN_W = 158
 
-    def _extra_add_button(self, mode: str) -> QPushButton:
+    def _extra_add_button(self, mode: str, done: bool = False) -> QPushButton:
         """'결과물 추가' 버튼 한 개 — 파일 형식 원색 아이콘 + 설정 화면과 같은 이름.
+
+        `done`=이미 만들어진 결과물. 목록에서 빼지 않고 **비활성 상태로 남긴다**
+        (사용자 지시 2026-08-12) — 네 자리가 고정돼 있어야 누를 때마다 버튼이
+        사라져 자리가 밀리지 않고, 비활성 자체가 '이건 이미 있다'는 표시가 된다.
 
         ⚠ 전역 QSS의 `QPushButton[variant=…]` 대신 objectName으로 스코프한
           per-instance 스타일시트를 쓴다 — 바로 위에 놓인 산출물 줄(`outInset`)과
           같은 인셋 표면이어야 '이미 있는 것'과 '더 만들 것'이 한 벌로 읽힌다.
           결과 패널은 테마 전환 때 통째로 다시 렌더되므로 색이 굳지 않는다.
         ⚠ 아이콘은 원색 SVG라 색 인자가 무시된다(`_OUT_META` 주석) — 그래서 여기서
-          role/색을 고르지 않는다.
+          role/색을 고르지 않는다. 비활성일 때 아이콘이 흐려지는 것은 Qt가 해 준다.
         """
         pal = current_palette()
         dark = current_mode() == "dark"
@@ -1713,18 +1854,28 @@ class ResultPanel(QWidget):
 
         b = QPushButton("  " + name)
         b.setObjectName("outAddBtn")
-        b.setCursor(Qt.PointingHandCursor)
-        b.setToolTip(desc)
+        b.setCursor(Qt.ArrowCursor if done else Qt.PointingHandCursor)
+        b.setToolTip("이미 만들어진 결과물입니다." if done else desc)
         b.setIcon(make_icon(icon, pal["text"], 22))
         b.setIconSize(icon_size(22))
         b.setMinimumWidth(self._ADD_BTN_W)
         b.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
-        bg   = _rgba("#FFFFFF", 0.05) if dark else _rgba("#FFFFFF", 0.72)
-        bd   = _rgba("#FFFFFF", 0.12) if dark else _rgba("#0F172A", 0.10)
-        hov  = _rgba("#FFFFFF", 0.11) if dark else _rgba("#FFFFFF", 0.98)
-        prs  = _rgba("#FFFFFF", 0.07) if dark else _rgba("#0F172A", 0.06)
+        # 활성/비활성 대비 — ★두 테마가 **다른 방향으로** 어긋났다(사용자 보고
+        #   2026-08-12: 라이트는 차이가 너무 크고, 다크는 너무 작다).
+        #   원인은 비활성 표면을 만든 방식이 서로 달랐던 것:
+        #     · 라이트 = 활성이 흰색 72%인데 비활성은 **어두운 톤을 얹어**(#0F172A 3.5%)
+        #       파인 구멍처럼 보였다 → 같은 흰색의 **옅은 판**으로 바꿔 '바랜' 느낌만 준다.
+        #     · 다크 = 활성 5% vs 비활성 2%로 사실상 같은 면이었다 → 활성을 올리고
+        #       (11%) 비활성을 더 내려(1.5%) 판 자체가 갈리게 한다.
+        #   글자색 차이(text ↔ text_dim)는 두 테마 공통이라 여기서 손대지 않는다.
+        bg   = _rgba("#FFFFFF", 0.11) if dark else _rgba("#FFFFFF", 0.72)
+        bd   = _rgba("#FFFFFF", 0.18) if dark else _rgba("#0F172A", 0.10)
+        hov  = _rgba("#FFFFFF", 0.18) if dark else _rgba("#FFFFFF", 0.98)
+        prs  = _rgba("#FFFFFF", 0.09) if dark else _rgba("#0F172A", 0.06)
         hbd  = _rgba(pal["accent"], 0.55)
+        dis_bg = _rgba("#FFFFFF", 0.015) if dark else _rgba("#FFFFFF", 0.34)
+        dis_bd = _rgba("#FFFFFF", 0.05) if dark else _rgba("#0F172A", 0.05)
         b.setStyleSheet(
             f"QPushButton#outAddBtn {{ background:{bg}; color:{pal['text']}; "
             f"border:1px solid {bd}; border-radius:14px; padding:0 18px 0 14px; "
@@ -1733,8 +1884,8 @@ class ResultPanel(QWidget):
             f"QPushButton#outAddBtn:hover {{ background:{hov}; border-color:{hbd}; }}"
             f"QPushButton#outAddBtn:pressed {{ background:{prs}; }}"
             f"QPushButton#outAddBtn:disabled {{ color:{pal['text_dim']}; "
-            f"background:{bg}; border-color:{bd}; }}")
-        b.setEnabled(not self._extra_busy)
+            f"background:{dis_bg}; border-color:{dis_bd}; }}")
+        b.setEnabled(not done and not self._extra_busy)
         # ⚠ `clicked`는 checked(bool)를 넘긴다 — `lambda mm=mode:`로 쓰면 mm이 True로
         #   덮인다(위 폴더 열기 버튼과 같은 함정).
         b.clicked.connect(lambda *_a, mm=mode:

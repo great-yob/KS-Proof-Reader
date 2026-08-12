@@ -74,6 +74,22 @@ LIGHT = {
     "log_ok":      "#157F3C",
     "log_warn":    "#B4690E",
     "log_err":     "#D63B3B",
+
+    # ── 툴팁 — ★라이트/다크 **같은 값**(테마 무관 다크 칩) ────────────────
+    #   ⚠ 토큰을 테마별로 나누지 말 것. 툴팁은 제 창(HWND)이고, 이 환경의 Qt는
+    #     **QSS의 배경색을 무시하고 검정으로 칠한다**(실측 2026-08-12: 배경을
+    #     #FF0000으로 강제해도 칠해진 색은 검정 — 테두리·글자·padding은 QSS대로
+    #     적용됐다. Fusion 스타일·툴팁 페이드 끄기·DWM 유리 해제 모두 무효).
+    #     그래서 라이트 팔레트의 어두운 글자(#1A1D23)를 쓰면 **검정 위 검정**이
+    #     되어 읽을 수 없었다(사용자 보고).
+    #   → 배경이 사실상 검정으로 고정이므로 **글자를 밝게** 두어 두 테마에서
+    #     똑같이 읽히게 한다. 배경 토큰도 같은 어두운 톤으로 선언해, 훗날 Qt가
+    #     QSS 배경을 존중하게 되더라도 '어두운 칩 + 밝은 글자'라는 결론이
+    #     그대로 유지되게 한다(항상-라이트인 LightConfirmDialog·토스트와 같은
+    #     '테마 무관 표면' 관용구).
+    "tooltip_bg":     "#1B1E24",
+    "tooltip_fg":     "#F2F5F9",
+    "tooltip_border": "#3A424E",
 }
 
 DARK = {
@@ -120,6 +136,12 @@ DARK = {
     "log_ok":      "#54D17F",
     "log_warn":    "#E8B468",
     "log_err":     "#F1726E",
+
+    # 툴팁 — ★LIGHT와 **같은 값**이어야 한다(그 쪽 주석이 근거). 테마별로 갈라
+    #   놓는 순간 라이트에서 검정 위 검정이 되어 글자가 사라진다.
+    "tooltip_bg":     "#1B1E24",
+    "tooltip_fg":     "#F2F5F9",
+    "tooltip_border": "#3A424E",
 }
 
 
@@ -165,10 +187,14 @@ QWidget {
 }
 QMainWindow, QDialog, QStackedWidget { background-color: $bg; }
 QLabel { background: transparent; }
+/* 툴팁 — ★테마 무관 다크 칩. 토큰(tooltip_*)이 라이트·다크에서 같은 값인 이유는
+   LIGHT 팔레트의 그 항목 주석 참조(요약: 이 환경의 Qt는 툴팁 배경을 QSS와 무관하게
+   검정으로 칠한다 — 그래서 글자를 밝게 고정한다). 색은 `apply_theme`가 팔레트
+   (ToolTipBase/ToolTipText)에도 같이 심는다 — QSS가 닿지 않는 경로 대비. */
 QToolTip {
     font-family: "Pretendard"; font-size: 12px;
-    background: $surface; color: $text;
-    border: 1px solid $border; border-radius: 6px; padding: 5px 8px;
+    background-color: $tooltip_bg; color: $tooltip_fg; opacity: 255;
+    border: 1px solid $tooltip_border; border-radius: 6px; padding: 5px 8px;
 }
 /* 팝업/대화상자 — 폰트를 Pretendard로 통일(시스템 기본 폰트 폴백 방지) */
 QMessageBox, QMessageBox QLabel, QInputDialog, QInputDialog QLabel {
@@ -458,10 +484,24 @@ def build_qss(palette: dict) -> str:
 # ══════════════════════════════════════════════════════════════
 
 def apply_theme(app, mode: str = None):
-    """QApplication에 현재(또는 지정) 모드의 글로벌 QSS 적용."""
+    """QApplication에 현재(또는 지정) 모드의 글로벌 QSS 적용.
+
+    ⚠ 툴팁 색은 QSS만으론 부족해 **팔레트에도** 심는다 — 툴팁은 별도 창이라
+      QSS가 닿지 않는 경로가 있고, 그때 팔레트 기본값(시스템 색)으로 떨어지면
+      글자색이 배경과 붙어 읽을 수 없게 된다(QSS의 QToolTip 주석 참조).
+      ⚠ 팔레트는 **툴팁 두 역할만** 건드린다. 다른 역할까지 덮으면 QSS를 안 쓰는
+        네이티브 위젯(스크롤바·메뉴 등)의 색이 함께 흔들린다.
+    """
     if mode is not None:
         set_mode(mode)
     app.setStyleSheet(build_qss(current_palette()))
+
+    from PySide6.QtGui import QPalette, QColor   # 모듈 import-time은 Qt 비의존 유지
+    pal_tokens = current_palette()
+    qpal = app.palette()
+    qpal.setColor(QPalette.ToolTipBase, QColor(pal_tokens["tooltip_bg"]))
+    qpal.setColor(QPalette.ToolTipText, QColor(pal_tokens["tooltip_fg"]))
+    app.setPalette(qpal)
 
 
 def restyle(widget):
