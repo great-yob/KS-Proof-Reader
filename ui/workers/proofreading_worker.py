@@ -1217,7 +1217,7 @@ class ProofreadingWorker(QThread):
                             continue
                         sp_cards.append(Correction(
                             original=eojeol, corrected=spaced,
-                            reason="보조용언 띄어쓰기 — '···해야 한다/된다'는 띄어 씀이 원칙(한글 맞춤법 제47항)",
+                            reason="보조용언 띄어쓰기\n— '···해야 한다/된다'는 띄어 씀이 원칙",
                             source="spacing", color=HL_TYPO,
                             category="띄어쓰기", confidence="high",
                         ))

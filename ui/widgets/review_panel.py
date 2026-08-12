@@ -18,11 +18,14 @@ ui/widgets/review_panel.py — 교정 항목 검토 패널
 import html
 import time
 
-from PySide6.QtCore import Qt, Signal, QTimer, QRect, QSize, QPoint
-from PySide6.QtGui import QTextOption, QPainter, QFont, QColor, QLinearGradient
+from PySide6.QtCore import Qt, Signal, QTimer, QRect, QSize, QPoint, QEvent
+from PySide6.QtGui import (
+    QTextOption, QPainter, QFont, QColor, QLinearGradient,
+    QTextCursor, QTextCharFormat, QTextDocument,
+)
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QDialog, QPushButton,
-    QGraphicsDropShadowEffect,
+    QGraphicsDropShadowEffect, QLineEdit, QStyle, QStyleOptionFrame,
     QScrollArea, QFrame, QTextBrowser, QSplitter, QTextEdit, QLayout, QSizePolicy,
 )
 
@@ -31,6 +34,7 @@ from ui.widgets.components import (
     AnimatedGradientBorder, soft_breakable as _soft_breakable
 )
 from ui.styles.theme import current_palette, restyle, local_qss, LIGHT
+from ui.styles.fonts import SERIF_FAMILY
 
 
 _SOURCE_LABEL = {"dict": "사전검증", "ai_typo": "AI 오탈자", "ai_polish": "AI 윤문",
@@ -178,6 +182,110 @@ class GrowingTextEdit(QTextEdit):
         h = max(h, self.fontMetrics().height() + chrome)
         if h != self.height():
             self.setFixedHeight(h)
+
+
+class GradientPillFrame(QFrame):
+    """가로 그라디언트 **테두리**를 두른 완전 타원(pill) 카드.
+
+    Qt QSS는 `border-color`에 `qlineargradient`를 받지 않으므로 직접 그린다:
+    바깥 라운드렉트를 그라디언트로 채우고, 그보다 `border`만큼 작은 라운드렉트를
+    표면색으로 덮어 테두리만 남긴다. 반지름은 **높이의 절반**이라 높이가 바뀌어도
+    (검색줄은 `_align_search_row`가 높이를 조절한다) 항상 완전한 타원을 유지한다.
+
+    ⚠ `super().paintEvent()`를 부르지 않는다 — 부르면 전역 QSS의 `QWidget` 배경이
+    이 그림 위에 사각형으로 덮인다. 자식 위젯은 각자 그려지므로 영향 없다.
+    """
+
+    def __init__(self, stops: list[tuple[float, str]], border: int = 2, parent=None):
+        super().__init__(parent)
+        self._stops = stops
+        self._border = border
+        self.setAttribute(Qt.WA_StyledBackground, False)
+
+    def paintEvent(self, event):
+        from PySide6.QtCore import QRectF
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        grad = QLinearGradient(r.left(), 0, r.right(), 0)
+        for pos, color in self._stops:
+            grad.setColorAt(pos, QColor(color))
+        p.setPen(Qt.NoPen)
+        p.setBrush(grad)
+        p.drawRoundedRect(r, r.height() / 2, r.height() / 2)
+        b = self._border
+        inner = r.adjusted(b, b, -b, -b)
+        p.setBrush(QColor(current_palette()["surface"]))
+        p.drawRoundedRect(inner, inner.height() / 2, inner.height() / 2)
+        p.end()
+
+
+class HintLineEdit(QLineEdit):
+    """포커스가 오면 안내문이 사라지고 **커서만 깜빡이는** 검색 입력기.
+
+    QLineEdit의 `placeholderText`를 쓰지 않는 이유: Qt6의 placeholder는 포커스가
+    와도 글자가 비어 있는 한 그대로 남는다. '커서를 놓으면 안내문이 사라진다'는
+    요구를 만족시키려면 표시 시점을 직접 정해야 한다. 안내문 라벨을 입력기의
+    **자식으로 얹고** 마우스 이벤트를 통과시킨다 — 위젯을 나란히 두고 교대로
+    숨기는 방식은 안내문을 클릭했을 때 입력기가 포커스를 못 받는다.
+
+    ⚠ 안내문 x좌표는 상수로 두지 말 것 — QSS 패딩·프레임 두께·스타일에 따라 글자
+    시작점이 달라진다. `cursorRect()`도 쓰면 안 된다: 그건 커서 **다시 그릴 영역**이라
+    좌우로 5px씩 부풀려져 있어(Qt `QWidgetLineControl::cursorRect`) 안내문이 입력기
+    왼쪽 밖으로 3px 삐져나갔다(실측). 스타일에 직접 묻는 `SE_LineEditContents`를 쓴다.
+    """
+
+    def __init__(self, hint: str, font_size: int = 14, parent=None):
+        super().__init__(parent)
+        self._hint = QLabel(hint, self)
+        f = self._hint.font()
+        f.setPixelSize(font_size)
+        f.setWeight(QFont.Weight(600))
+        self._hint.setFont(f)
+        self._hint.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.textChanged.connect(lambda *_: self._sync_hint())
+
+    def set_hint_color(self, color: str):
+        self._hint.setStyleSheet(
+            f"QLabel {{ color: {color}; background: transparent; border: none; }}")
+        self._sync_hint()
+
+    # QLineEdit이 내용 사각형 안에서 글자를 그리기 전에 더하는 가로 여백
+    #   (QLineEditPrivate::horizontalMargin). 실측으로 확인 — 입력한 글자의 첫 잉크가
+    #   x=2에서 시작한다. 어긋나도 2px이라 무해하므로 상수로 둔다.
+    _TEXT_MARGIN = 2
+
+    def _text_left(self) -> int:
+        opt = QStyleOptionFrame()
+        self.initStyleOption(opt)
+        r = self.style().subElementRect(QStyle.SubElement.SE_LineEditContents, opt, self)
+        return max(0, r.left() + self.textMargins().left() + self._TEXT_MARGIN)
+
+    def _sync_hint(self):
+        show = not self.hasFocus() and not self.text()
+        self._hint.setVisible(show)
+        if not show:
+            return
+        sz = self._hint.sizeHint()
+        self._hint.resize(sz)
+        self._hint.move(self._text_left(),
+                        max(0, (self.height() - sz.height()) // 2))
+
+    def focusInEvent(self, e):
+        super().focusInEvent(e)
+        self._sync_hint()
+
+    def focusOutEvent(self, e):
+        super().focusOutEvent(e)
+        self._sync_hint()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._sync_hint()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._sync_hint()
 
 
 def _display_category(c: dict) -> str:
@@ -529,6 +637,24 @@ class ReviewPanel(QWidget):
     #   마지막 조작 뒤 한 번만 그린다 — 클릭 반응은 카드 색 변경으로 즉시 돌려준다.
     _PREVIEW_DEBOUNCE_MS = 80
 
+    # ── 원문 검색줄 ────────────────────────────────────────────────────
+    #   _SEARCH_H0는 첫 프레임용 근사치일 뿐이다 — 실제 높이는 _align_search_row가
+    #   두 구분선의 y를 재서 정한다(글꼴·DPI·칩 줄 수에 따라 달라지므로).
+    _SEARCH_H0 = 54
+    _SEARCH_MIN_H = 40
+    _SEARCH_GAP = 14        # 검색줄 ↔ 원문/교정문 칸 사이 여백
+    _SEARCH_DEBOUNCE_MS = 160
+    # 한 글자만 넣어도 문서 전체가 걸리는 질의가 있어 상한을 둔다(형광펜 수만 개는
+    #   그리는 비용이 크고 '몇 번째'라는 안내도 의미를 잃는다).
+    _SEARCH_MAX_HITS = 2000
+    _SEARCH_TOP_PAD = 6     # 찾은 낱말을 맨 위에 놓을 때 남기는 윗여백
+    # 검색줄 생김새 — 테두리 그라디언트는 안내문이 쓰던 그 색 그대로다.
+    _SEARCH_STOPS = [(0.0, "#A88BFF"), (0.5, "#5BB3FF"), (1.0, "#3DD9D6")]
+    _SEARCH_BORDER = 1
+    _SEARCH_ICON = 22       # 돋보기(선 굵기는 stroke_width=2.4)
+    _SEARCH_BTN = 26        # ↑/↓/✕ 원형 버튼 지름(전역 icon 버튼 32보다 작게)
+    _SEARCH_BTN_ICON = 14
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._corrections = []   # 고유 교정 목록(적용/카운트용)
@@ -567,6 +693,14 @@ class ReviewPanel(QWidget):
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._refresh_preview)
+        # 원문 검색 상태 — 두 뷰의 문서 좌표는 서로 다르므로(수락한 교정이 글자를
+        #   바꾼다) 뷰마다 따로 찾는다. _search_idx는 원문 쪽 목록의 인덱스.
+        self._search_query = ""
+        self._search_hits = {"src": [], "prv": []}   # 뷰별 [(start, end), …]
+        self._search_idx = -1
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.timeout.connect(self._run_search)
         self._build_ui()
         self._build_toast()
 
@@ -587,36 +721,400 @@ class ReviewPanel(QWidget):
         root.setSpacing(0)
         root.addWidget(self._build_body(), 1)
         self._apply_card_theme()
+        self._apply_search_theme()
 
     def _build_body(self) -> QSplitter:
+        """검색줄 + 원문|교정문 을 한 칸으로 묶고, 그 옆에 카드 칸.
+
+        ⚠ 스플리터가 **2단(안쪽에 또 2단)**인 이유는 오직 검색줄 때문이다. 3단
+        하나에 검색줄을 통째로 얹으면 검색줄이 세 칸을 **모두** 밀어 내려, 원문
+        구분선과 교정 제안 구분선의 높이 차가 영원히 그대로다(실측: 검색줄을
+        543px까지 키워도 차이 68px 고정). 검색줄이 앞의 두 칸만 밀어야 정렬이 성립한다.
+        """
+        inner = QSplitter(Qt.Horizontal)      # 원문 | 교정문
+        inner.setHandleWidth(16)
+        inner.setStyleSheet("QSplitter::handle { background: transparent; }")
+        inner.setChildrenCollapsible(False)
+        for wdg in (self._build_source_panel(), self._build_preview_panel()):
+            wdg.setMinimumWidth(140)
+            inner.addWidget(wdg)
+        for i in range(2):
+            inner.setStretchFactor(i, 1)
+        inner.setSizes([10000, 10000])
+        inner.splitterMoved.connect(lambda *_: self._equalize_splitter())
+        self._inner_splitter = inner
+
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(0)
+        lv.addWidget(self._build_search_row())
+        lv.addSpacing(self._SEARCH_GAP)
+        lv.addWidget(inner, 1)
+        left.setMinimumWidth(296)             # 두 칸 최소(140×2) + 핸들
+
         splitter = QSplitter(Qt.Horizontal)
         splitter.setHandleWidth(16)
         splitter.setStyleSheet("QSplitter::handle { background: transparent; }")
         splitter.setChildrenCollapsible(False)
-        # 세 칸 모두 동일한 작은 최소 너비 → 어떤 칸도 1/3보다 커지지 않게(1:1:1 보장)
-        for wdg in (self._build_source_panel(), self._build_preview_panel(),
-                    self._build_card_panel()):
-            wdg.setMinimumWidth(140)
-            splitter.addWidget(wdg)
-        for i in range(3):
-            splitter.setStretchFactor(i, 1)
-        splitter.setSizes([10000, 10000, 10000])
+        cards = self._build_card_panel()
+        cards.setMinimumWidth(140)
+        splitter.addWidget(left)
+        splitter.addWidget(cards)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([20000, 10000])
         # 3단 1:1:1 항상 유지 — 사용자가 핸들을 드래그하면 즉시 균등 복원.
         splitter.splitterMoved.connect(lambda *_: self._equalize_splitter())
         self._splitter = splitter
         return splitter
 
-    def _equalize_splitter(self):
-        sp = getattr(self, "_splitter", None)
-        if sp is None:
+    # ══════════════════════════════════════════════
+    # 원문 검색줄
+    # ══════════════════════════════════════════════
+    def _build_search_row(self) -> QWidget:
+        """원문·교정문 **두 칸 위**에만 걸치는 검색줄(카드 칸은 위까지 꽉 찬다).
+
+        가로 폭은 바깥 스플리터의 왼쪽 칸이 정해 준다(= 원문 + 핸들 + 교정문).
+        높이는 `_align_search_row`가 두 구분선을 재서 정한다.
+        """
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(0)
+
+        # 완전 타원(pill) + 안내문 그라디언트와 같은 색의 테두리.
+        bar = GradientPillFrame(self._SEARCH_STOPS, border=self._SEARCH_BORDER)
+        bar.setObjectName("ksSearchBar")
+        bl = QHBoxLayout(bar)
+        # ⚠ 좌우 여백은 타원 끝단의 곡률(=높이의 절반)을 피해야 글자가 테두리에
+        #   붙지 않는다 — 모서리 14px 사각형이던 때보다 넉넉히 준다.
+        bl.setContentsMargins(26, 0, 16, 0)
+        bl.setSpacing(11)
+
+        # 돋보기 — 카드 칸 헤더의 ✦와 같은 브랜드 보라(#7B5CFF). 팔레트 토큰이 아니라
+        #   테마와 무관한 고정색이므로 refresh_theme 대상이 아니다(일반 QLabel).
+        self._search_icon = QLabel()
+        self._search_icon.setFixedSize(self._SEARCH_ICON, self._SEARCH_ICON)
+        self._search_icon.setStyleSheet("background: transparent; border: none;")
+        from ui.styles.icons import pixmap as _icon_pixmap
+        self._search_icon.setPixmap(_icon_pixmap(
+            "search", "#7B5CFF", self._SEARCH_ICON, stroke_width=2.4))
+        bl.addWidget(self._search_icon)
+
+        self._search_input = HintLineEdit("검색할 단어를 입력해 주세요", font_size=14)
+        self._search_input.setObjectName("ksSearchInput")
+        self._search_input.setClearButtonEnabled(False)
+        # ⚠ ClickFocus — StrongFocus면 검토 화면에 들어서는 순간 Qt가 포커스 체인의
+        #   첫 위젯인 이 입력기에 자동으로 포커스를 준다. 그러면 안내문이 곧바로
+        #   사라져(포커스=안내문 숨김) 사용자는 이 칸이 무엇인지 한 번도 못 본다.
+        self._search_input.setFocusPolicy(Qt.ClickFocus)
+        # 세로로 꽉 채운다 — QLineEdit의 기본 세로 정책은 Fixed라 54px 줄 안에서
+        #   18px만 차지해, 클릭으로 포커스를 줄 수 있는 띠가 가운데 18px뿐이었다.
+        self._search_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._search_input.textChanged.connect(self._on_search_text)
+        self._search_input.returnPressed.connect(lambda: self._search_step(1))
+        self._search_input.installEventFilter(self)
+        bl.addWidget(self._search_input, 1)
+
+        self._search_count = QLabel("")
+        self._search_count.setObjectName("ksSearchCount")
+        bl.addWidget(self._search_count)
+
+        self._search_prev_btn = IconButton(
+            "chevron-up", tooltip="이전 검색 결과 (Shift+Enter)",
+            size=self._SEARCH_BTN_ICON, on_click=lambda: self._search_step(-1))
+        self._search_next_btn = IconButton(
+            "chevron-down", tooltip="다음 검색 결과 (Enter)",
+            size=self._SEARCH_BTN_ICON, on_click=lambda: self._search_step(1))
+        self._search_clear_btn = IconButton(
+            "x", tooltip="검색어 지우기 (Esc)",
+            size=self._SEARCH_BTN_ICON, on_click=self._clear_search)
+        for b in (self._search_prev_btn, self._search_next_btn, self._search_clear_btn):
+            b.setObjectName("ksSearchNav")
+            bl.addWidget(b)
+
+        rl.addWidget(bar, 1)
+        self._search_bar = bar
+        self._search_row = row
+        row.setFixedHeight(self._SEARCH_H0)
+        self._set_search_nav_enabled(False)
+        return row
+
+    def _apply_search_theme(self):
+        """검색줄 색 재적용.
+
+        ⚠ 선택자를 **명시**한 규칙만 쓴다(`local_qss`가 필요한 선언 전용 문자열이
+        아니다) — 선언만 주면 Qt가 `*{…}`로 감싸 하위 툴팁까지 덮는다.
+        """
+        pal = current_palette()
+        self._search_input.setStyleSheet(
+            f"QLineEdit#ksSearchInput {{ background: transparent; border: none; "
+            f"padding: 0px; font-size: 14px; color: {pal['text']}; "
+            f"selection-background-color: {pal['accent']}; "
+            f"selection-color: {pal['accent_fg']}; }}")
+        # 안내문은 고스트(흐린 회색) — 그라디언트는 테두리가 맡는다.
+        self._search_input.set_hint_color(pal["text_muted"])
+        self._search_count.setStyleSheet(
+            f"QLabel#ksSearchCount {{ color: {pal['text_muted']}; background: transparent; "
+            f"border: none; font-size: 12px; }}")
+        # 전역 QSS의 QPushButton[variant="icon"](32×32 고정)를 이겨야 작아진다 —
+        #   ⚠ setFixedSize가 아니라 **min/max를 QSS로** 다시 선언해야 한다.
+        s = self._SEARCH_BTN
+        self._search_bar.setStyleSheet(
+            f"QPushButton#ksSearchNav {{ background: {pal['surface_alt']}; "
+            f"color: {pal['text_sub']}; border: none; border-radius: {s // 2}px; "
+            f"min-width: {s}px; max-width: {s}px; min-height: {s}px; max-height: {s}px; "
+            f"padding: 0px; }}"
+            f"QPushButton#ksSearchNav:hover {{ background: {pal['surface_hover']}; }}"
+            f"QPushButton#ksSearchNav:disabled {{ background: transparent; }}")
+        f = self._search_input.font()
+        f.setPixelSize(14)               # QSS font-size는 fontMetrics에 반영되지 않는다
+        self._search_input.setFont(f)
+        self._search_bar.update()        # 타원 안쪽 채움색은 paintEvent가 팔레트에서 읽는다
+
+    def _show_chips(self, on: bool):
+        """집계 칩 표출 토글 — '표기 일관성 제안' 단계는 이 칩과 무관해 숨긴다.
+
+        ⚠ 칩이 사라지면 교정 제안 쪽 구분선이 그만큼 올라가므로 검색줄도 다시
+        맞춰야 한다. 칩 표출을 바꾸는 유일한 통로로 두는 이유가 그것.
+        """
+        self._chips_box.setVisible(on)
+        QTimer.singleShot(0, self._align_search_row)
+
+    def _set_search_nav_enabled(self, on: bool):
+        for b in (self._search_prev_btn, self._search_next_btn):
+            b.setEnabled(on)
+
+    def _align_search_row(self, _pass: int = 0):
+        """검색줄 높이를 조절해 원문·교정문의 구분선을 교정 제안의 구분선과 같은 높이로.
+
+        고정 상수로 못 박지 않는 이유: 교정 제안 쪽 구분선 높이는 헤더 글꼴·집계 칩
+        줄 수·DPI에 따라 달라진다. 그래서 **두 구분선의 실제 y를 재서** 그 차이만큼
+        검색줄을 늘리고 줄인다. 검색줄 높이는 원문 칸만 밀어 내리고 카드 칸에는
+        영향이 없으므로 한 번에 수렴하지만, Qt 레이아웃이 여러 패스에 걸쳐 확정되는
+        경우가 있어(새 카드 pos()와 같은 이유) 안정될 때까지 몇 번만 다시 잰다.
+        """
+        row = getattr(self, "_search_row", None)
+        src, sec = getattr(self, "_src_divider", None), getattr(self, "_sec_divider", None)
+        if row is None or src is None or sec is None or not src.isVisible():
             return
-        w = max(sp.width(), 3)
-        third = w // 3
-        sizes = [third, third, w - 2 * third]
-        if sp.sizes() != sizes:
-            sp.blockSignals(True)
-            sp.setSizes(sizes)
-            sp.blockSignals(False)
+        delta = sec.mapTo(self, QPoint(0, 0)).y() - src.mapTo(self, QPoint(0, 0)).y()
+        if delta == 0 or _pass >= 4:
+            return
+        h = max(self._SEARCH_MIN_H, row.height() + delta)
+        if h == row.height():
+            return
+        row.setFixedHeight(h)
+        QTimer.singleShot(0, lambda: self._align_search_row(_pass + 1))
+
+    # ── 검색 실행 ─────────────────────────────────
+    def eventFilter(self, obj, ev):
+        if (obj is getattr(self, "_search_input", None)
+                and ev.type() == QEvent.Type.KeyPress):
+            if ev.key() == Qt.Key_Escape:
+                self._clear_search()
+                return True
+            if (ev.key() in (Qt.Key_Return, Qt.Key_Enter)
+                    and ev.modifiers() & Qt.ShiftModifier):
+                self._search_step(-1)    # Shift+Enter = 이전(returnPressed는 다음)
+                return True
+        return super().eventFilter(obj, ev)
+
+    def _on_search_text(self, text: str):
+        # ⚠ 공백을 **떼지 않는다** — 띄어쓰기 교정 도구라 '전후 ' 처럼 공백이 붙은
+        #   질의가 의미를 갖는다. 공백뿐인 입력만 '질의 없음'으로 본다.
+        self._search_query = text if text.strip() else ""
+        if not self._search_query:
+            self._search_timer.stop()
+            self._run_search()           # 즉시 지운다(형광펜이 남아 있으면 안 된다)
+            return
+        self._search_timer.start(self._SEARCH_DEBOUNCE_MS)
+
+    def _find_hits(self, view, q: str) -> list[tuple[int, int]]:
+        """뷰의 **문서 좌표**로 된 검색 결과 목록(대소문자 무시).
+
+        `_full_text` 오프셋이 아니라 문서 좌표인 이유: 렌더는 각주 표지 같은 글자를
+        끼워 넣고, 교정문은 수락한 교정만큼 글자가 달라져 두 문서의 좌표가 서로도
+        원문 오프셋과도 어긋난다. 각 문서에서 직접 찾으면 그 어긋남을 계산할 필요가
+        없다.
+        """
+        if not q:
+            return []
+        doc = view.document()
+        out, cur = [], QTextCursor(doc)
+        while len(out) < self._SEARCH_MAX_HITS:
+            cur = doc.find(q, cur, QTextDocument.FindFlag(0))
+            if cur.isNull():
+                break
+            out.append((cur.selectionStart(), cur.selectionEnd()))
+        return out
+
+    # 형광펜 — 노란 형광펜 잉크. **테마와 무관하게 같은 값**을 쓴다(툴팁 칩·
+    #   LightConfirmDialog와 같은 '테마 무관 표면' 관용구): 형광펜은 종이에 그은
+    #   잉크라는 은유라 다크에서 색이 바뀌면 형광펜으로 안 읽힌다. 글자는 두 테마
+    #   모두 어두운 색으로 덮어써야 노랑 위에서 읽힌다.
+    _HL_BASE = "#FFF34D"     # 모든 결과
+    _HL_ACTIVE = "#FFD11A"   # 지금 보고 있는 결과(한 단계 진한 노랑)
+    _HL_FG = "#1A1D23"
+
+    @classmethod
+    def _search_colors(cls) -> tuple[str, str, str]:
+        """(형광펜 배경, 활성 배경, 글자색)."""
+        return cls._HL_BASE, cls._HL_ACTIVE, cls._HL_FG
+
+    def _paint_search(self):
+        """형광펜 표시 — 문서를 다시 그리지 않고 ExtraSelection으로 얹는다.
+
+        ⚠ HTML에 섞어 넣으면 ↑/↓ 한 번마다 setHtml이 다시 돌아 수백 ms가 든다
+        (미리보기 재렌더 비용의 96%가 setHtml). ExtraSelection은 문서를 건드리지
+        않으므로 이동은 즉시다. ⚠ 대신 setHtml이 이걸 지우므로 _refresh_preview
+        끝에서 반드시 다시 칠해야 한다.
+        """
+        base, active, fg = self._search_colors()
+        src_pos = self._current_hit_pos()
+        prv_pos = self._paired_prv_pos(src_pos)
+        for key, view, act in (("src", self._source_view, src_pos),
+                               ("prv", self._preview, prv_pos)):
+            sels = []
+            for s, e in self._search_hits.get(key, []):
+                sel = QTextEdit.ExtraSelection()
+                cur = QTextCursor(view.document())
+                cur.setPosition(s)
+                cur.setPosition(e, QTextCursor.KeepAnchor)
+                sel.cursor = cur
+                fmt = QTextCharFormat()
+                fmt.setBackground(QColor(active if s == act else base))
+                fmt.setForeground(QColor(fg))
+                sel.format = fmt
+                sels.append(sel)
+            view.setExtraSelections(sels)
+
+    def _current_hit_pos(self):
+        hits = self._search_hits.get("src", [])
+        if 0 <= self._search_idx < len(hits):
+            return hits[self._search_idx][0]
+        return None
+
+    def _paired_prv_pos(self, src_pos):
+        """원문 결과 하나에 대응하는 **교정문 결과의 문서 위치**(없으면 None).
+
+        k번째끼리 짝짓지 않고 **위치가 가장 가까운 결과**를 고른다 — 수락한 교정이
+        검색어를 바꾸면 두 문서의 결과 개수가 달라져, 인덱스로 짝지으면 어긋난
+        지점 뒤가 통째로 밀린다(이 저장소가 정오표 '쪽 재정렬'에서 이미 겪은 부류).
+        두 문서의 좌표 차이는 수락된 교정의 길이 차만큼뿐이라 결과 간격보다 훨씬
+        작으므로, 가장 가까운 것이 곧 대응하는 것이다.
+        ⚠ 형광펜(_paint_search)과 스크롤(_goto_search)이 **같은 규칙**을 써야 한다 —
+        따로 정하면 활성 표시와 실제로 맞춰진 자리가 어긋난다.
+        """
+        prv = self._search_hits.get("prv", [])
+        if src_pos is None or not prv:
+            return None
+        return min(prv, key=lambda h: abs(h[0] - src_pos))[0]
+
+    def _run_search(self, keep_index: bool = False):
+        """질의를 두 문서에서 다시 찾아 형광펜을 갱신한다(keep_index=현재 위치 유지)."""
+        q = self._search_query
+        old = self._search_idx
+        self._search_hits = {"src": self._find_hits(self._source_view, q),
+                             "prv": self._find_hits(self._preview, q)}
+        n = len(self._search_hits["src"])
+        if not n:
+            self._search_idx = -1
+        elif keep_index:
+            self._search_idx = min(max(old, 0), n - 1)
+        else:
+            self._search_idx = 0
+        self._paint_search()
+        self._update_search_ui()
+        if n and not keep_index:
+            self._goto_search(self._search_idx)
+
+    def _update_search_ui(self):
+        hits = self._search_hits.get("src", [])
+        if not self._search_query:
+            self._search_count.setText("")
+        elif not hits:
+            self._search_count.setText("결과 없음")
+        else:
+            self._search_count.setText(f"{len(hits)}개의 결과 중 {self._search_idx + 1}번째")
+        self._set_search_nav_enabled(len(hits) > 1)
+
+    def _search_step(self, delta: int):
+        hits = self._search_hits.get("src", [])
+        if not hits:
+            return
+        self._search_idx = (self._search_idx + delta) % len(hits)
+        self._paint_search()
+        self._update_search_ui()
+        self._goto_search(self._search_idx)
+
+    def _goto_search(self, idx: int):
+        """찾은 낱말이 **맨 위**에 오도록 원문·교정문을 함께 스크롤.
+
+        교정문 쪽 대응 자리는 `_paired_prv_pos`가 정한다(형광펜과 같은 규칙).
+        대응 결과가 아예 없으면 원문이 움직인 만큼만 교정문을 밀어 흐름을 지킨다.
+        """
+        src_hits = self._search_hits.get("src", [])
+        if not (0 <= idx < len(src_hits)):
+            return
+        sync = getattr(self, "_scroll_sync", None)
+        if sync:
+            sync.suspend()          # 두 뷰를 각자 정확한 자리로 — 델타 전파를 잠시 끈다
+        pos = src_hits[idx][0]
+        moved = self._scroll_view_to(self._source_view, pos)
+        near = self._paired_prv_pos(pos)
+        if near is not None:
+            self._scroll_view_to(self._preview, near)
+        else:
+            sb = self._preview.verticalScrollBar()
+            sb.setValue(sb.value() + moved)   # 대응 결과 없음 — 흐름만 따라가게
+        if sync:
+            sync.resume()
+
+    def _scroll_view_to(self, view, pos: int) -> int:
+        """문서 위치 pos가 뷰포트 맨 위에 오게 스크롤 — 실제 이동량(px)을 돌려준다."""
+        cur = QTextCursor(view.document())
+        cur.setPosition(pos)
+        sb = view.verticalScrollBar()
+        before = sb.value()
+        sb.setValue(before + view.cursorRect(cur).top() - self._SEARCH_TOP_PAD)
+        return sb.value() - before
+
+    def _clear_search(self):
+        self._search_timer.stop()
+        self._search_input.clear()      # textChanged → _on_search_text → _run_search
+        self._search_input.setFocus()
+
+    def _equalize_splitter(self):
+        """세 칸을 균등 폭으로 되돌린다 — 원문·교정문 두 칸은 **정확히 같은 폭**.
+
+        ⚠ 나눌 폭은 `width()`가 아니라 거기서 **핸들 폭을 뺀 값**이다(핸들 16px가
+        바깥·안쪽 하나씩 = 32px). 빼지 않고 `w//3`을 넘기면 요청 합이 가용폭보다
+        커져 Qt가 알아서 줄이는데, 그 배분이 균등하지 않아 실측 `[439, 440, 441]`처럼
+        칸마다 1px씩 어긋났다. 미리보기는 같은 글을 좌우로 대조하는 화면이라 그
+        1px이 경계에 걸린 줄의 줄바꿈 위치를 바꿔, 원문에서만 한 낱말이 다음 줄로
+        넘어간다(사용자 보고 2026-08-12 — 'Fax. +82-2-748-7588').
+        ⚠ 나머지 픽셀은 **카드 칸**에 몰아 준다. 앞의 두 칸에 나눠 주면 다시
+        원문≠교정문이 되고, 그게 이 버그다. 안쪽 스플리터에 정확히 `2*share`만
+        내주는 것도 같은 이유 — 홀수 폭이 남으면 Qt가 한 칸에만 1px을 얹는다.
+        """
+        outer = getattr(self, "_splitter", None)
+        inner = getattr(self, "_inner_splitter", None)
+        if outer is None or inner is None:
+            return
+        ihw = inner.handleWidth()
+        avail = max(outer.width() - outer.handleWidth() - ihw, 3)
+        share = avail // 3
+        sizes = [2 * share + ihw, avail - 2 * share]
+        if outer.sizes() != sizes:
+            outer.blockSignals(True)
+            outer.setSizes(sizes)
+            outer.blockSignals(False)
+        if inner.sizes() != [share, share]:
+            inner.blockSignals(True)
+            inner.setSizes([share, share])
+            inner.blockSignals(False)
 
     def _build_source_panel(self) -> QWidget:
         panel = QFrame()
@@ -630,7 +1128,9 @@ class ReviewPanel(QWidget):
         hdr.addWidget(sub_label("원문"))
         hdr.addStretch()
         lay.addLayout(hdr)
-        lay.addWidget(divider())
+        # 검색줄 높이 정렬의 기준선(_align_search_row) — 참조를 남긴다.
+        self._src_divider = divider()
+        lay.addWidget(self._src_divider)
         lay.addSpacing(14)
 
         self._source_view = QTextBrowser()
@@ -852,7 +1352,7 @@ class ReviewPanel(QWidget):
         self._position_toast()
         self._toast_w.setVisible(True)
         self._toast_w.raise_()
-        self._toast_timer.start(6000)
+        self._toast_timer.start(4500)
 
     def _position_toast(self):
         host = self._toast_w.parentWidget() or self
@@ -865,8 +1365,15 @@ class ReviewPanel(QWidget):
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self._equalize_splitter()
+        self._align_search_row()
         if self._toast_w.isVisible():
             self._position_toast()
+
+    def showEvent(self, e):
+        # 스테이지 전환으로 처음 보일 때는 크기가 그대로라 resizeEvent가 안 온다 —
+        #   구분선 y는 보이기 전엔 0이므로 이때 한 번 더 맞춘다.
+        super().showEvent(e)
+        QTimer.singleShot(0, self._align_search_row)
 
     def _on_scroll(self, value):
         self._note_interaction()
@@ -938,12 +1445,18 @@ class ReviewPanel(QWidget):
         self._fam_word_choices, self._fam_decided = {}, {}
         self._fam_words, self._word_cards = [], []
         self._fam_blocked, self._fam_broken = [], []
+        self._search_timer.stop()
+        self._search_input.clear()        # 새 문서 — 이전 파일의 검색어는 무의미
+        self._search_query = ""
+        self._search_hits, self._search_idx = {}, -1
+        self._update_search_ui()
         self._build_occurrences()
         self._rebuild_cards()
         self._refresh_preview(keep_scroll=False)   # 새 문서는 맨 위에서 시작
         self._emit_counts()
-        # 첫 표시 시 3단 1:1:1 강제(기본 창 크기에서도).
+        # 첫 표시 시 3단 1:1:1 강제(기본 창 크기에서도) + 검색줄 높이 정렬.
         QTimer.singleShot(0, self._equalize_splitter)
+        QTimer.singleShot(0, self._align_search_row)
 
     def get_corrections(self) -> list:
         return self._corrections
@@ -2266,7 +2779,7 @@ class ReviewPanel(QWidget):
         self._fam_mode = True
         self._prefetch_timer.stop()
         self._set_grid_title("표기 일관성 제안", self._FAM_STOPS)
-        self._chips_box.setVisible(False)          # 교정 카드용 집계 칩은 이 단계와 무관
+        self._show_chips(False)          # 교정 카드용 집계 칩은 이 단계와 무관
         self._build_family_cards()
         self._card_scroll.verticalScrollBar().setValue(0)
         self._emit_family_counts()
@@ -2314,7 +2827,7 @@ class ReviewPanel(QWidget):
         self._fam_all = []
         self._fam_cards = []
         self._set_grid_title("교정 제안", self._CARD_STOPS)
-        self._chips_box.setVisible(True)
+        self._show_chips(True)
         self._rebuild_cards()
         self._emit_counts()
 
@@ -2417,7 +2930,7 @@ class ReviewPanel(QWidget):
         finally:
             self._batch_flip = False
         self._set_grid_title("교정 제안", self._CARD_STOPS)
-        self._chips_box.setVisible(True)
+        self._show_chips(True)
         self._rebuild_cards()
         self._refresh_preview()
         self._emit_counts()
@@ -2837,6 +3350,10 @@ class ReviewPanel(QWidget):
         else:
             self._source_view.setHtml(self._render_with_text(original=True))
             self._preview.setHtml(self._render_with_text(original=False))
+        # ⚠ setHtml은 ExtraSelection(검색 형광펜)도 함께 지우고, 문서가 새로 짜였으니
+        #   옛 위치는 무효다 — 질의가 살아 있으면 다시 찾아 칠한다(현재 위치는 유지).
+        if self._search_query:
+            self._run_search(keep_index=True)
         if keep is None:
             if sync:
                 sync.resume()
@@ -2905,9 +3422,20 @@ class ReviewPanel(QWidget):
             cursor = e
         if cursor < len(text):
             parts.append(self._escape_body(text[cursor:], cursor))
+        return (f'<div style="{self._body_style()}">{"".join(parts)}</div>')
+
+    @staticmethod
+    def _body_style() -> str:
+        """원문·교정문 **본문 전용** 글꼴 — 명조(본명조).
+
+        출판 원고는 대부분 본문에 명조 계열을 쓴다. 미리보기를 UI 글꼴(고딕)로
+        그리면 같은 글을 원고와 다른 인상으로 읽게 되므로 본문만 명조로 돌린다.
+        ⚠ 화면의 다른 글자(패널 제목·카드·집계)는 그대로 Pretendard다 — 명조는
+        작은 글자·UI 밀도에서 가독성이 떨어진다.
+        """
         pal = current_palette()
-        return (f'<div style="line-height:2.0; font-size:14px; color:{pal["text"]};">'
-                f'{"".join(parts)}</div>')
+        return (f"line-height:2.0; font-size:14px; "
+                f"font-family:'{SERIF_FAMILY}'; color:{pal['text']};")
 
     def _render_fallback(self, original: bool) -> str:
         pal = current_palette()
@@ -2940,8 +3468,7 @@ class ReviewPanel(QWidget):
                 f'<span style="background:{bg}; padding:1px 4px; '
                 f'border-radius:4px; color:{fg}; font-weight:{weight};">'
                 f'{html.escape(shown or "")}</span></a>')
-        return (f'<div style="line-height:2.0; font-size:14px; color:{pal["text"]};">'
-                f'{"".join(parts)}</div>')
+        return (f'<div style="{self._body_style()}">{"".join(parts)}</div>')
 
     @staticmethod
     def _escape_text(s: str) -> str:
@@ -3313,6 +3840,7 @@ class ReviewPanel(QWidget):
         self._emit_counts()
 
     def refresh_theme(self):
+        self._apply_search_theme()   # 형광펜 색은 _refresh_preview 안의 재검색이 갱신
         if self._fam_mode:
             # 가족 카드는 점진 로딩 대상이 아니라 _rebuild_cards가 못 다룬다 — 통째로 다시 만든다.
             self._build_family_cards()

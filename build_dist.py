@@ -499,6 +499,15 @@ def verify(outdir: Path) -> bool:
             print(f"  ✗ _internal/assets/{sub} 없음/빈 폴더 — UI 자산이 사라집니다")
         else:
             print(f"  ✔ _internal/assets/{sub} ({len(list(p.iterdir()))}개)")
+    # 본문 명조(본명조) — 검토 화면 원문·교정문 본문 전용. 빠져도 예외가 나지 않고
+    #   조용히 고딕으로 되돌아가므로(폴백) 빌드가 대신 잡는다.
+    serif = outdir / "_internal" / "assets" / "fonts" / "NotoSerifKR-VF.ttf"
+    if not serif.is_file():
+        ok = False
+        print("  ✗ _internal/assets/fonts/NotoSerifKR-VF.ttf 없음 — 미리보기 본문이"
+              " 조용히 고딕으로 바뀝니다")
+    else:
+        print(f"  ✔ 본문 명조 NotoSerifKR-VF.ttf ({serif.stat().st_size / 1048576:.1f}MB)")
 
     # 32비트 HWP 브리지 — 없으면 배포본에서 한/글 교정이 통째로 죽는다(과거 실제 사고).
     bexe = outdir / BRIDGE_DIR_NAME / BRIDGE_EXE_NAME
