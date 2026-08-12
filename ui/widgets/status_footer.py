@@ -4,6 +4,13 @@ ui/widgets/status_footer.py — 하단 영구 상태바
 상태 텍스트 + 진행바(실행 중에만) + 취소 + 컨텍스트 1차 액션 버튼.
 워크스페이스 전 단계에 걸쳐 항상 표시되며, 현재 단계에 맞는 주 행동을
 한 곳에서 제공한다.
+
+⚠ **완료 단계의 산출물 액션(정오표 열기/생성·폴더 열기)은 여기에 두지 않는다**
+  (사용자 지시 2026-08-11). 결과 화면의 '산출물' 카드가 만들어진 파일을 한 줄씩
+  이름·요약과 함께 늘어놓고 각 줄에서 폴더를 열며, 없는 결과물은 같은 카드에서
+  바로 추가로 만든다 — 푸터에 같은 행동을 한 벌 더 두면 '정오표 열기'가 어느
+  정오표를 여는지(1차/메모/PDF) 말할 수 없어 오히려 산출물 목록과 어긋난다.
+  완료 단계에 남는 푸터 액션은 **초기화 하나뿐**이다.
 """
 
 from PySide6.QtCore import Signal, QVariantAnimation, QEasingCurve
@@ -17,8 +24,6 @@ class StatusFooter(QFrame):
     primary_clicked = Signal()
     cancel_clicked  = Signal()
     reset_clicked   = Signal()
-    errata_clicked  = Signal()
-    folder_clicked  = Signal()
     recheck_clicked = Signal()
 
     def __init__(self, parent=None):
@@ -56,18 +61,6 @@ class StatusFooter(QFrame):
                                      on_click=self.reset_clicked.emit)
         self._reset_btn.setVisible(False)
         lay.addWidget(self._reset_btn)
-
-        self._errata_btn = IconButton("table", text="정오표 생성", variant="ghost",
-                                      role="text_sub", size=14,
-                                      on_click=self.errata_clicked.emit)
-        self._errata_btn.setVisible(False)
-        lay.addWidget(self._errata_btn)
-
-        self._folder_btn = IconButton("folder-open", text="폴더 열기", variant="ghost",
-                                      role="text_sub", size=14,
-                                      on_click=self.folder_clicked.emit)
-        self._folder_btn.setVisible(False)
-        lay.addWidget(self._folder_btn)
 
         # 표기 일관성 2단계 — 1차 통일 뒤 **남은 갈림**을 다시 볼 때만 나온다.
         #   1차 액션(교정 적용)을 가리면 안 되므로 ghost 보조 버튼이다.
@@ -130,8 +123,6 @@ class StatusFooter(QFrame):
         self._status.setText(status)
         self._cancel_btn.setVisible(False)
         self._reset_btn.setVisible(False)
-        self._errata_btn.setVisible(False)
-        self._folder_btn.setVisible(False)
         self._recheck_btn.setVisible(False)
         self._reset_cancel()
 
@@ -143,8 +134,6 @@ class StatusFooter(QFrame):
         self._status.setText(status)
         self._cancel_btn.setVisible(True)
         self._reset_btn.setVisible(False)
-        self._errata_btn.setVisible(False)
-        self._folder_btn.setVisible(False)
         self._recheck_btn.setVisible(False)
         self._reset_cancel()
         
@@ -176,12 +165,6 @@ class StatusFooter(QFrame):
         self._recheck_btn.setText(f"일관성 선택 재검토 ({count}건)" if count
                                   else "일관성 선택 재검토")
         self._recheck_btn.setVisible(visible)
-
-    # ── 결과 화면 전용 액션(정오표/폴더 열기) ─────────
-    def set_result_actions(self, visible: bool, has_errata: bool = False):
-        self._errata_btn.setText("정오표 열기" if has_errata else "정오표 생성")
-        self._errata_btn.setVisible(visible)
-        self._folder_btn.setVisible(visible)
 
     @staticmethod
     def _icon_role_for(variant: str) -> str:

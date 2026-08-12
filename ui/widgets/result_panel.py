@@ -2,7 +2,7 @@
 ui/widgets/result_panel.py — 교정 완료 보고서 패널 (글래스 대시보드)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 완료 단계를 '완료 보고서 대시보드'로 구성한다:
-  · 헤더 — 문서명 · 완료 시각(정오표/폴더 열기 액션은 하단 StatusFooter로 이동)
+  · 헤더 — 문서명 · 완료 시각
   · 파이프라인 히어로 — 01 분석(글자 수) → 02 교정 제안(사전·규칙/AI) → 03 적용(건·곳·적용률)
   · 상세 분석 — 제안 소스 도넛 · 적용률 게이지 · 오류 유형 바 차트
   · 실패 항목(사유 인라인 — 별도 다이얼로그 없이) · 교정 진행 로그
@@ -25,7 +25,8 @@ ui/widgets/result_panel.py — 교정 완료 보고서 패널 (글래스 대시�
 덮이지 않도록 per-instance stylesheet로 지정한다(카드류는 재렌더되므로 허용 패턴).
 ⚠ QLabel은 QFrame 서브클래스 — per-instance QSS의 `QFrame{}` 선택자는 자식
 라벨까지 물들이므로 반드시 objectName으로 스코프를 한정한다.
-"새 파일"·정오표 생성/열기·폴더 열기는 하단 StatusFooter(초기화-정오표-폴더열기 순)가 담당한다.
+산출물(만들어진 파일 열기 + 없는 결과물 추가 생성)은 '산출물' 카드가 전담한다 —
+하단 StatusFooter에 남는 완료 단계 액션은 **초기화 하나뿐**이다(사용자 지시 2026-08-11).
 """
 
 import html
@@ -36,7 +37,7 @@ import datetime
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
-    QScrollArea, QTextEdit, QSizePolicy,
+    QScrollArea, QTextEdit, QSizePolicy, QPushButton,
     QGraphicsOpacityEffect,
 )
 from PySide6.QtGui import (
@@ -49,6 +50,7 @@ from PySide6.QtCore import (
 )
 
 from ui.widgets.components import IconLabel, IconButton
+from ui.styles.icons import make_icon, icon_size
 from ui.styles.theme import current_palette, current_mode
 
 
@@ -701,7 +703,7 @@ class DonutChartWidget(QWidget):
     _BUBBLE_ANGLES = (60, 240)   # 고정 위치: index0=5시(우하), index1=11시(좌상).
 
     def __init__(self, segments, *, unit: str = "건", caption: str = None,
-                 labels: list = None, size: int = 158,
+                 labels: list = None, size: int = 140,
                  canvas_w: int = None, canvas_h: int = None, parent=None):
         super().__init__(parent)
         self._segments = [(float(v), key) for v, key in segments]
@@ -828,7 +830,7 @@ class RadialGauge(QWidget):
                  center_text: str = None, bubble_label: str = None,
                  bubble_labels: tuple = None, fill_color: str = None,
                  reject_color: str = None,
-                 size: int = 158, canvas_w: int = None, canvas_h: int = None,
+                 size: int = 140, canvas_w: int = None, canvas_h: int = None,
                  parent=None):
         super().__init__(parent)
         self._fraction = max(0.0, min(1.0, fraction))
@@ -1526,14 +1528,18 @@ class ResultPanel(QWidget):
     #     선택지를 두 화면이 다르게 부르면 사용자는 다른 기능이라고 읽는다.
     #   ⚠ 짧은 꼬리표는 `main_window._extra_errata_path`가 붙이는 파일명 괄호와 **같은
     #     말**이어야 한다 — 화면에는 '정오표 (메모)', 파일은 `…_정오표(메모).xlsx`.
+    #   ⚠ 아이콘은 파일 형식을 그대로 그린 **원색 아이콘**이다(hwp/memo/pdf/excel.svg).
+    #     Lucide 선 아이콘과 달리 `currentColor`가 없어 `icons.pixmap`의 색 치환이
+    #     no-op이고, 그래서 라이트·다크 어디서나 제 색으로 그려진다 — 의도한 동작이다
+    #     ('무엇을 하나 더 만들지'를 글자보다 아이콘이 먼저 말하게 하는 자리).
     _OUT_META = {
-        "hwp":    ("clipboard-check", "HWP (빨간색)",  "교정본",
+        "hwp":    ("hwp",   "HWP (빨간색)",  "교정본",
                    "원고에 반영 + 빨간색 표시", "교정본"),
-        "memo":   ("file-text",       "HWP (메모)",    "메모본",
+        "memo":   ("memo",  "HWP (메모)",    "메모본",
                    "글자 무변경 + 메모로 표시", "메모"),
-        "pdf":    ("file-down",       "PDF (주석)",    "PDF 주석본",
+        "pdf":    ("pdf",   "PDF (주석)",    "PDF 주석본",
                    "PDF 변환 + 형광펜·주석", "PDF"),
-        "errata": ("table",           "Excel (정오표)", "정오표",
+        "errata": ("excel", "Excel (정오표)", "정오표",
                    "쪽·수정 전·수정 후 기록", "정오표만"),
     }
     _OUT_ORDER = ("hwp", "memo", "pdf", "errata")
@@ -1664,9 +1670,6 @@ class ResultPanel(QWidget):
             lay.addWidget(self._artifact_row_widget(label, path, summary))
 
         if remaining:
-            lay.addSpacing(4)
-            lay.addWidget(_hline())
-            lay.addSpacing(2)
             if self._extra_busy:
                 meta = self._OUT_META.get(self._extra_busy)
                 lay.addWidget(_ctext(
@@ -1674,24 +1677,69 @@ class ResultPanel(QWidget):
                     px=14, color="accent", weight=600, wrap=True))
             else:
                 lay.addWidget(_ctext(
-                    "결과물 추가 — 지금 검토 결과를 그대로 써서 다른 형태로 한 번 더 만듭니다"
-                    " (검토 다시 하지 않음)",
+                    "결과물 추가 — 다른 형태의 결과물이 필요하면 선택하세요.",
                     px=13, color="text_sub", weight=500, wrap=True))
             btn_row = QHBoxLayout()
-            btn_row.setSpacing(8)
+            btn_row.setSpacing(10)
             for m in remaining:
-                icon, name, _file, desc, _tag = self._OUT_META[m]
-                b = IconButton(icon, text=name, variant="ghost",
-                               role="text_sub", size=15, tooltip=desc,
-                               on_click=lambda *_a, mm=m:
-                                   self.extra_output_requested.emit(mm))
-                b.setEnabled(not self._extra_busy)
-                btn_row.addWidget(b)
+                btn_row.addWidget(self._extra_add_button(m))
             btn_row.addStretch()
             wrap = _twidget()
             wrap.setLayout(btn_row)
             lay.addWidget(wrap)
         return frame
+
+    # 아이콘 22px + 이름 한 줄('Excel (정오표)')이 접히지 않는 크기.
+    #   ⚠ 높이는 **반드시 QSS(min-height)로** 준다. 스타일시트를 입은 위젯은 Qt가
+    #     스타일시트 박스모델로 최소 크기를 다시 계산해, 전역 QSS의
+    #     `QPushButton{min-height:18px}`가 `setMinimumHeight()`를 이긴다 —
+    #     46px로 지정한 버튼이 24px로 찌그러져 아이콘이 버튼을 꽉 채웠다(실측).
+    _ADD_BTN_H = 46
+    _ADD_BTN_W = 158
+
+    def _extra_add_button(self, mode: str) -> QPushButton:
+        """'결과물 추가' 버튼 한 개 — 파일 형식 원색 아이콘 + 설정 화면과 같은 이름.
+
+        ⚠ 전역 QSS의 `QPushButton[variant=…]` 대신 objectName으로 스코프한
+          per-instance 스타일시트를 쓴다 — 바로 위에 놓인 산출물 줄(`outInset`)과
+          같은 인셋 표면이어야 '이미 있는 것'과 '더 만들 것'이 한 벌로 읽힌다.
+          결과 패널은 테마 전환 때 통째로 다시 렌더되므로 색이 굳지 않는다.
+        ⚠ 아이콘은 원색 SVG라 색 인자가 무시된다(`_OUT_META` 주석) — 그래서 여기서
+          role/색을 고르지 않는다.
+        """
+        pal = current_palette()
+        dark = current_mode() == "dark"
+        icon, name, _file, desc, _tag = self._OUT_META[mode]
+
+        b = QPushButton("  " + name)
+        b.setObjectName("outAddBtn")
+        b.setCursor(Qt.PointingHandCursor)
+        b.setToolTip(desc)
+        b.setIcon(make_icon(icon, pal["text"], 22))
+        b.setIconSize(icon_size(22))
+        b.setMinimumWidth(self._ADD_BTN_W)
+        b.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+
+        bg   = _rgba("#FFFFFF", 0.05) if dark else _rgba("#FFFFFF", 0.72)
+        bd   = _rgba("#FFFFFF", 0.12) if dark else _rgba("#0F172A", 0.10)
+        hov  = _rgba("#FFFFFF", 0.11) if dark else _rgba("#FFFFFF", 0.98)
+        prs  = _rgba("#FFFFFF", 0.07) if dark else _rgba("#0F172A", 0.06)
+        hbd  = _rgba(pal["accent"], 0.55)
+        b.setStyleSheet(
+            f"QPushButton#outAddBtn {{ background:{bg}; color:{pal['text']}; "
+            f"border:1px solid {bd}; border-radius:14px; padding:0 18px 0 14px; "
+            f"min-height:{self._ADD_BTN_H}px; "
+            "font-size:14px; font-weight:700; text-align:left; }"
+            f"QPushButton#outAddBtn:hover {{ background:{hov}; border-color:{hbd}; }}"
+            f"QPushButton#outAddBtn:pressed {{ background:{prs}; }}"
+            f"QPushButton#outAddBtn:disabled {{ color:{pal['text_dim']}; "
+            f"background:{bg}; border-color:{bd}; }}")
+        b.setEnabled(not self._extra_busy)
+        # ⚠ `clicked`는 checked(bool)를 넘긴다 — `lambda mm=mode:`로 쓰면 mm이 True로
+        #   덮인다(위 폴더 열기 버튼과 같은 함정).
+        b.clicked.connect(lambda *_a, mm=mode:
+                          self.extra_output_requested.emit(mm))
+        return b
 
     # ── 헤더 ─────────────────────────────────────
     def _build_header(self, review_mode, flagged,
@@ -1761,16 +1809,16 @@ class ResultPanel(QWidget):
         f = self._glass(tint, shine_delay)
         f.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         v = QVBoxLayout(f)
-        v.setContentsMargins(28, 24, 28, 24)
-        v.setSpacing(5)
+        v.setContentsMargins(28, 20, 28, 20)
+        v.setSpacing(4)
         # ⚠ text_dim은 불투명 표면 전제 토큰이라 반투명 글래스 카드(책 배경이
         #   비치는 가변 명도) 위에서는 거의 사라진다(사용자 보고) — 부제와 같은
         #   text_sub로 올려 카드 어디서나 읽히게 한다.
         num_lbl = _ctext(num, px=13, color="text_sub", weight=700, ls=1.5)
         v.addWidget(num_lbl)
-        v.addWidget(_ctext(title, px=20, color="text", weight=800))
-        v.addWidget(_ctext(sub, px=15, color="text_sub", weight=500))
-        v.addSpacing(16)
+        v.addWidget(_ctext(title, px=18, color="text", weight=800))
+        v.addWidget(_ctext(sub, px=14, color="text_sub", weight=500))
+        v.addSpacing(4)
         return f, v
 
     def _unit_row(self, num_widget, unit: str, *, unit_px: int = 17) -> QHBoxLayout:
@@ -1780,7 +1828,7 @@ class ResultPanel(QWidget):
         두 폰트의 descent 차이를 계산해 단위 라벨에 그만큼 아래 여백을 더하면
         두 베이스라인이 픽셀 단위로 일치한다."""
         h = QHBoxLayout()
-        h.setSpacing(5)
+        h.setSpacing(4)
         h.addWidget(num_widget)
 
         big_font = QFont(num_widget.font())
@@ -1806,10 +1854,10 @@ class ResultPanel(QWidget):
 
     def _card_meta(self, v_layout, text: str):
         """카드 하단 메타 설명 — 구분선 아래 표기(3카드 공통 패턴)."""
-        v_layout.addSpacing(10)
+        v_layout.addSpacing(6)
         v_layout.addWidget(_hline())
-        v_layout.addSpacing(8)
-        v_layout.addWidget(_ctext(text, px=15, color="text_sub", weight=500, wrap=True))
+        v_layout.addSpacing(6)
+        v_layout.addWidget(_ctext(text, px=14, color="text_sub", weight=500, wrap=True))
 
     def _connector(self, delay: int) -> QWidget:
         """진행 표시(미니멀 쉐브런) — 자체 페이드인(start)이 등장 효과라 _rise로
@@ -1833,7 +1881,7 @@ class ResultPanel(QWidget):
                                   shine_delay=self._T_CARD1 + 520)
         if self._page_count:
             v1.addLayout(self._unit_row(
-                self._num(self._page_count, px=58, delay=self._T_CARD1 + 330,
+                self._num(self._page_count, px=50, delay=self._T_CARD1 + 330,
                           duration=1500), "페이지", unit_px=18))
             if self._char_count is not None:
                 self._card_meta(v1, f"추출 글자 : {self._char_count:,}자")
@@ -1852,7 +1900,7 @@ class ResultPanel(QWidget):
         f2, v2 = self._stage_card("02", "교정 제안", "표준국어대사전 + AI 교정",
                                   shine_delay=self._T_CARD2 + 520)
         v2.addLayout(self._unit_row(
-            self._num(n_prop, px=58, delay=self._T_CARD2 + 330,
+            self._num(n_prop, px=50, delay=self._T_CARD2 + 330,
                       duration=1500), "건", unit_px=18))
         if self._corrections is not None:
             self._card_meta(v2, f"사전 : {n_rule:,}건  |  AI : {n_ai:,}건")
@@ -1869,7 +1917,7 @@ class ResultPanel(QWidget):
             f3, v3 = self._stage_card("03", title, sub,
                                       tint="accent", shine_delay=self._T_CARD3 + 560)
             v3.addLayout(self._unit_row(
-                self._num(to_apply, px=58, color=pal["accent"],
+                self._num(to_apply, px=50, color=pal["accent"],
                           delay=self._T_CARD3 + 380, duration=1700), "건", unit_px=18))
             meta = f"{to_apply_occ:,}곳 반영 필요"
             # 표시한 자리 수 — 메모·주석은 '몇 곳에 실제로 달렸는지'가 산출물의 알맹이다.
@@ -1889,13 +1937,13 @@ class ResultPanel(QWidget):
             f3, v3 = self._stage_card("03", "검수", "정오표 기록 · HWP 미수정",
                                       tint="accent", shine_delay=self._T_CARD3 + 560)
             v3.addLayout(self._unit_row(
-                self._num(flagged, px=58, color=pal["accent"],
+                self._num(flagged, px=50, color=pal["accent"],
                           delay=self._T_CARD3 + 380, duration=1700), "건", unit_px=18))
         else:
             f3, v3 = self._stage_card("03", "적용", "최종 교정 반영",
                                       tint="accent", shine_delay=self._T_CARD3 + 560)
             v3.addLayout(self._unit_row(
-                self._num(applied, px=58, color=_success_color(),
+                self._num(applied, px=50, color=_success_color(),
                           delay=self._T_CARD3 + 380, duration=1700), "건", unit_px=18))
             meta = f"{occ:,}항목 치환 성공"
             extra = []
@@ -1924,16 +1972,16 @@ class ResultPanel(QWidget):
         frame = self._glass("default", shine_delay)
         frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         lay = QVBoxLayout(frame)
-        lay.setContentsMargins(28, 24, 28, 24)
+        lay.setContentsMargins(28, 20, 28, 20)
         lay.setSpacing(13)
         hdr = QHBoxLayout()
         hdr.setSpacing(9)
         if icon:
             hdr.addWidget(IconLabel(icon, role=icon_role, size=18))
         if hero_title:
-            hdr.addWidget(_ctext(title, px=20, color="text", weight=800))
+            hdr.addWidget(_ctext(title, px=18, color="text", weight=800))
         else:
-            hdr.addWidget(_ctext(title, px=16, color="text", weight=700))
+            hdr.addWidget(_ctext(title, px=15, color="text", weight=700))
         hdr.addStretch()
         lay.addLayout(hdr)
         return frame, lay

@@ -299,8 +299,6 @@ class MainWindow(QMainWindow):
         self.footer.primary_clicked.connect(self._on_primary)
         self.footer.cancel_clicked.connect(self._on_cancel)
         self.footer.reset_clicked.connect(self._reset)
-        self.footer.errata_clicked.connect(self._on_footer_errata_clicked)
-        self.footer.folder_clicked.connect(self._on_footer_folder_clicked)
         self.footer.recheck_clicked.connect(self._enter_consistency)
 
     def _toggle_maximize(self):
@@ -338,11 +336,12 @@ class MainWindow(QMainWindow):
         elif phase == "result":
             self.rail.complete_all()
             self.footer.set_idle("교정 완료")
+            # ⚠ 완료 단계 푸터에 남는 액션은 **초기화 하나뿐**이다(사용자 지시
+            #   2026-08-11). 산출물을 열고·더 만드는 일은 결과 화면의 '산출물'
+            #   카드가 전담한다 — 같은 행동을 푸터에 한 벌 더 두면 '정오표 열기'가
+            #   어느 정오표(1차/메모/PDF)를 여는지 말할 수 없다.
             self.footer.set_primary("수정된 HWP 열기",
                                     variant="primary", enabled=False, visible=False, show_reset=True)
-            errata_path = self._result.get("errata_path", "")
-            has_errata = bool(errata_path) and os.path.exists(errata_path)
-            self.footer.set_result_actions(True, has_errata=has_errata)
 
     def _refresh_setup_footer(self):
         if self._phase != "setup":
@@ -1029,7 +1028,8 @@ class MainWindow(QMainWindow):
         extras.append(entry)
         self._result["extra_outputs"] = extras
         # 1차 실행에 정오표가 아예 없었다면(교정본 모드 + 정오표 끄기) 이번 것이
-        #   그 자리를 채운다 — 푸터의 '정오표 열기'가 가리킬 곳이 생긴다.
+        #   그 자리를 채운다 — 산출물 카드가 '정오표는 이미 있다'고 셀 근거가 생긴다
+        #   (`ResultPanel._produced_modes`).
         #   ⚠ 다만 **누가 만든 것인지**를 함께 남긴다. 안 남기면 산출물 목록이 그것을
         #     1차 정오표인 양 '정오표'로만 적고 1차 실행의 행 수까지 붙여, 사용자가
         #     '이 모드의 정오표는 안 만들어졌다'고 읽는다(2026-08-10 사용자 보고).
@@ -1069,22 +1069,6 @@ class MainWindow(QMainWindow):
         self.result_panel.update_result(self._result)
         self._show_phase("result")
 
-    def _on_footer_errata_clicked(self):
-        errata_path = self._result.get("errata_path", "")
-        if errata_path and os.path.exists(errata_path):
-            self._open_path_folder(errata_path)
-        else:
-            self._on_generate_errata_requested()
-
-    def _on_footer_folder_clicked(self):
-        # 결과물이 무엇이든 '그 파일이 있는 폴더'를 연다 — '정오표만'에는 한글 산출물이
-        #   없고, PDF 주석 모드에는 한글 산출물 대신 PDF가 있다. 버튼 문구가 '폴더 열기'라
-        #   어느 쪽이든 어긋나지 않는다.
-        path = (self._result.get("hwp_path", "")
-                or self._result.get("pdf_path", "")
-                or self._result.get("errata_path", ""))
-        self._open_path_folder(path)
-
     def _open_path_folder(self, path: str):
         if not path or not os.path.exists(path):
             QMessageBox.warning(self, "파일 없음", "해당 파일이나 폴더를 찾을 수 없습니다.")
@@ -1094,51 +1078,12 @@ class MainWindow(QMainWindow):
             folder = path
         QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
-    def _on_generate_errata_requested(self):
-        try:
-            from output.errata_generator import generate_errata
-            mode = "polish" if self._options.get("scope_polish") else "typo"
-            # ApplyWorker가 동봉한, 실제 적용 결과와 **쪽 번호**가 병합된 등장 단위 행을
-            #   그대로 재사용한다 — 수동 정오표도 같은 진실을 기록한다.
-            rows = self._result.get("errata_rows")
-            if not rows:
-                # 폴백(적용 결과 데이터 부재) — 결정만으로 구성한다. 쪽 번호는 문서를
-                #   다시 열어야 알 수 있으므로 비운다('—'로 표시될 뿐 행은 남는다).
-                rows = [
-                    {
-                        "page":      None,
-                        "original":  c["original"],
-                        "corrected": c["corrected"],
-                        "reason":    c.get("reason", ""),
-                        "category":  c.get("category", ""),
-                        "source":    c.get("source", "dict"),
-                        "color":     c.get("color", 0),
-                        "outcome":   ("applied" if c.get("status") == "accepted"
-                                      else "rejected"),
-                        "note":      "",
-                    }
-                    for c in self._corrections
-                ]
-            errata_path = generate_errata(
-                rows     = rows,
-                hwp_path = self._file_path,
-                options  = {
-                    "used_ai":         self._options.get("use_ai", True),
-                    "mode":            mode,
-                    "used_dict":       True,
-                    "deep_screening":  self._options.get("deep_screening", False),
-                },
-            )
-            self._result["errata_path"] = errata_path
-            self.activity.log(f"✓ 정오표 수동 생성 완료: {os.path.basename(errata_path)}")
-            # ⚠ show_result가 아니라 update_result — 정오표 한 줄이 늘었을 뿐인데
-            #   대시보드 전체가 카운트업·차트 애니메이션을 다시 재생하면 '새 실행'처럼
-            #   보인다(결과 dict가 같아 완료 시각은 유지되지만 모션은 다시 돈다).
-            self.result_panel.update_result(self._result)
-            self.footer.set_result_actions(True, has_errata=True)
-            self._open_path_folder(errata_path)
-        except Exception as exc:
-            QMessageBox.critical(self, "정오표 생성 오류", f"정오표를 생성하지 못했습니다:\n{exc}")
+    # ⚠ 예전의 '정오표 수동 생성'(`_on_generate_errata_requested`)은 푸터의 '정오표
+    #   생성' 버튼과 함께 제거됐다(2026-08-11). 1차 실행이 정오표를 만들지 않았어도
+    #   결과 화면 '산출물' 카드의 **결과물 추가**가 같은 일을 더 정확하게 한다 —
+    #   ApplyWorker를 `output_mode="errata"`로 다시 태우므로 쪽 번호·적용 결과가
+    #   실제 실행에서 나오고(수동 경로는 데이터가 없으면 쪽을 비웠다), 파일 이름도
+    #   `_정오표(정오표만).xlsx`로 출처를 밝힌다(`_extra_errata_path` 주석 참조).
 
     # ══════════════════════════════════════════════
     # 오류 / 취소 / 리셋

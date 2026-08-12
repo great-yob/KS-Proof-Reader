@@ -45,6 +45,22 @@ AUTO_APPLY_ENABLED = False
 POLISH_ENABLED = False
 
 
+# ══════════════════════════════════════════════════════════════
+# 여백 스케일 — 설정 화면 전체 높이를 한 곳에서 통제한다(사용자 지시 2026-08-11:
+#   "카드 내부 여백을 살짝 줄여 전체 높이를 살짝 줄일 것").
+#   ⚠ 값을 각 빌더에 흩어 놓으면 한 섹션만 줄어들어 리듬이 깨진다 — 선택 카드·토글
+#     행·섹션 간격이 **같은 비율로** 움직여야 화면이 균일하게 조여진다.
+#   ⚠ 세로만 줄인다. 가로 여백(22)은 카드 최소폭·글자 접힘과 얽혀 있어(memory
+#     `setup-panel-equal-grid-qt-traps`) 건드리면 좁은 창에서 제목이 접히거나
+#     가로 스크롤이 생긴다.
+_CARD_PAD_H  = 22      # 카드 좌우 여백(불변)
+_CARD_PAD_V  = 12      # 선택 카드 상하 여백(16 → 12)
+_ROW_PAD_V   = 10      # 토글 행 상하 여백(14 → 10)
+_SEC_GAP     = 12      # 섹션 제목 ↔ 카드 줄 간격(16 → 12)
+_SEC_SPACING = 24      # 섹션과 섹션 사이(30 → 24)
+_MAIN_PAD_V  = 18      # 바깥 카드 상하 여백(21 → 18)
+
+
 def _wrap_card_policy() -> QSizePolicy:
     """줄바꿈(wrap) 라벨을 품은 카드용 size policy.
 
@@ -80,6 +96,10 @@ class FilePanel(QFrame):
         root.setContentsMargins(0, 0, 0, 0)
         
         frame, lay = section_card("문서 선택", "file-text")
+        # 오른쪽 설정 카드와 **같은 세로 여백**으로 맞춘다 — 좌우 1:1 그리드라 두 카드의
+        #   안쪽 여백이 다르면 제목 줄의 높이가 어긋나 보인다(section_card 기본값은
+        #   다른 패널도 쓰므로 여기서만 덮어쓴다).
+        lay.setContentsMargins(27, _MAIN_PAD_V, 27, _MAIN_PAD_V)
 
         # 드롭존
         self._dropzone = QFrame()
@@ -267,8 +287,8 @@ class SetupPanel(QWidget):
         from ui.widgets.components import card
         main_card = card("section")
         main_lay = QVBoxLayout(main_card)
-        main_lay.setContentsMargins(27, 21, 27, 21)
-        main_lay.setSpacing(30)
+        main_lay.setContentsMargins(27, _MAIN_PAD_V, 27, _MAIN_PAD_V)
+        main_lay.setSpacing(_SEC_SPACING)
 
         # 네 섹션 모두 **가로 2단**이라 세로로는 내용만큼만 차지하면 된다.
         #   ⚠ 여기에 stretch를 주면 남는 세로 공간이 카드 안으로 배분돼 제목과 설명
@@ -284,7 +304,7 @@ class SetupPanel(QWidget):
     def _build_apply_mode_section(self) -> QVBoxLayout:
         lay = QVBoxLayout()
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(16)
+        lay.setSpacing(_SEC_GAP)
 
         hdr = QHBoxLayout()
         hdr.setSpacing(8)
@@ -346,7 +366,7 @@ class SetupPanel(QWidget):
         card.setSizePolicy(_wrap_card_policy())
 
         cl = QVBoxLayout(card)
-        cl.setContentsMargins(22, 16, 22, 16)
+        cl.setContentsMargins(_CARD_PAD_H, _CARD_PAD_V, _CARD_PAD_H, _CARD_PAD_V)
         cl.setSpacing(6)
 
         # 아이콘 + 제목 (+ 잠금 칩) 한 줄.
@@ -385,18 +405,24 @@ class SetupPanel(QWidget):
     # ── 결과물 ─────────────────────────────────
     #   카드 정의를 한곳에 모아 둔다 — 카드·선택·요약·옵션이 같은 목록을 보게 해서
     #   값을 하나 더 늘릴 때 고칠 자리가 하나로 유지되게 하는 것이 목적.
+    #   ⚠ 아이콘은 결과 화면의 '결과물 추가' 버튼(`ResultPanel._OUT_META`)과 **같은
+    #     원색 파일형식 아이콘**을 쓴다 — 같은 선택지를 두 화면이 다른 그림으로 부르면
+    #     사용자는 다른 기능이라고 읽는다(이름을 맞추는 것과 같은 이유).
+    #     이 SVG들엔 `currentColor`가 없어 `_make_choice_card`가 넘기는 role 색이
+    #     no-op이다 — 잠금(locked) 카드에서도 흐려지지 않으므로, 잠글 값이 생기면
+    #     선 아이콘으로 되돌리거나 다른 잠금 표시를 쓸 것.
     _OUTPUT_CARDS = (
         # (mode, icon, 제목, 설명, 요약 문구)
-        ("hwp",    "clipboard-check", "HWP (빨간색)",
+        ("hwp",    "hwp",   "HWP (빨간색)",
          "한글 원고에 교정안을 반영하고\n해당 자리를 빨간색으로 표시합니다.",
          "HWP (빨간색)"),
-        ("memo",   "file-text",       "HWP (메모)",
+        ("memo",   "memo",  "HWP (메모)",
          "한글 원고에 교정안을 반영하지 않고\n해당 자리에 메모로 교정안을 표시합니다.",
          "HWP (메모)"),
-        ("pdf",    "file-down",       "PDF (주석)",
+        ("pdf",    "pdf",   "PDF (주석)",
          "한글 원고를 PDF로 변환한 뒤\n형광펜과 주석으로 교정안을 표시합니다.",
          "PDF (주석)"),
-        ("errata", "table",           "Excel (정오표)",
+        ("errata", "excel", "Excel (정오표)",
          "한글 원고에 교정안을 반영하지 않고\n교정안과 해당 페이지만 기록합니다.",
          "Excel (정오표)"),
     )
@@ -412,7 +438,7 @@ class SetupPanel(QWidget):
         """
         lay = QVBoxLayout()
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(16)
+        lay.setSpacing(_SEC_GAP)
 
         hdr = QHBoxLayout()
         hdr.setSpacing(8)
@@ -485,7 +511,7 @@ class SetupPanel(QWidget):
         """
         lay = QVBoxLayout()
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(16)
+        lay.setSpacing(_SEC_GAP)
 
         hdr = QHBoxLayout()
         hdr.setSpacing(8)
@@ -541,7 +567,7 @@ class SetupPanel(QWidget):
     def _build_extra_section(self) -> QVBoxLayout:
         lay = QVBoxLayout()
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(16)
+        lay.setSpacing(_SEC_GAP)
 
         hdr = QHBoxLayout()
         hdr.setSpacing(8)
@@ -573,7 +599,7 @@ class SetupPanel(QWidget):
         row.setProperty("locked", "true" if locked else "false")
         row.setSizePolicy(_wrap_card_policy())
         rl = QHBoxLayout(row)
-        rl.setContentsMargins(22, 14, 22, 14)
+        rl.setContentsMargins(_CARD_PAD_H, _ROW_PAD_V, _CARD_PAD_H, _ROW_PAD_V)
         rl.setSpacing(10)
         # ⚠ 세로 가운데 정렬은 **토글에만** 준다(아래 addWidget). 레이아웃 전체에
         #   AlignVCenter를 걸면 글자 칸(col)까지 sizeHint 높이로 고정돼, 접힌 제목·설명이
