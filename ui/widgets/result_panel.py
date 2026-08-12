@@ -50,7 +50,7 @@ from PySide6.QtCore import (
 
 from ui.widgets.components import IconLabel, IconButton
 from ui.styles.icons import make_icon, icon_size
-from ui.styles.theme import current_palette, current_mode
+from ui.styles.theme import current_palette, current_mode, local_qss
 
 
 # 오류 유형 폴백 라벨(검수 카드와 동일 언어 — review_panel._SOURCE_LABEL과 맞춤)
@@ -130,9 +130,13 @@ def _ctext(text: str, *, px: int = 14, color: str = "text_sub", weight: int = 50
 def _twidget() -> QWidget:
     """투명 컨테이너 — plain QWidget은 전역 QSS `QWidget{background:$bg}`를
     불투명하게 그려 메시 배경을 가리므로, 선언 전용 스타일시트(하위 트리
-    범용 적용)로 투명화한다."""
+    범용 적용)로 투명화한다.
+
+    ⚠ 그 '하위 트리'에는 **툴팁도 들어간다** — `local_qss` 없이 두면 이 컨테이너
+      아래 버튼의 툴팁이 투명해져 새까맣게 뜬다(실측 2026-08-12: #000000).
+    """
     w = QWidget()
-    w.setStyleSheet("background: transparent;")
+    w.setStyleSheet(local_qss("background: transparent;"))
     return w
 
 
@@ -460,7 +464,8 @@ class _Riser(QWidget):
     def __init__(self, child: QWidget, dist: int = 26, duration: int = 680,
                  parent=None):
         super().__init__(parent)
-        self.setStyleSheet("background: transparent;")   # 전역 QSS $bg 차단
+        # 전역 QSS $bg 차단. `local_qss` — 이 선언은 하위 트리(툴팁 포함)에 걸린다.
+        self.setStyleSheet(local_qss("background: transparent;"))
         self._lay = QVBoxLayout(self)
         self._lay.setContentsMargins(0, 0, 0, 0)
         self._lay.setSpacing(0)
@@ -1554,7 +1559,11 @@ class ResultPanel(QWidget):
     #   ⚠ 이름은 설정 화면(`setup_panel._OUTPUT_CARDS`)과 **같은 말**을 쓴다 — 같은
     #     선택지를 두 화면이 다르게 부르면 사용자는 다른 기능이라고 읽는다.
     #   ⚠ 짧은 꼬리표는 `main_window._extra_errata_path`가 붙이는 파일명 괄호와 **같은
-    #     말**이어야 한다 — 화면에는 '정오표 (메모)', 파일은 `…_정오표(메모).xlsx`.
+    #     말**이어야 한다 — 화면도 파일도 `정오표(메모)`로, 괄호 앞 공백 없이 똑같이
+    #     적는다(사용자 지시 2026-08-12). 그래야 화면의 이름으로 파일을 바로 찾는다.
+    #   ⚠ 산출물 이름(`[2]`)에 형식을 되풀이하지 않는다 — 바로 앞에 원색 형식 아이콘이
+    #     붙으므로 'PDF 주석본'은 PDF를 두 번 말한다('메모본'이 'HWP 메모본'이 아닌 것과
+    #     같은 이유). 선택 카드 이름(`[1]`)은 설정 화면과 짝이라 그대로 둔다.
     #   ⚠ 아이콘은 파일 형식을 그대로 그린 **원색 아이콘**이다(hwp/memo/pdf/excel.svg).
     #     Lucide 선 아이콘과 달리 `currentColor`가 없어 `icons.pixmap`의 색 치환이
     #     no-op이고, 그래서 라이트·다크 어디서나 제 색으로 그려진다 — 의도한 동작이다
@@ -1564,7 +1573,7 @@ class ResultPanel(QWidget):
                    "원고에 반영 + 빨간색 표시", "교정본"),
         "memo":   ("memo",  "HWP (메모)",    "메모본",
                    "원고에 미반영 + 메모로 표시", "메모"),
-        "pdf":    ("pdf",   "PDF (주석)",    "PDF 주석본",
+        "pdf":    ("pdf",   "PDF (주석)",    "주석본",
                    "PDF 변환 + 형광펜 · 주석", "PDF"),
         "errata": ("excel", "Excel (정오표)", "정오표",
                    "페이지 + 수정 전 · 후 기록", "정오표만"),
@@ -1626,7 +1635,7 @@ class ResultPanel(QWidget):
         ★**추가 실행 한 번 = 목록 한 줄**이다(사용자 지시 2026-08-12). 추가 산출물은
           정오표가 항상 함께 나오므로(`main_window._start_extra_output`이 `gen_errata`를
           켠다) 둘을 따로 적으면 한 번 누른 결과가 두 줄로 불어나, 무엇이 무엇에 딸린
-          것인지 흐려진다 — '메모본 + 정오표 (메모)' 한 줄로 묶는다.
+          것인지 흐려진다 — '🗒️ 메모본 + 📗 정오표(메모)' 한 줄로 묶는다.
         ⚠ 1차 실행은 묶지 않는다. 그쪽 정오표는 **끌 수 있는 별개 산출물**이고
           (부가 기능 토글), 없을 수도 있기 때문이다.
         """
@@ -1656,16 +1665,18 @@ class ResultPanel(QWidget):
             err_path = e.get("errata_path", "")
             err_sum = self._mode_summary("errata", e)
             if e.get("path"):
-                title, icons, summary = name, [m], self._mode_summary(m, e)
+                parts, summary = [(m, name)], self._mode_summary(m, e)
                 if err_path:
-                    # 한 줄로 합치기 — 아이콘도 둘, 요약도 둘(각 파일이 제 수치를 말한다).
+                    # 한 줄로 합치기 — 요약도 둘(각 파일이 제 수치를 말한다).
                     #   ⚠ 정오표 쪽 수치엔 이름을 붙인다 — 그냥 '68행'만 이어 붙이면
                     #     앞의 메모 수치와 한 덩어리로 읽혀 무엇의 68행인지 흐려진다.
-                    title = f"{name} + 정오표 ({tag})"
-                    icons = [m, "errata"]
+                    # ★아이콘은 **자기 이름 앞에** 하나씩 붙인다(사용자 지시 2026-08-12).
+                    #   둘을 줄 앞에 모아 두면 '🗒️📗 메모본 + 정오표(메모)'가 되어
+                    #   어느 아이콘이 어느 파일인지 짝지어지지 않는다.
+                    parts = [(m, name), ("errata", f"정오표({tag})")]
                     summary = " · ".join(
                         x for x in (summary, f"정오표 {err_sum}" if err_sum else "") if x)
-                rows.append(self._row(m, title, e["path"], summary, icons=icons))
+                rows.append(self._row(m, name, e["path"], summary, parts=parts))
             elif err_path:
                 # '정오표만' 추가 실행 — 산출물이 정오표 하나뿐이라 꼬리표를 붙이지
                 #   않는다(1차가 정오표를 냈다면 이 모드는 애초에 제안되지 않는다).
@@ -1674,9 +1685,10 @@ class ResultPanel(QWidget):
         return rows
 
     @staticmethod
-    def _row(mode: str, title: str, path: str, summary: str, icons=None) -> dict:
+    def _row(mode: str, title: str, path: str, summary: str, parts=None) -> dict:
+        """산출물 한 줄. `parts`는 **[(아이콘, 이름), …]** — 합쳐진 줄은 둘이다."""
         return {"mode": mode, "title": title, "path": path,
-                "summary": summary, "icons": icons or [mode]}
+                "summary": summary, "parts": parts or [(mode, title)]}
 
     def _artifact_row_widget(self, row: dict) -> QWidget:
         """산출물 한 줄 — [형식 아이콘] 산출물명 / 서브 내용 · 우측 '폴더 열기'.
@@ -1684,11 +1696,14 @@ class ResultPanel(QWidget):
         ⚠ 파일명은 적지 않는다(사용자 지시 2026-08-12). 산출물명이 이미 무엇인지
           말하고, 파일 이름은 폴더를 열면 보인다 — 좁은 왼쪽 칸에서 긴 파일명이
           두 줄로 접혀 줄 높이만 들쭉날쭉하게 만들었다.
-        ⚠ 합쳐진 줄(메모본 + 정오표)은 아이콘이 둘이고 파일도 둘이지만 **폴더 열기는
-          하나**다 — 두 파일이 원본과 같은 폴더에 나란히 놓이므로 여는 곳이 같다.
+        ★합쳐진 줄은 **아이콘을 각자 자기 이름 앞에** 놓는다(사용자 지시 2026-08-12):
+          `🗒️ 메모본 + 📗 정오표(메모)`. 아이콘을 줄 앞에 모으면 둘 중 어느 것이
+          어느 파일인지 짝이 지어지지 않는다.
+        ⚠ 합쳐진 줄은 파일이 둘이지만 **폴더 열기는 하나**다 — 두 파일이 원본과 같은
+          폴더에 나란히 놓이므로 여는 곳이 같다.
         """
-        label, path, summary = row["title"], row["path"], row["summary"]
-        icon_names = row.get("icons") or []
+        path, summary = row["path"], row["summary"]
+        parts = row.get("parts") or [(row["mode"], row["title"])]
         dark = current_mode() == "dark"
         item = QFrame()
         item.setObjectName("outInset")
@@ -1711,18 +1726,24 @@ class ResultPanel(QWidget):
         head.setContentsMargins(0, 0, 0, 0)
         head.setSpacing(8)
         # 설정·완료 화면과 같은 원색 형식 아이콘(`_OUT_META` 주석) — 무엇이 나왔는지를
-        #   글자보다 먼저 말한다. 합쳐진 줄은 파일 수만큼(모드 + 정오표).
-        icons = QHBoxLayout()
-        icons.setContentsMargins(0, 0, 0, 0)
-        icons.setSpacing(3)
-        for name in icon_names:
-            meta = self._OUT_META.get(name)
+        #   글자보다 먼저 말한다. 아이콘은 **자기 이름 바로 앞**에 붙는다.
+        #   ⚠ 아이콘↔이름 간격(4)은 부분↔부분 간격(head 8)보다 좁아야 짝이 보인다.
+        for i, (icon_name, text) in enumerate(parts):
+            if i:
+                head.addWidget(_ctext("+", px=14, color="text_muted", weight=700),
+                               0, Qt.AlignVCenter)
+            meta = self._OUT_META.get(icon_name)
             if meta:
-                icons.addWidget(IconLabel(meta[0], size=19), 0, Qt.AlignVCenter)
-        if icons.count():
-            head.addLayout(icons)
-        name = _ctext(label, px=14, color="text", weight=700)
-        head.addWidget(name, 0, Qt.AlignVCenter)
+                pair = QHBoxLayout()
+                pair.setContentsMargins(0, 0, 0, 0)
+                pair.setSpacing(4)
+                pair.addWidget(IconLabel(meta[0], size=19), 0, Qt.AlignVCenter)
+                pair.addWidget(_ctext(text, px=14, color="text", weight=700),
+                               0, Qt.AlignVCenter)
+                head.addLayout(pair)
+            else:
+                head.addWidget(_ctext(text, px=14, color="text", weight=700),
+                               0, Qt.AlignVCenter)
         head.addStretch()
         col.addLayout(head)
         if summary:

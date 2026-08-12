@@ -965,7 +965,7 @@ class MainWindow(QMainWindow):
         #   (실측: '… 재사용 (교정 412건)' → '건'이 사라진 채 표시됨).
         self.activity.log(f"[추가] {label} 생성 시작 · 교정 {len(self._corrections)}건 "
                           f"재사용 · 검토 생략")
-        self.result_panel.set_extra_busy(mode, f"{label} 만드는 중… "
+        self.result_panel.set_extra_busy(mode, f"{label} 만드는 중… \n"
                                                f"진행률은 아래 상태바에 표시됩니다")
         self.footer.set_busy(f"{label} 생성 중…", "생성 중")
 

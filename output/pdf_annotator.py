@@ -30,6 +30,7 @@ output/pdf_annotator.py — 한/글이 만든 PDF에 교정 주석 달기
 
 import os
 import re
+import time
 
 # 라이브러리는 **호출 시점에** 들여온다 — 미설치 환경에서도 앱이 뜨고, PDF 모드만
 #   '사용 불가'로 degrade 되게 하기 위함(core/의 graceful 관용구와 같다).
@@ -332,6 +333,8 @@ def annotate(pdf_path: str, items: list, out_path: str = None,
     # ── 2) 주석 쓰기 ──────────────────────────────────────────────
     writer = pypdf.PdfWriter(clone_from=pdf_path)
     n_annot = 0
+    # 한 번 만든 문자열을 모든 주석이 나눠 쓴다 — 한 번의 실행은 한 시각이다.
+    now = _pdf_date()
     # 어느 **등장 인덱스**에 실제로 주석이 붙었는가 — 정오표가 '주석 못 단 자리'를
     #   적을 수 있게 돌려준다(교정본의 '부분 반영' 안전망과 같은 역할).
     marked_occ = {}
@@ -351,6 +354,9 @@ def annotate(pdf_path: str, items: list, out_path: str = None,
                 )
                 hl[NameObject("/Contents")] = TextStringObject(body)
                 hl[NameObject("/T")] = TextStringObject(_ANNOT_AUTHOR)
+                # ★날짜를 넣지 않으면 뷰어가 그 칸에 '미정값'을 적는다(위 §주석 날짜).
+                hl[NameObject("/M")] = TextStringObject(now)
+                hl[NameObject("/CreationDate")] = TextStringObject(now)
                 writer.add_annotation(page_number=m.page, annotation=hl)
                 marked_occ.setdefault(needle, []).append(k)
                 n_annot += 1
@@ -384,6 +390,22 @@ def annotate(pdf_path: str, items: list, out_path: str = None,
 _HL_COLOR = "ffd400"
 # 주석 작성자(`/T`) — 뷰어의 주석 목록에 이 이름으로 묶여 원고 저자의 주석과 구분된다.
 _ANNOT_AUTHOR = "KS-AI Editor"
+
+
+# ── ★주석 날짜(`/M`) ──────────────────────────────────────────────────
+#   ⚠ 날짜를 **빼면 사라지는 게 아니라 '미정값'이 찍힌다**(사용자 보고 2026-08-12:
+#   주석 목록마다 "2페이지 미정값"). 뷰어의 주석 목록은 `작성자 · 쪽 · 수정 날짜`를
+#   고정 칸으로 그리므로, 우리가 `/M`을 넣지 않으면 그 칸이 빈 채로 남고 한컴 뷰어는
+#   빈 날짜를 '미정값'이라고 적는다. 즉 **지울 수 있는 문자열이 아니라 비어 있다는
+#   표시**이고, 없애는 유일한 방법은 실제 날짜를 넣는 것이다.
+#   PDF 날짜 서식은 `D:YYYYMMDDHHmmSS+09'00'`(PDF 32000-1 §7.9.4).
+def _pdf_date(ts=None) -> str:
+    t = time.localtime(ts)
+    off = -(time.altzone if t.tm_isdst and time.daylight else time.timezone)
+    sign = "+" if off >= 0 else "-"
+    off = abs(off)
+    return (f"D:{time.strftime('%Y%m%d%H%M%S', t)}"
+            f"{sign}{off // 3600:02d}'{(off % 3600) // 60:02d}'")
 
 
 def _memo_body(item: dict, warn: str = "") -> str:

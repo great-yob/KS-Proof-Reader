@@ -76,17 +76,11 @@ LIGHT = {
     "log_err":     "#D63B3B",
 
     # ── 툴팁 — ★라이트/다크 **같은 값**(테마 무관 다크 칩) ────────────────
-    #   ⚠ 토큰을 테마별로 나누지 말 것. 툴팁은 제 창(HWND)이고, 이 환경의 Qt는
-    #     **QSS의 배경색을 무시하고 검정으로 칠한다**(실측 2026-08-12: 배경을
-    #     #FF0000으로 강제해도 칠해진 색은 검정 — 테두리·글자·padding은 QSS대로
-    #     적용됐다. Fusion 스타일·툴팁 페이드 끄기·DWM 유리 해제 모두 무효).
-    #     그래서 라이트 팔레트의 어두운 글자(#1A1D23)를 쓰면 **검정 위 검정**이
-    #     되어 읽을 수 없었다(사용자 보고).
-    #   → 배경이 사실상 검정으로 고정이므로 **글자를 밝게** 두어 두 테마에서
-    #     똑같이 읽히게 한다. 배경 토큰도 같은 어두운 톤으로 선언해, 훗날 Qt가
-    #     QSS 배경을 존중하게 되더라도 '어두운 칩 + 밝은 글자'라는 결론이
-    #     그대로 유지되게 한다(항상-라이트인 LightConfirmDialog·토스트와 같은
-    #     '테마 무관 표면' 관용구).
+    #   토큰을 테마별로 나누지 말 것 — 툴팁은 어느 화면 위에 뜰지 모르는 떠 있는
+    #   칩이라, 항상-라이트인 LightConfirmDialog·토스트와 같은 '테마 무관 표면'
+    #   관용구를 따른다(사용자도 이 통일을 앱의 기준으로 본다).
+    #   ⚠ 이 값이 실제로 칠해지려면 `local_qss()`가 함께 필요하다 — 이유는 그 함수의
+    #     주석 참조(선언 전용 인스턴스 스타일시트가 툴팁까지 캐스케이드한다).
     "tooltip_bg":     "#1B1E24",
     "tooltip_fg":     "#F2F5F9",
     "tooltip_border": "#3A424E",
@@ -177,6 +171,17 @@ def set_mode(mode: str):
 # ▌글로벌 QSS 템플릿  ($token = 팔레트 값, { } = CSS 블록)
 # ══════════════════════════════════════════════════════════════
 
+# ── 툴팁 칩 — ★전역 QSS와 **인스턴스 스타일시트** 양쪽에서 쓰는 단일 출처 ──────
+#   글자 크기·굵기: 12px/400은 시인성이 나빴다(사용자 보고 2026-08-12) →
+#   13px/500(Pretendard Medium, 번들에 포함). 여백도 함께 키운다.
+_TOOLTIP_RULE = """
+QToolTip {
+    font-family: "Pretendard"; font-size: 13px; font-weight: 500;
+    background-color: $tooltip_bg; color: $tooltip_fg; opacity: 255;
+    border: 1px solid $tooltip_border; border-radius: 6px; padding: 6px 10px;
+}
+"""
+
 _QSS_TEMPLATE = Template("""
 /* ── 전역 기본 ──────────────────────────────── */
 QWidget {
@@ -187,15 +192,11 @@ QWidget {
 }
 QMainWindow, QDialog, QStackedWidget { background-color: $bg; }
 QLabel { background: transparent; }
-/* 툴팁 — ★테마 무관 다크 칩. 토큰(tooltip_*)이 라이트·다크에서 같은 값인 이유는
-   LIGHT 팔레트의 그 항목 주석 참조(요약: 이 환경의 Qt는 툴팁 배경을 QSS와 무관하게
-   검정으로 칠한다 — 그래서 글자를 밝게 고정한다). 색은 `apply_theme`가 팔레트
-   (ToolTipBase/ToolTipText)에도 같이 심는다 — QSS가 닿지 않는 경로 대비. */
-QToolTip {
-    font-family: "Pretendard"; font-size: 12px;
-    background-color: $tooltip_bg; color: $tooltip_fg; opacity: 255;
-    border: 1px solid $tooltip_border; border-radius: 6px; padding: 5px 8px;
-}
+/* 툴팁 — ★테마 무관 다크 칩(규칙 본문은 `_TOOLTIP_RULE` 단일 출처).
+   ⚠ 이 전역 규칙만으로는 **부족하다** — 선언 전용 인스턴스 스타일시트를 가진
+   조상 아래에서는 그쪽 `background`가 툴팁까지 덮는다(`local_qss()` 주석 참조).
+   색은 `apply_theme`가 팔레트(ToolTipBase/ToolTipText)에도 같이 심는다. */
+""" + _TOOLTIP_RULE + """
 /* 팝업/대화상자 — 폰트를 Pretendard로 통일(시스템 기본 폰트 폴백 방지) */
 QMessageBox, QMessageBox QLabel, QInputDialog, QInputDialog QLabel {
     font-family: "Pretendard";
@@ -477,6 +478,36 @@ QLabel[role="stepSub"][state="error"] { color: $error; }
 def build_qss(palette: dict) -> str:
     """팔레트로 글로벌 QSS 문자열 생성."""
     return _QSS_TEMPLATE.substitute(palette)
+
+
+def tooltip_qss() -> str:
+    """툴팁 칩 규칙 한 벌 — 인스턴스 스타일시트에 덧붙일 때 쓴다."""
+    return Template(_TOOLTIP_RULE).substitute(current_palette())
+
+
+def local_qss(decls: str) -> str:
+    """★셀렉터 없는 인스턴스 스타일시트를 **툴팁 안전하게** 만든다.
+
+    `w.setStyleSheet("background: transparent;")`처럼 셀렉터 없이 선언만 준 문자열을
+    Qt는 내부에서 **`* { … }`로 감싸** 해석한다. 그 `*`는 하위 트리 전체에 걸리는데,
+    툴팁(QTipLabel)도 그 하위로 간주되므로 **조상의 배경이 툴팁 배경을 덮는다.**
+    전역 QSS의 `QToolTip` 규칙은 인스턴스 스타일시트보다 우선순위가 낮아 진다.
+
+    실측 2026-08-12(실촬영 · `QScreen.grabWindow`):
+      · 조상에 선언 전용 스타일시트가 **없으면** 전역 QSS대로 칠해진다
+        (배경을 #FF0000으로 강제하니 그대로 빨강).
+      · 검수 카드(`background: #FFFFFF` 조상) → 툴팁 배경 **#ffffff** + 글자 #f2f5f9
+        = 라이트 모드에서 **흰 바탕에 흰 글씨**(사용자 보고).
+      · 결과 패널(`background: transparent` 조상) → 투명이 그대로 먹혀 **#000000**.
+        ⚠ 예전 메모의 "이 환경의 Qt는 툴팁을 무조건 검정으로 칠한다"는 결론은 이
+        경로에서 잰 것이었다 — Qt가 QSS를 무시한 게 아니라 **조상 선언이 이긴 것**이다.
+
+    그래서 선언을 `*`로 **명시**하고(= Qt가 하던 것과 동일) 그 뒤에 `QToolTip` 규칙을
+    다시 선언한다. 타입 셀렉터가 `*`보다 구체적이라 툴팁만 칩 색을 되찾는다.
+    ⚠ 선언과 규칙을 한 문자열에 섞어 쓰지 말 것(`"background: …; QToolTip{…}"`) —
+      Qt는 파싱에 실패해 **전체를 다시 `*{…}`로 감싸** 통째로 망가뜨린다.
+    """
+    return "* { %s }\n%s" % (decls.strip(), tooltip_qss())
 
 
 # ══════════════════════════════════════════════════════════════

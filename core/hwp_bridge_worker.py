@@ -1498,6 +1498,10 @@ class HwpBridge:
     #   ⚠ 이 값이 틀리면 커서가 앵커를 못 넘어 **같은 자리에 메모가 겹쳐 달린다**.
     #   그래서 값에만 의존하지 않고 아래 두 겹으로 방어한다(전진 검증 + 재발견 감지).
     _MEMO_CTRL_SPAN = 8
+    # 메모 본문 서식 (사용자 지정 2026-08-12) — 말풍선 안에서만 쓰인다.
+    _MEMO_FONT = "맑은 고딕"
+    _MEMO_FONT_SIZE = 800        # HWPUNIT(1pt = 100) → 8pt
+    _MEMO_LINE_SPACING = 140     # %
 
     def _advance_past_anchor(self, match_pos, original):
         """메모를 단 직후, 커서를 **앵커 낱말 뒤**로 옮긴다. 반환: 재발견 감지용 좌표.
@@ -1548,6 +1552,50 @@ class HwpBridge:
                     break
         return ((p2[0], p2[1]), anchor_start)
 
+    def _apply_memo_style(self):
+        """메모 편집 상태에서 **글자·문단 모양을 통일**한다(사용자 지정 2026-08-12).
+
+        맑은 고딕 8pt · 줄간격 140% — 말풍선은 좁고 본문 서식(원고 폰트·크기)을 그대로
+        물려받으면 장마다 크기가 달라 읽는 리듬이 끊긴다.
+
+        ⚠ **선택 없이, 글자를 쓰기 전에** 건다. 그래야 '앞으로 입력될 글자'의 모양이
+          되고, 뒤이어 `InsertText`가 만드는 두·세째 줄까지 같은 모양을 물려받는다.
+          ⚠ `SelectAll`로 잡아 거는 길을 택하지 말 것 — 서브스토리 밖까지 잡히면
+            **원고 전체**에 8pt가 걸린다(메모 모드의 약속은 원고 무변경이다).
+        ⚠ 서식 실패는 메모 자체의 실패가 아니다 — 통째로 삼키고 본문 쓰기로 넘어간다.
+          내용 없는 말풍선보다 서식이 다른 말풍선이 낫다.
+        """
+        try:
+            cset = self.hwp.HParameterSet.HCharShape
+            self.hwp.HAction.GetDefault("CharShape", cset.HSet)
+            # 언어별 글꼴 칸이 따로 있다 — 하나만 바꾸면 한글·영문이 갈린다.
+            for attr in ("FaceNameHangul", "FaceNameLatin", "FaceNameHanja",
+                         "FaceNameJapanese", "FaceNameOther", "FaceNameSymbol",
+                         "FaceNameUser"):
+                try:
+                    setattr(cset, attr, self._MEMO_FONT)
+                except Exception:
+                    pass
+            cset.Height = self._MEMO_FONT_SIZE      # HWPUNIT = pt × 100
+            self.hwp.HAction.Execute("CharShape", cset.HSet)
+        except Exception:
+            pass
+        try:
+            pset = self.hwp.HParameterSet.HParaShape
+            # ⚠ 액션 이름은 **"ParagraphShape"**다 — 파라미터셋 이름(`HParaShape`)을
+            #   그대로 따라 "ParaShape"라고 쓰면 **예외도 없이 아무 일도 일어나지
+            #   않는다**(실측 2026-08-12: 메모 문단이 기본 paraPr 0 · 줄간격 160%
+            #   그대로였다. 글자 모양은 같은 방식으로 정상 적용돼 더 헷갈린다).
+            self.hwp.HAction.GetDefault("ParagraphShape", pset.HSet)
+            try:
+                pset.LineSpacingType = self.hwp.LineSpacingMethod("Percent")
+            except Exception:
+                pset.LineSpacingType = 0            # 0 = 글자에 따라(%)
+            pset.LineSpacing = self._MEMO_LINE_SPACING
+            self.hwp.HAction.Execute("ParagraphShape", pset.HSet)
+        except Exception:
+            pass
+
     def _write_memo_body(self, text):
         """메모 편집 상태에서 본문을 쓴다. 반환 사유 문자열(빈 문자열이면 성공).
 
@@ -1555,6 +1603,7 @@ class HwpBridge:
           **없다**(실측 2026-08-08: `AttributeError: HWPFrame.HwpObject.InsertText`).
           파라미터셋 경로가 유일하다.
         """
+        self._apply_memo_style()
         try:
             iset = self.hwp.HParameterSet.HInsertText
             self.hwp.HAction.GetDefault("InsertText", iset.HSet)

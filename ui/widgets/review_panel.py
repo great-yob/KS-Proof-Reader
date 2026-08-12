@@ -30,7 +30,7 @@ from ui.widgets.components import (
     label, sub_label, divider, chip, badge, IconButton,
     AnimatedGradientBorder, soft_breakable as _soft_breakable
 )
-from ui.styles.theme import current_palette, restyle, LIGHT
+from ui.styles.theme import current_palette, restyle, local_qss, LIGHT
 
 
 _SOURCE_LABEL = {"dict": "사전검증", "ai_typo": "AI 오탈자", "ai_polish": "AI 윤문",
@@ -3326,6 +3326,9 @@ class ReviewPanel(QWidget):
 
     def _apply_card_theme(self):
         pal = current_palette()
-        self._inner_card.setStyleSheet(f"background: {pal['surface']}; border: none; border-radius: 12px;")
+        # ⚠ `local_qss` — 이 선언은 하위 트리 전체(`*`)에 걸리고 **툴팁까지** 덮는다.
+        #   그대로 두면 라이트 모드 검수 카드 툴팁이 흰 바탕 + 흰 글씨가 된다(실측).
+        self._inner_card.setStyleSheet(local_qss(
+            f"background: {pal['surface']}; border: none; border-radius: 12px;"))
         if hasattr(self, "_sec_divider"):
             self._sec_divider.setStyleSheet(f"background: {pal['border']}; border: none;")
