@@ -129,6 +129,48 @@ def _security_dll_path():
         return None
 
 
+def _ensure_security_module_registered():
+    """FilePathCheckerModule을 한/글의 **per-user 모듈 목록**에 등록한다.
+
+    ★한/글은 이 보안 모듈을 COM ProgID로 찾지 않는다. 자기 레지스트리 키
+      `HKCU\Software\HNC\HwpAutomation\Modules\<이름>` = DLL 절대경로 를 본다.
+      (실측 2026-08-21: 개발 PC엔 pyhwpx가 만든 이 값이 있었고 COM 등록은
+       HKCR·WOW6432Node·HKCU\Software\Classes 어디에도 없었는데
+       `RegisterModule`이 True를 돌려줬다. 배포 PC엔 이 값이 없다 — pyhwpx를
+       깔 일이 없으므로. 그래서 거기서만 한/글이 접근 승인 모달을 띄운다.)
+
+    ⚠ **HKCU라 관리자 권한이 필요 없다.** 설치 프로그램이
+      `PrivilegesRequired=lowest`인 우리에게 열려 있는 유일한 경로다
+      (regsvr32는 HKLM을 요구해 쓸 수 없다 — installer-setup-and-bridge32 참조).
+
+    ⚠ 이미 유효한 등록이 있으면 **건드리지 않는다** — 사용자가 다른 경로(예: pyhwpx)로
+      등록해 둔 것을 우리 번들 경로로 덮어쓰면, 앱을 지웠을 때 한/글이 사라진 DLL을
+      가리키게 된다.
+
+    반환: 최종적으로 등록돼 있는 DLL 경로, 없으면 None.
+    """
+    dll = _security_dll_path()
+    if not dll:
+        return None
+    try:
+        import winreg
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"Software\HNC\HwpAutomation\Modules",
+                                0, winreg.KEY_READ | winreg.KEY_WRITE) as key:
+            try:
+                cur, _ = winreg.QueryValueEx(key, "FilePathCheckerModule")
+            except OSError:
+                cur = None
+            if cur and os.path.isfile(cur):
+                _send_log(f"[보안] 모듈 이미 등록됨: {cur}")
+                return cur
+            winreg.SetValueEx(key, "FilePathCheckerModule", 0, winreg.REG_SZ, dll)
+            _send_log(f"[보안] 모듈 신규 등록: {dll}")
+            return dll
+    except Exception as exc:
+        _send_log(f"[보안] 모듈 등록 실패({type(exc).__name__}): {exc}")
+        return None
+
+
 # 확장자 → HWP COM Open()의 Format 인자
 _HWP_FORMAT_BY_EXT = {
     ".hwp":   "HWP",
@@ -179,6 +221,7 @@ _HWP_PROGID_BY_EXT = {
 _user32 = ctypes.windll.user32
 _kernel32 = ctypes.windll.kernel32
 _SW_HIDE = 0
+_SW_SHOW = 5
 try:
     _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
     _user32.IsWindowVisible.argtypes = [wintypes.HWND]
@@ -216,8 +259,12 @@ def _list_hwp_pids():
     return pids
 
 
-def _hide_windows_of(pids):
-    """주어진 PID들의 '보이는' 최상위 창을 SW_HIDE."""
+def _hide_windows_of(pids, hidden=None):
+    """주어진 PID들의 '보이는' 최상위 창을 SW_HIDE.
+
+    hidden(set)을 주면 **우리가 실제로 숨긴 hwnd만** 기록한다 — 되살릴 때
+    (_show_windows) 우리가 건드리지 않은 창까지 띄우지 않기 위함이다.
+    """
     if not pids:
         return
 
@@ -227,6 +274,8 @@ def _hide_windows_of(pids):
             _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             if pid.value in pids and _user32.IsWindowVisible(hwnd):
                 _user32.ShowWindow(hwnd, _SW_HIDE)
+                if hidden is not None:
+                    hidden.add(hwnd)
         except Exception:
             pass
         return True
@@ -235,6 +284,28 @@ def _hide_windows_of(pids):
         _user32.EnumWindows(_EnumWindowsProc(_cb), 0)
     except Exception:
         pass
+
+
+def _show_windows(hwnds):
+    """_hide_windows_of가 숨긴 창을 다시 띄운다.
+
+    ⚠ 이 함수가 있는 이유(배포 첫날 실사고 2026-08-21): 한/글이 **모달 대화상자**를
+      띄운 채 COM 호출이 블록되면, 그 창을 우리가 숨겨 둔 탓에 사용자는 보지도
+      클릭하지도 못하는 **영구 대기**에 빠진다. 개발 PC는 등록·보안 승인·개인정보
+      동의가 이미 정리돼 있어 절대 재현되지 않고, 새로 배포된 PC에서는 첫 실행이
+      곧 첫 대화상자다. 지연 감시(_StallWatch)가 이 함수로 창을 되살려, 최소한
+      사용자가 상황을 보고 처리할 수 있게 만든다.
+    """
+    for hwnd in list(hwnds or ()):
+        try:
+            _user32.ShowWindow(hwnd, _SW_SHOW)
+        except Exception:
+            pass
+    for hwnd in list(hwnds or ()):
+        try:
+            _user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
 
 
 class _WindowHider:
@@ -246,6 +317,7 @@ class _WindowHider:
         self._max = max_seconds
         self._stop = threading.Event()
         self._th = None
+        self._hidden = set()      # 우리가 숨긴 hwnd — unhide()로만 되돌린다
 
     def start(self):
         self._th = threading.Thread(target=self._loop, daemon=True)
@@ -264,7 +336,7 @@ class _WindowHider:
                     target = _list_hwp_pids() - self._pre
                     last_snap = now
                 if target:
-                    _hide_windows_of(target)
+                    _hide_windows_of(target, self._hidden)
             except Exception:
                 pass
             time.sleep(0.001)
@@ -276,6 +348,64 @@ class _WindowHider:
                 self._th.join(timeout=1)
             except Exception:
                 pass
+
+    def unhide(self):
+        """숨김을 중단하고, 지금까지 숨긴 창을 모두 다시 띄운다.
+
+        ⚠ stop()을 **먼저** 해야 한다 — 루프가 살아 있으면 1ms 안에 다시 숨긴다.
+        """
+        self.stop()
+        _show_windows(self._hidden)
+        self._hidden.clear()
+
+
+class _StallWatch:
+    """블로킹 COM 호출이 오래 걸리면 숨긴 한/글 창을 되살리고 **한 번** 경고한다.
+
+    한/글은 최초 실행 등록·개인정보 동의·문서 복구·자동화 보안 승인 같은 모달을
+    띄울 수 있고, 그동안 Dispatch/Open은 반환하지 않는다. 그 창이 숨겨져 있으면
+    사용자에게는 그냥 '멈춘 앱'이다(→ _show_windows 주석).
+
+    ⚠ 경고는 반드시 **1회**만 낸다. stderr 출력은 부모(_send_cmd)의 유휴 타임아웃을
+      리셋하므로, 주기적으로 짖으면 120초 타임아웃이 영원히 오지 않는다.
+    """
+
+    def __init__(self, stage, hider, seconds=20.0):
+        self._stage = stage
+        self._hider = hider
+        self._sec = seconds
+        self._timer = threading.Timer(seconds, self._fire)
+        self._timer.daemon = True
+
+    def _fire(self):
+        try:
+            if self._hider is not None:
+                self._hider.unhide()
+        except Exception:
+            pass
+        try:
+            _send_log(
+                # ⚠ 화면 로그는 `—` 앞에서 잘린다(activity_panel) — 조치 문구를 앞에.
+                f"[한/글 대기] 한/글 창을 확인해 주세요 — {self._stage} 단계가 "
+                f"{self._sec:.0f}초째 무응답입니다. 한/글이 대화상자(사용자 등록·"
+                f"문서 복구·접근 승인 등)를 띄운 것 같아 숨겨 둔 창을 다시 표시했습니다."
+            )
+        except Exception:
+            pass
+
+    def __enter__(self):
+        try:
+            self._timer.start()
+        except Exception:
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self._timer.cancel()
+        except Exception:
+            pass
+        return False
 
 
 class HwpBridge:
@@ -303,6 +433,7 @@ class HwpBridge:
         forced = os.environ.get("KS_HWP_PROGID", "").strip()
         if forced:
             try:
+                _send_log(f"[HWP] Dispatch 시도(강제): {forced}")
                 hwp = win32.Dispatch(forced)
                 _send_log(f"[HWP] Dispatch 강제 지정 성공: {forced}")
                 return hwp
@@ -316,6 +447,9 @@ class HwpBridge:
         last_exc = None
         for progid in candidates:
             try:
+                # ⚠ 반드시 **호출 전에** 남긴다 — Dispatch가 블록되면(한/글 모달)
+                #   성공 후 로그는 영원히 오지 않아, 부모에겐 그냥 '침묵'이다.
+                _send_log(f"[HWP] Dispatch 시도: {progid}")
                 hwp = win32.Dispatch(progid)
                 _send_log(f"[HWP] Dispatch 성공: {progid} (확장자 {ext})")
                 return hwp
@@ -339,8 +473,12 @@ class HwpBridge:
                 self._hider.start()
             except Exception:
                 self._hider = None
+        else:
+            self._hider = None
         # 확장자별 선호 ProgID 시도 → HWP 2022가 .hwpx, HWP 2010이 .hwp 처리
-        self.hwp = self._dispatch_hwp(file_path)
+        #   지연 감시: 한/글이 최초 실행 대화상자를 띄우면 여기서 영원히 멈춘다.
+        with _StallWatch("한/글 연결", self._hider):
+            self.hwp = self._dispatch_hwp(file_path)
 
         # #1: HWP 버전 진단 — 어느 버전이 실제로 열렸는지 stderr로 알림.
         try:
@@ -363,22 +501,30 @@ class HwpBridge:
             pass
 
         # 보안 모듈 등록 (보안 경고 팝업 우회) — I5: 결과를 stderr 진단으로 남김
-        sec_status = "기본"
-        try:
-            # 1. HWP 기본 보안 모듈 시도
-            self.hwp.RegisterModule("FilePathCheckDLL", "SecurityModule")
-            sec_status = "SecurityModule"
-        except Exception as exc:
-            _send_log(f"[보안] SecurityModule 등록 실패: {exc}")
-
-        try:
-            # 2. FilePathCheckerModule DLL이 있으면 활용 (팝업 완벽 우회 가능)
-            if _security_dll_path():
-                self.hwp.RegisterModule("FilePathCheckDLL", "FilePathCheckerModule")
-                sec_status = "FilePathCheckerModule"
-        except Exception as exc:
-            _send_log(f"[보안] FilePathCheckerModule 등록 실패: {exc}")
-        _send_log(f"[보안] 등록된 보안 모듈: {sec_status}")
+        #
+        # ⚠ **반환값을 봐야 한다.** ProgID가 등록돼 있지 않으면 RegisterModule은
+        #   예외를 던지지 않고 그냥 False를 돌려준다. 예전 코드는 예외만 잡고
+        #   sec_status를 무조건 덮어써서, 등록이 전혀 안 된 PC에서도
+        #   `[보안] 등록된 보안 모듈: FilePathCheckerModule`이라고 **거짓 보고**했다
+        #   (실측 2026-08-21: 개발 PC의 HKCR·WOW6432Node·HKCU\Software\Classes
+        #   어디에도 FilePathCheckerModule ProgID가 없는데 그 로그가 찍혔다).
+        #   원격 진단이 이 한 줄에 기대므로, '시도'와 '성공'을 절대 뭉뚱그리지 말 것.
+        sec_status = "없음(기본 동작)"
+        # ★RegisterModule보다 **먼저** — 한/글이 참조하는 per-user 키를 채워 둔다.
+        _ensure_security_module_registered()
+        for progid in ("SecurityModule", "FilePathCheckerModule"):
+            if progid == "FilePathCheckerModule" and not _security_dll_path():
+                _send_log("[보안] FilePathCheckerModule DLL이 옆에 없어 건너뜀")
+                continue
+            try:
+                ok_reg = self.hwp.RegisterModule("FilePathCheckDLL", progid)
+            except Exception as exc:
+                _send_log(f"[보안] {progid} 등록 예외: {exc}")
+                continue
+            _send_log(f"[보안] {progid} RegisterModule 반환={ok_reg!r}")
+            if ok_reg:
+                sec_status = progid
+        _send_log(f"[보안] 실제 등록된 보안 모듈: {sec_status}")
 
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"파일 없음: {file_path}")
@@ -391,20 +537,24 @@ class HwpBridge:
         # S6: 어느 단계에서 성공했는지 진단 정보를 stderr로 남김
         ok = False
         open_mode = ""
-        try:
-            ok = self.hwp.Open(file_path, fmt, "forceopen:true")
-            open_mode = "forceopen"
-        except Exception:
+        _send_log(f"[HWP] 파일 열기 시도: fmt={fmt or 'auto'}")
+        # 지연 감시: 보안 모듈이 등록되지 않은 PC에서는 여기서 '문서 접근 허용'
+        #   모달이 뜬다(SetMessageBoxMode로도 안 막히는 부류가 있다).
+        with _StallWatch("파일 열기", self._hider):
             try:
-                ok = self.hwp.Open(file_path, fmt, "")
-                open_mode = "empty-arg"
+                ok = self.hwp.Open(file_path, fmt, "forceopen:true")
+                open_mode = "forceopen"
             except Exception:
                 try:
-                    ok = self.hwp.Open(file_path, fmt)
-                    open_mode = "no-arg"
+                    ok = self.hwp.Open(file_path, fmt, "")
+                    open_mode = "empty-arg"
                 except Exception:
-                    ok = self.hwp.Open(file_path)
-                    open_mode = "fmt-omitted"
+                    try:
+                        ok = self.hwp.Open(file_path, fmt)
+                        open_mode = "no-arg"
+                    except Exception:
+                        ok = self.hwp.Open(file_path)
+                        open_mode = "fmt-omitted"
 
         if ok is False:
             raise RuntimeError(f"HWP에서 파일을 열지 못했습니다: {file_path}")
@@ -2134,6 +2284,13 @@ def _send_log(msg):
 
 
 def main():
+    # ⚠ 첫 명령을 읽기 **전에** 낸다 — 이 줄이 없으면 부모는 '워커가 아예 못 떴다'와
+    #   '워커는 떴는데 COM이 막혔다'를 구분할 수 없다(둘 다 그냥 침묵이다).
+    try:
+        _send_log(f"[브리지] 워커 시작 (pid {os.getpid()}, "
+                  f"{8 * ctypes.sizeof(ctypes.c_void_p)}비트)")
+    except Exception:
+        pass
     bridge = HwpBridge()
 
     for line in sys.stdin:

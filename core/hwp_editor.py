@@ -112,7 +112,9 @@ class HwpEditor:
     def __init__(self, file_path: str, logger=None, visible: bool = False):
         self.file_path = file_path
         self.logger    = logger
-        self.visible   = visible
+        # KS_HWP_VISIBLE=1 → 한/글 창을 숨기지 않는다. 배포 PC에서 '모달이 숨겨져
+        #   멈춘' 상황을 눈으로 확인하기 위한 현장 진단 스위치.
+        self.visible   = visible or os.environ.get("KS_HWP_VISIBLE") == "1"
         self._proc     = None
         # S1: stderr 진행률/로그 큐 — 워커 lifetime 전체에서 계속 drain
         self._stderr_queue: "queue.Queue[dict]" = queue.Queue()
@@ -126,6 +128,10 @@ class HwpEditor:
         #   (apply/verify는 진행률을 주기적으로 쏘므로 '총 시간'이 아닌 '무응답 시간'으로
         #    재야 대용량 문서에서 거짓 타임아웃이 나지 않는다.)
         self._last_activity = time.time()
+        # 행업 진단용 — 워커가 마지막으로 낸 stderr 한 줄. 타임아웃 메시지에 실어
+        #   보내면 '어느 단계에서 멈췄는지'가 화면 캡처만으로 드러난다(브리지 로그는
+        #   activity_panel._DROP이 화면에서 감추므로 이 경로가 유일하다).
+        self._last_worker_line = ""
         # 메모 재색인이 만드는 중간 저장본(아래 `_reindex_document`). 끝나면 지운다.
         self._stage_file = None
         self._reindexing = False
@@ -573,6 +579,7 @@ class HwpEditor:
                 line = line.strip()
                 if not line:
                     continue
+                self._last_worker_line = line[:300]
                 try:
                     p = json.loads(line)
                     # progress 메시지면 큐에 넣어 _send_cmd가 소비
@@ -581,9 +588,14 @@ class HwpEditor:
                         continue
                 except (json.JSONDecodeError, ValueError):
                     pass
-                # JSON이 아닌 일반 메시지는 로거로 흘려보냄
+                # 지연 경고(_StallWatch)만은 **접두사 없이** 그대로 넘긴다 —
+                #   activity_panel._DROP이 '[Worker stderr]'를 통째로 감추므로,
+                #   접두사를 붙이면 정작 사용자가 봐야 할 이 한 줄이 사라진다.
                 if self.logger:
-                    self.logger(f"  [Worker stderr] {line}")
+                    if line.startswith("[한/글 대기]"):
+                        self.logger(line)
+                    else:
+                        self.logger(f"  [Worker stderr] {line}")
         except Exception:
             pass
 
@@ -644,9 +656,22 @@ class HwpEditor:
                             self._proc.kill()
                         except Exception:
                             pass
-                        return {"ok": False, "error":
-                                f"HWP 브리지 응답 없음 — {timeout:.0f}초간 아무 출력이 없어 "
-                                f"중단했습니다 (한/글 행업 추정). 다시 시도해 주세요."}
+                        tail = (self._last_worker_line or "").strip()
+                        where = (f"마지막 브리지 출력: {tail}" if tail else
+                                 "브리지가 출력을 한 줄도 내지 못했습니다 "
+                                 "(32비트 워커 실행 자체가 막혔을 수 있습니다).")
+                        return {"ok": False, "error": "\n".join([
+                            f"HWP 브리지 응답 없음 — {timeout:.0f}초간 아무 출력이 "
+                            f"없어 중단했습니다.",
+                            where,
+                            "",
+                            "확인해 주세요:",
+                            "  1. 한/글을 직접 한 번 실행해 사용자 등록·개인정보 동의 등 "
+                            "안내 창을 모두 닫아 주세요.",
+                            "  2. 화면에 한/글 대화상자가 떠 있으면 확인 후 닫아 주세요.",
+                            "  3. 작업 관리자에서 남은 hwp.exe를 모두 끝낸 뒤 "
+                            "다시 시도해 주세요.",
+                        ])}
                     continue
 
                 if response_line is None:   # EOF 센티널 — 프로세스 종료
