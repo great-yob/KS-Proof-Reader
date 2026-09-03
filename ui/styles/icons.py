@@ -64,6 +64,43 @@ def make_icon(name: str, color: str, size: int = 18) -> QIcon:
     return ic
 
 
+def multi_pixmap(names, color: str, size: int = 18, gap: int = 4) -> QPixmap:
+    """아이콘 여러 개를 가로로 이어 붙인 **하나의** 픽스맵.
+
+    'HWP (빨간색+메모)'처럼 두 기능을 합친 값은 아이콘도 둘이어야 하는데
+    (`hwp` + `memo`), QPushButton은 아이콘을 하나만 받는다 — 그래서 그림 자체를
+    합친다(사용자 지시 2026-09-03: 설정 화면과 완료 화면이 같은 선택지를 같은
+    그림으로 가리켜야 한다).
+
+    ⚠ 반환 픽스맵은 **정사각형이 아니다**. 쓰는 쪽에서 `multi_icon_size()`로 같은
+      비율의 QSize를 줘야 Qt가 가로로 찌그러뜨리지 않는다.
+    """
+    names = tuple(names)
+    if len(names) == 1:
+        return pixmap(names[0], color, size)
+    w = size * len(names) + gap * (len(names) - 1)
+    pm = QPixmap(int(w * _DPR), int(size * _DPR))
+    pm.fill(Qt.transparent)
+    pm.setDevicePixelRatio(_DPR)
+    p = QPainter(pm)
+    for i, nm in enumerate(names):
+        p.drawPixmap(int(i * (size + gap)), 0, pixmap(nm, color, size))
+    p.end()
+    return pm
+
+
+def make_multi_icon(names, color: str, size: int = 18, gap: int = 4) -> QIcon:
+    ic = QIcon()
+    ic.addPixmap(multi_pixmap(names, color, size, gap))
+    return ic
+
+
+def multi_icon_size(names, size: int = 18, gap: int = 4) -> QSize:
+    """`make_multi_icon`과 짝이 되는 QSize — 아이콘 수만큼 넓다."""
+    n = len(tuple(names))
+    return QSize(size * n + gap * max(0, n - 1), size)
+
+
 def app_icon() -> QIcon:
     """작업표시줄·Alt-Tab·창 아이콘용 앱 아이콘(assets/icon.ico, 다해상도).
 

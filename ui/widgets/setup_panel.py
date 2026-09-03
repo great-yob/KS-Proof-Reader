@@ -62,7 +62,7 @@ _CARD_PAD_H  = 22      # 카드 좌우 여백(불변)
 _CARD_PAD_V  = 9       # 선택 카드 상하 여백(16 → 12 → 9)
 _ROW_PAD_V   = 8       # 토글 행 상하 여백(14 → 10 → 8)
 _SEC_GAP     = 9       # 섹션 제목 ↔ 카드 줄 간격(16 → 12 → 9)
-_SEC_SPACING = 16      # 섹션과 섹션 사이(30 → 24 → 16)
+_SEC_SPACING = 20      # 섹션과 섹션 사이(30 → 24 → 16 → 20)
 _MAIN_PAD_V  = 14      # 바깥 카드 상하 여백(21 → 18 → 14)
 _ROW_GAP     = 10      # 결과물 카드 줄 사이 — 3줄이 되어 기본 간격보다 좁게 쥔다
 
@@ -149,7 +149,10 @@ class FilePanel(QFrame):
         fc.setSpacing(16)
 
         fc.addStretch(1)
-        fc.addWidget(IconLabel("file-text", role="accent", size=80), alignment=Qt.AlignCenter)
+        # 원색 파일형식 아이콘 — '무엇이 첨부됐는지'를 글자보다 먼저 말한다(사용자
+        #   지시 2026-09-03). hwp.svg에는 `currentColor`가 없어 색 치환이 no-op이므로
+        #   role을 주지 않는다(결과물 카드·산출물 목록과 같은 자산·같은 취급).
+        fc.addWidget(IconLabel("hwp", size=80), alignment=Qt.AlignCenter)
         fc.addSpacing(12)   # 아이콘 ↔ 파일명 간격(기본 16 + 12 = 28)
 
         # 파일명은 **줄이지 않고 전부** 보여 준다(사용자 지정 2026-08-06) — 대신 줄바꿈.
@@ -266,33 +269,33 @@ class DictPanel(QFrame):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
 
-        frame, lay = section_card("사용자 사전 (선택)", "spell-check")
+        frame, lay = section_card("사용자 사전 (선택사항)", "table")
         lay.setContentsMargins(27, 14, 27, 14)
         lay.setSpacing(10)
 
-        # 드롭존(미첨부)
+        # 드롭존(미첨부) — 문서 선택 칸과 **같은 세로 배치**: 아이콘이 맨 위 가운데,
+        #   글자는 그 아래 가운데(사용자 지시 2026-09-03).
+        #   ⚠ 이 칸의 글자는 wrap을 켜지 않는다(줄바꿈 금지). 그래서 좌우 여백을 좁게
+        #     잡아 글자가 접히거나 잘릴 폭을 남기지 않는다 — 넓히면 긴 안내문이 먼저
+        #     잘린다(1/3 높이 칸이라 두 줄로 늘릴 여유도 없다).
         self._dropzone = QFrame()
         self._dropzone.setProperty("role", "dropzone")
         dz = QVBoxLayout(self._dropzone)
-        dz.setContentsMargins(20, 12, 20, 12)
-        dz.setSpacing(6)
+        dz.setContentsMargins(12, 12, 12, 12)
+        dz.setSpacing(4)
         dz.addStretch(1)
 
-        row = QHBoxLayout()
-        row.setSpacing(10)
-        row.addStretch(1)
-        self._dz_icon = IconLabel("table", role="text_muted", size=34, stroke_width=1.2)
-        row.addWidget(self._dz_icon, 0, Qt.AlignVCenter)
-        col = QVBoxLayout()
-        col.setSpacing(2)
+        self._dz_icon = IconLabel("file-down", role="text_muted", size=34, stroke_width=1.2)
+        dz.addWidget(self._dz_icon, 0, Qt.AlignHCenter)
+        dz.addSpacing(4)
         t = label("사용자 사전 엑셀을 여기에 드래그하세요", role="h2")
-        col.addWidget(t)
-        col.addWidget(sub_label("첫 칸 원문 · 둘째 칸 교정문 (.xlsx)"))
-        row.addLayout(col, 0)
-        row.addStretch(1)
-        dz.addLayout(row)
+        t.setAlignment(Qt.AlignCenter)
+        dz.addWidget(t)
+        st = sub_label("미리 작성한 원문-교정문 엑셀파일 (.xlsx)")
+        st.setAlignment(Qt.AlignCenter)
+        dz.addWidget(st)
 
-        browse = make_button("파일 선택", "ghost", on_click=self._browse)
+        browse = make_button("파일 선택", "primary", on_click=self._browse)
         browse.setFixedWidth(100)
         browse.setFixedHeight(32)
         browse.setStyleSheet("padding: 4px 10px; margin-top: 8px;")
@@ -304,30 +307,26 @@ class DictPanel(QFrame):
         self._dict_card = QFrame()
         self._dict_card.setProperty("role", "dropzone_selected")
         dc = QVBoxLayout(self._dict_card)
-        dc.setContentsMargins(20, 12, 20, 12)
-        dc.setSpacing(6)
+        dc.setContentsMargins(12, 12, 12, 12)
+        dc.setSpacing(4)
         dc.addStretch(1)
 
-        drow = QHBoxLayout()
-        drow.setSpacing(10)
-        drow.addStretch(1)
         # 원색 파일형식 아이콘 — 설정/결과 두 화면이 같은 그림으로 같은 것을 가리킨다
-        #   (result_panel._OUT_META의 excel과 같은 자산).
-        drow.addWidget(IconLabel("excel", size=34), 0, Qt.AlignVCenter)
-        dcol = QVBoxLayout()
-        dcol.setSpacing(2)
+        #   (result_panel._OUT_META의 excel과 같은 자산). 위 드롭존과 같은 자리에 둔다.
+        dc.addWidget(IconLabel("excel", size=34), 0, Qt.AlignHCenter)
+        dc.addSpacing(4)
         # 파일명은 줄이지 않고 접는다(FilePanel과 같은 3종 세트 — 정책·hfw·ZWSP).
+        #   ⚠ 여기만 wrap을 켠다 — 파일명은 길이를 예측할 수 없어 잘리면 안 된다.
         self._name_lbl = label("", role="h2", wrap=True)
+        self._name_lbl.setAlignment(Qt.AlignCenter)
         self._name_lbl.setTextFormat(Qt.PlainText)
         _sp = QSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         _sp.setHeightForWidth(True)
         self._name_lbl.setSizePolicy(_sp)
-        dcol.addWidget(self._name_lbl)
+        dc.addWidget(self._name_lbl)
         self._meta_lbl = sub_label("", wrap=True)
-        dcol.addWidget(self._meta_lbl)
-        drow.addLayout(dcol, 1)
-        drow.addStretch(1)
-        dc.addLayout(drow)
+        self._meta_lbl.setAlignment(Qt.AlignCenter)
+        dc.addWidget(self._meta_lbl)
 
         clear_btn = make_button("삭제", "ghost",
                                 on_click=lambda _: self.dict_selected.emit(""))
@@ -413,10 +412,10 @@ class DictPanel(QFrame):
             return "⚠ 교정 항목이 없습니다 — 첫 칸 원문 · 둘째 칸 교정문으로 적어 주세요."
         # 띄어쓰기 통일 규칙(앞뒤 공백으로 적은 행)은 낱말 페어와 성격이 달라 따로 센다 —
         #   사용자가 공백을 의도대로 적었는지 여기서 확인할 수 있어야 한다.
-        part = [f"낱말 {len(ud.pairs)}건"] if ud.pairs else []
+        part = [f"사용자 사전 용어 {len(ud.pairs)}건"] if ud.pairs else []
         if ud.boundary:
             part.append(f"띄어쓰기 통일 {len(ud.boundary)}건")
-        return " · ".join(part) + " · 모든 교정 로직보다 우선 적용됩니다."
+        return " · ".join(part) + "\n모든 교정 로직보다 우선 적용됩니다."
 
     def has_dict(self) -> bool:
         return bool(self._dict_path)
@@ -614,9 +613,19 @@ class SetupPanel(QWidget):
         cl.setSpacing(6)
 
         # 아이콘 + 제목 (+ 잠금 칩) 한 줄.
+        #   ⚠ `icon`은 이름 하나이거나 **이름 목록**이다 — 'HWP (빨간색+메모)'처럼 두
+        #     기능을 합친 값은 아이콘도 둘을 나란히 보여 준다(hwp + memo). 목록일 때
+        #     간격을 좁혀(4px) 한 덩어리로 읽히게 한다.
         trow = QHBoxLayout()
         trow.setSpacing(8)
-        trow.addWidget(IconLabel(icon, role="text_muted" if locked else "accent", size=20))
+        names = (icon,) if isinstance(icon, str) else tuple(icon)
+        irow = QHBoxLayout()
+        irow.setContentsMargins(0, 0, 0, 0)
+        irow.setSpacing(4)
+        for nm in names:
+            irow.addWidget(IconLabel(nm, role="text_muted" if locked else "accent",
+                                     size=20))
+        trow.addLayout(irow)
         trow.addWidget(label(title, role="h2"))
         if badge_text:
             trow.addWidget(badge(badge_text))
@@ -664,7 +673,7 @@ class SetupPanel(QWidget):
         #   치환·빨강까지는 'hwp'와 같고, 그 자리에 메모를 하나 더 단다. 앵커가 원문이
         #   아니라 **교정문**이라는 점이 메모 모드와 결정적으로 다르다(apply_worker
         #   `_run_memo(anchor_corrected=True)` 참조).
-        ("hwp_memo", "memo", "HWP (빨간색+메모)",
+        ("hwp_memo", ("hwp", "memo"), "HWP (빨간색+메모)",
          "교정안을 반영해 빨간색으로 표시하고\n같은 자리에 메모까지 남깁니다.",
          "HWP (빨간색+메모)"),
         ("memo",   "memo",  "HWP (메모)",

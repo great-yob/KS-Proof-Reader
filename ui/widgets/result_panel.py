@@ -49,7 +49,8 @@ from PySide6.QtCore import (
 )
 
 from ui.widgets.components import IconLabel, IconButton
-from ui.styles.icons import make_icon, icon_size
+from ui.styles.icons import (make_icon, icon_size, make_multi_icon,
+                             multi_icon_size)
 from ui.styles.theme import current_palette, current_mode, local_qss
 
 
@@ -1572,7 +1573,10 @@ class ResultPanel(QWidget):
     _OUT_META = {
         "hwp":    ("hwp",   "HWP (빨간색)",  "교정본",
                    "원고에 반영 + 빨간색 표시", "교정본"),
-        "hwp_memo": ("memo", "HWP (빨간색+메모)", "교정본+메모",
+        # ⚠ 아이콘이 **둘**이다(hwp + memo) — 두 기능을 합친 값이라 설정 화면의
+        #   같은 카드도 둘을 나란히 그린다(사용자 지시 2026-09-03). 쓰는 쪽은
+        #   `icons.make_multi_icon`/`multi_icon_size` 짝으로 받아야 한다.
+        "hwp_memo": (("hwp", "memo"), "HWP (빨간색+메모)", "교정본+메모",
                      "원고에 반영 + 빨간색 + 메모", "교정본+메모"),
         "memo":   ("memo",  "HWP (메모)",    "메모본",
                    "원고에 미반영 + 메모로 표시", "메모"),
@@ -1747,7 +1751,8 @@ class ResultPanel(QWidget):
                 pair = QHBoxLayout()
                 pair.setContentsMargins(0, 0, 0, 0)
                 pair.setSpacing(4)
-                pair.addWidget(IconLabel(meta[0], size=19), 0, Qt.AlignVCenter)
+                for nm in ((meta[0],) if isinstance(meta[0], str) else tuple(meta[0])):
+                    pair.addWidget(IconLabel(nm, size=19), 0, Qt.AlignVCenter)
                 pair.addWidget(_ctext(text, px=14, color="text", weight=700),
                                0, Qt.AlignVCenter)
                 head.addLayout(pair)
@@ -1887,8 +1892,11 @@ class ResultPanel(QWidget):
         b.setObjectName("outAddBtn")
         b.setCursor(Qt.ArrowCursor if done else Qt.PointingHandCursor)
         b.setToolTip("이미 만들어진 결과물입니다." if done else desc)
-        b.setIcon(make_icon(icon, pal["text"], 22))
-        b.setIconSize(icon_size(22))
+        # ⚠ 이름이 하나면 정사각, 목록이면 이어 붙인 **가로로 긴** 그림이다.
+        #   QSize를 같이 맞춰 주지 않으면 Qt가 22×22에 욱여넣어 찌그러뜨린다.
+        names = (icon,) if isinstance(icon, str) else tuple(icon)
+        b.setIcon(make_multi_icon(names, pal["text"], 22))
+        b.setIconSize(multi_icon_size(names, 22) if len(names) > 1 else icon_size(22))
         b.setMinimumWidth(self._ADD_BTN_W)
         b.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
