@@ -35,10 +35,16 @@ from ui.widgets.components import (
 )
 from ui.styles.theme import current_palette, restyle, local_qss, LIGHT
 from ui.styles.fonts import SERIF_FAMILY
+# 사용자 첨부 사전 카드 식별자 — 이 패널에서 딱 한 가지가 달라진다: **수락 상태로
+#   등장하되 그것을 '반복 일괄 처리'로 취급하지 않는다**(_build_occurrences 참조).
+#   ⚠ 문자열을 여기 다시 적지 말 것 — 워커·정오표·결과 화면이 같은 값을 보고 분기하므로
+#     한 글자만 어긋나도 조용히 어긋난다. 단일 출처는 core/user_dict_file.SOURCE다.
+from core.user_dict_file import SOURCE as USER_DICT_SOURCE
 
 
 _SOURCE_LABEL = {"dict": "사전검증", "ai_typo": "AI 오탈자", "ai_polish": "AI 윤문",
-                 "dict_flag": "사전 검수", "spacing": "띄어쓰기", "punct": "문장부호"}
+                 "dict_flag": "사전 검수", "spacing": "띄어쓰기", "punct": "문장부호",
+                 "user_dict": "사용자 사전"}
 
 # 검수 필요(미등재 dict_flag·저신뢰)는 카테고리와 배타로 한 묶음(반드시 사용자 확인).
 REVIEW_CAT = "검수 필요"
@@ -1545,6 +1551,7 @@ class ReviewPanel(QWidget):
                 positions = [None]   # 본문에서 못 찾음 → 합성 단일 항목
             total = len(positions)
             init = c.get("status", "pending")
+            _ud_card = c.get("source") == USER_DICT_SOURCE
             for k, p in enumerate(positions):
                 self._occ.append({
                     "uid": self._new_uid(),
@@ -1557,7 +1564,12 @@ class ReviewPanel(QWidget):
                     #   덮어쓰지 않음). _set_status 참조. 로드 시점에 상태가 이미
                     #   정해져 있으면(auto_apply 사전 결정 등) 일괄 처리로 취급해
                     #   반대 선택 시 확인 팝업을 거치게 한다.
-                    "auto": init != "pending", "by_user": False,
+                    # ⚠ 사용자 첨부 사전(user_dict) 카드는 예외다. 수락 상태로 뜨는 건
+                    #   '반복 전파'가 아니라 사용자가 사전에 적어 둔 결정이라, auto로
+                    #   두면 거절할 때마다 "반복 항목을 반대로 처리할까요?"라는 엉뚱한
+                    #   팝업이 뜬다. 한 번 눌러 거절할 수 있어야 한다(사용자 지시
+                    #   2026-09-03: "개별적으로 거절도 가능").
+                    "auto": init != "pending" and not _ud_card, "by_user": False,
                 })
         # 문서 등장 순으로 정렬(없는 항목은 끝)
         self._occ.sort(key=lambda o: (o["pos"] is None, o["pos"] or 0))

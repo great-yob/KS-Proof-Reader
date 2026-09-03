@@ -20,6 +20,8 @@ from ui.widgets.components import (
 )
 from ui.widgets._toggle import ToggleSwitch
 from ui.styles.theme import restyle
+# 첨부 UI와 로더가 **같은 확장자 기준**을 쓰도록 core에서 가져온다(따로 적으면 어긋난다).
+from core.user_dict_file import EXTENSIONS as DICT_EXTENSIONS
 
 
 # ══════════════════════════════════════════════════════════════
@@ -53,12 +55,16 @@ POLISH_ENABLED = False
 #   ⚠ 세로만 줄인다. 가로 여백(22)은 카드 최소폭·글자 접힘과 얽혀 있어(memory
 #     `setup-panel-equal-grid-qt-traps`) 건드리면 좁은 창에서 제목이 접히거나
 #     가로 스크롤이 생긴다.
+#   ⚠ 2026-09-03 재조정: 결과물 축에 'HWP (빨간색+메모)'가 붙어 **2×2 → 3줄**이 됐다.
+#     줄이 통째로 하나 늘었으므로 같은 창 높이에 담으려면 세로 여백을 한 번 더 조여야
+#     한다(안 그러면 설정 칸에 세로 스크롤이 생긴다 — 사용자 지시 2026-09-03).
 _CARD_PAD_H  = 22      # 카드 좌우 여백(불변)
-_CARD_PAD_V  = 12      # 선택 카드 상하 여백(16 → 12)
-_ROW_PAD_V   = 10      # 토글 행 상하 여백(14 → 10)
-_SEC_GAP     = 12      # 섹션 제목 ↔ 카드 줄 간격(16 → 12)
-_SEC_SPACING = 24      # 섹션과 섹션 사이(30 → 24)
-_MAIN_PAD_V  = 18      # 바깥 카드 상하 여백(21 → 18)
+_CARD_PAD_V  = 9       # 선택 카드 상하 여백(16 → 12 → 9)
+_ROW_PAD_V   = 8       # 토글 행 상하 여백(14 → 10 → 8)
+_SEC_GAP     = 9       # 섹션 제목 ↔ 카드 줄 간격(16 → 12 → 9)
+_SEC_SPACING = 16      # 섹션과 섹션 사이(30 → 24 → 16)
+_MAIN_PAD_V  = 14      # 바깥 카드 상하 여백(21 → 18 → 14)
+_ROW_GAP     = 10      # 결과물 카드 줄 사이 — 3줄이 되어 기본 간격보다 좁게 쥔다
 
 
 def _wrap_card_policy() -> QSizePolicy:
@@ -232,8 +238,244 @@ class FilePanel(QFrame):
         return bool(self._file_path)
 
 
+class DictPanel(QFrame):
+    """사용자 사전(.xlsx) 첨부 칸 — 문서 선택 칸 **아래**에 2:1 높이로 붙는다.
+
+    첨부는 선택 사항이다. 비어 있으면 워커가 이 계층을 통째로 건너뛰어 기존 교정
+    로직이 한 글자도 달라지지 않고, 첨부되면 그 목록이 **모든 교정 로직보다 위**에서
+    동작한다(core/user_dict_file 헤더 참조).
+
+    ⚠ 문서 선택 칸(FilePanel)의 축소판이 아니라 **더 낮은 칸**이다. 높이가 1/3뿐이라
+      드롭존 아이콘·여백을 그대로 쓰면 내용이 잘린다 — 여기 값들은 그래서 따로 잡았다.
+    """
+
+    dict_selected = Signal(str)
+
+    # 파일명 옆에 '용어 N건'을 보여 주려면 첨부 시점에 엑셀을 한 번 읽어야 한다.
+    #   사용자가 손으로 만든 목록이라 보통 수십~수백 행이지만, 어쩌다 큰 파일이 들어와도
+    #   GUI 스레드가 멈추지 않도록 상한을 둔다(넘으면 건수 없이 파일명만 보여 준다).
+    _PEEK_MAX_BYTES = 5 * 1024 * 1024
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self._dict_path = ""
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        frame, lay = section_card("사용자 사전 (선택)", "spell-check")
+        lay.setContentsMargins(27, 14, 27, 14)
+        lay.setSpacing(10)
+
+        # 드롭존(미첨부)
+        self._dropzone = QFrame()
+        self._dropzone.setProperty("role", "dropzone")
+        dz = QVBoxLayout(self._dropzone)
+        dz.setContentsMargins(20, 12, 20, 12)
+        dz.setSpacing(6)
+        dz.addStretch(1)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        row.addStretch(1)
+        self._dz_icon = IconLabel("table", role="text_muted", size=34, stroke_width=1.2)
+        row.addWidget(self._dz_icon, 0, Qt.AlignVCenter)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        t = label("사용자 사전 엑셀을 여기에 드래그하세요", role="h2")
+        col.addWidget(t)
+        col.addWidget(sub_label("첫 칸 원문 · 둘째 칸 교정문 (.xlsx)"))
+        row.addLayout(col, 0)
+        row.addStretch(1)
+        dz.addLayout(row)
+
+        browse = make_button("파일 선택", "ghost", on_click=self._browse)
+        browse.setFixedWidth(100)
+        browse.setFixedHeight(32)
+        browse.setStyleSheet("padding: 4px 10px; margin-top: 8px;")
+        dz.addWidget(browse, alignment=Qt.AlignCenter)
+        dz.addStretch(1)
+        lay.addWidget(self._dropzone, 1)
+
+        # 첨부 카드(첨부됨) — 초기 숨김
+        self._dict_card = QFrame()
+        self._dict_card.setProperty("role", "dropzone_selected")
+        dc = QVBoxLayout(self._dict_card)
+        dc.setContentsMargins(20, 12, 20, 12)
+        dc.setSpacing(6)
+        dc.addStretch(1)
+
+        drow = QHBoxLayout()
+        drow.setSpacing(10)
+        drow.addStretch(1)
+        # 원색 파일형식 아이콘 — 설정/결과 두 화면이 같은 그림으로 같은 것을 가리킨다
+        #   (result_panel._OUT_META의 excel과 같은 자산).
+        drow.addWidget(IconLabel("excel", size=34), 0, Qt.AlignVCenter)
+        dcol = QVBoxLayout()
+        dcol.setSpacing(2)
+        # 파일명은 줄이지 않고 접는다(FilePanel과 같은 3종 세트 — 정책·hfw·ZWSP).
+        self._name_lbl = label("", role="h2", wrap=True)
+        self._name_lbl.setTextFormat(Qt.PlainText)
+        _sp = QSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        _sp.setHeightForWidth(True)
+        self._name_lbl.setSizePolicy(_sp)
+        dcol.addWidget(self._name_lbl)
+        self._meta_lbl = sub_label("", wrap=True)
+        dcol.addWidget(self._meta_lbl)
+        drow.addLayout(dcol, 1)
+        drow.addStretch(1)
+        dc.addLayout(drow)
+
+        clear_btn = make_button("삭제", "ghost",
+                                on_click=lambda _: self.dict_selected.emit(""))
+        clear_btn.setFixedWidth(100)
+        clear_btn.setFixedHeight(32)
+        clear_btn.setStyleSheet("padding: 4px 10px; margin-top: 8px;")
+        dc.addWidget(clear_btn, alignment=Qt.AlignCenter)
+        dc.addStretch(1)
+
+        self._dict_card.setVisible(False)
+        lay.addWidget(self._dict_card, 1)
+
+        root.addWidget(frame)
+
+    # ── 파일 받기 ──────────────────────────────
+    def _browse(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "사용자 사전 엑셀 선택", "", "Excel 파일 (*.xlsx *.xlsm)")
+        if path:
+            self.dict_selected.emit(path)
+
+    @staticmethod
+    def _is_dict_file(path: str) -> bool:
+        return path.lower().endswith(DICT_EXTENSIONS)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            if urls and urls[0].isLocalFile() and self._is_dict_file(urls[0].toLocalFile()):
+                self._dropzone.setProperty("active", "true")
+                restyle(self._dropzone)
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._dropzone.setProperty("active", "false")
+        restyle(self._dropzone)
+
+    def dropEvent(self, event):
+        self._dropzone.setProperty("active", "false")
+        restyle(self._dropzone)
+        self.dict_selected.emit(event.mimeData().urls()[0].toLocalFile())
+
+    # ── 표시 ───────────────────────────────────
+    def set_dict(self, path: str):
+        self._dict_path = path
+        if not path:
+            self._name_lbl.setText("")
+            self._name_lbl.setToolTip("")
+            self._meta_lbl.setText("")
+            self._dict_card.setVisible(False)
+            self._dropzone.setVisible(True)
+            return
+
+        name = os.path.basename(path)
+        self._name_lbl.setText(soft_breakable(name))
+        self._name_lbl.setToolTip(name)
+        self._meta_lbl.setText(self._peek(path))
+        self._dropzone.setVisible(False)
+        self._dict_card.setVisible(True)
+
+    def _peek(self, path: str) -> str:
+        """첨부 직후의 한 줄 요약 — 사용자가 '엉뚱한 파일'을 바로 알아채게 한다.
+
+        ⚠ 여기서 읽어도 워커가 다시 읽는다(같은 로더). 표시용 미리 읽기이지 캐시가
+          아니다 — 분석 시작까지 사이에 사용자가 파일을 고칠 수 있으므로, 실제 교정에
+          쓰는 값은 언제나 워커가 그 시점에 읽은 것이어야 한다.
+        """
+        try:
+            if os.path.getsize(path) > self._PEEK_MAX_BYTES:
+                return "모든 교정 로직보다 우선 적용됩니다."
+        except OSError:
+            pass
+        try:
+            from core.user_dict_file import load as _load_ud
+            ud = _load_ud(path)
+        except Exception:
+            ud = None
+        if ud is None:
+            return "⚠ 엑셀을 읽지 못했습니다 — 파일을 확인하세요."
+        if not ud.pairs and not ud.boundary:
+            return "⚠ 교정 항목이 없습니다 — 첫 칸 원문 · 둘째 칸 교정문으로 적어 주세요."
+        # 띄어쓰기 통일 규칙(앞뒤 공백으로 적은 행)은 낱말 페어와 성격이 달라 따로 센다 —
+        #   사용자가 공백을 의도대로 적었는지 여기서 확인할 수 있어야 한다.
+        part = [f"낱말 {len(ud.pairs)}건"] if ud.pairs else []
+        if ud.boundary:
+            part.append(f"띄어쓰기 통일 {len(ud.boundary)}건")
+        return " · ".join(part) + " · 모든 교정 로직보다 우선 적용됩니다."
+
+    def has_dict(self) -> bool:
+        return bool(self._dict_path)
+
+
+class AttachPanel(QWidget):
+    """설정 화면 **우측 칸** — 한글 원고(위)와 사용자 사전(아래)을 2:1 높이로 나눈다.
+
+    ⚠ 세로 비율은 stretch(2, 1)만으로 정해지지 않는다. QVBoxLayout은 stretch를 나누기
+      전에 각 칸의 최소 높이를 먼저 확보하므로, 아래 칸 내용이 조금만 커도 2:1이 깨진다
+      — 좌우 1:1 그리드에서 겪은 것과 **같은 함정**이다(memory
+      `setup-panel-equal-grid-qt-traps`). 세로 정책 Ignored로 최소 높이를 0으로 취급시켜
+      비율이 오직 stretch로 정해지게 한다.
+    """
+
+    file_selected = Signal(str)
+    dict_selected = Signal(str)
+
+    _FILE_STRETCH = 2
+    _DICT_STRETCH = 1
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.file_panel = FilePanel()
+        self.dict_panel = DictPanel()
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(24)      # 좌우 칸 간격(main_window setup_layout)과 같은 리듬
+        for panel, stretch in ((self.file_panel, self._FILE_STRETCH),
+                               (self.dict_panel, self._DICT_STRETCH)):
+            sp = panel.sizePolicy()
+            sp.setVerticalPolicy(QSizePolicy.Ignored)
+            panel.setSizePolicy(sp)
+            lay.addWidget(panel, stretch)
+
+        self.file_panel.file_selected.connect(self.file_selected)
+        self.dict_panel.dict_selected.connect(self.dict_selected)
+
+    # 기존 호출부가 FilePanel에 하던 일을 그대로 받아 넘긴다.
+    def set_file(self, path: str):
+        self.file_panel.set_file(path)
+
+    def has_file(self) -> bool:
+        return self.file_panel.has_file()
+
+    def set_dict(self, path: str):
+        self.dict_panel.set_dict(path)
+
+    def has_dict(self) -> bool:
+        return self.dict_panel.has_dict()
+
+
 class SetupPanel(QWidget):
     options_changed = Signal()
+
+    # 한글 본문 글자를 실제로 바꾸는 결과물 — 이 모드에서만 정오표 토글을 열어 둔다.
+    #   ⚠ `apply_worker.ApplyWorker.MODIFY_MODES`와 같은 집합이어야 한다.
+    MODIFY_MODES = ("hwp", "hwp_memo")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -262,6 +504,8 @@ class SetupPanel(QWidget):
         #     "한글 파일을 안 고친다"만 뜻하며, 어느 산출물인지는 구분하지 못한다.
         #     새 분기를 bool로 만들지 말고 `output_mode`를 볼 것.
         self._output_mode  = "hwp"
+        # 한글 본문 글자를 **실제로 바꾸는** 모드(정오표 토글을 잠그지 않는 쪽).
+        #   ⚠ apply_worker.MODIFY_MODES와 같은 집합이어야 한다.
         # 사전 원문 스크리닝은 이제 항상 켜지는 기본 동작이다(옵트인 토글 폐지).
         self._build_ui()
 
@@ -416,6 +660,13 @@ class SetupPanel(QWidget):
         ("hwp",    "hwp",   "HWP (빨간색)",
          "한글 원고에 교정안을 반영하고\n해당 자리를 빨간색으로 표시합니다.",
          "HWP (빨간색)"),
+        # ★'빨간색 + 메모' — 두 표시를 한 파일에 함께 담는다(사용자 지시 2026-09-03).
+        #   치환·빨강까지는 'hwp'와 같고, 그 자리에 메모를 하나 더 단다. 앵커가 원문이
+        #   아니라 **교정문**이라는 점이 메모 모드와 결정적으로 다르다(apply_worker
+        #   `_run_memo(anchor_corrected=True)` 참조).
+        ("hwp_memo", "memo", "HWP (빨간색+메모)",
+         "교정안을 반영해 빨간색으로 표시하고\n같은 자리에 메모까지 남깁니다.",
+         "HWP (빨간색+메모)"),
         ("memo",   "memo",  "HWP (메모)",
          "한글 원고에 교정안을 반영하지 않고\n해당 자리에 메모로 교정안을 표시합니다.",
          "HWP (메모)"),
@@ -432,9 +683,11 @@ class SetupPanel(QWidget):
 
         ⚠ 교정 방식(항목별 검토/자동 일괄)과 **직교**한다 — 클래스 상단 `_output_mode`
           주석 참조. 그래서 그 섹션에 값을 더 붙이지 않고 섹션을 따로 둔다.
-        ⚠ 다른 세 섹션은 한 줄 2칸인데 여기만 **2×2**다. `_pair_row()`를 두 번 써서
-          두 줄을 만든다 — 한 줄에 4칸을 넣으면 카드 폭이 설명 두 줄을 못 버틴다
+        ⚠ 다른 세 섹션은 한 줄 2칸인데 여기만 **2칸 × 3줄**이다(값이 다섯). `_pair_row()`를
+          줄마다 써서 쌓는다 — 한 줄에 셋 이상을 넣으면 카드 폭이 설명 두 줄을 못 버틴다
           (설정 칸 최소폭 함정: memory `setup-panel-equal-grid-qt-traps`).
+        ⚠ 홀수라 마지막 줄에 빈 칸이 생긴다. **stretch로 채운다** — 비워 두면 남은 카드
+          하나가 줄 전체 폭으로 늘어나 위 줄들과 칸 폭이 어긋난다.
         """
         lay = QVBoxLayout()
         lay.setContentsMargins(0, 0, 0, 0)
@@ -451,17 +704,22 @@ class SetupPanel(QWidget):
 
         self._out_cards = {}
         row = None
+        n = len(self._OUTPUT_CARDS)
         for i, (mode, icon, title, desc, _sum) in enumerate(self._OUTPUT_CARDS):
             if i % 2 == 0:
                 row = self._pair_row()
+                row.setSpacing(_ROW_GAP)
                 lay.addLayout(row, 1)
             card = self._make_choice_card(icon, title, None, desc,
                                           mode == self._output_mode)
-            # ⚠ 람다 기본값으로 mode를 묶는다 — 늦은 바인딩이면 네 카드가 전부
+            # ⚠ 람다 기본값으로 mode를 묶는다 — 늦은 바인딩이면 카드가 전부
             #   마지막 값을 고르게 된다.
             card.mousePressEvent = lambda _e, m=mode: self._select_output_mode(m)
             self._out_cards[mode] = card
             row.addWidget(card, 1)
+            if i == n - 1 and n % 2 == 1:
+                row.addStretch(1)      # 홀수 마지막 줄의 빈 칸(위 ⚠)
+        lay.setSpacing(_ROW_GAP)
         return lay
 
     def _select_output_mode(self, mode: str):
@@ -482,7 +740,7 @@ class SetupPanel(QWidget):
           확인할 곳이 사라진다. 윤문·자동 일괄 적용과 같은 잠금 관용구다 — 토글을 끄는
           경로를 UI에서 막고, `get_options`에서 한 번 더 곱해 새어 나가지 못하게 한다.
         """
-        lock = self._output_mode != "hwp"
+        lock = self._output_mode not in self.MODIFY_MODES
         tg = self._tog_errata
         if lock:
             tg.set_on(True, emit=False)
@@ -677,14 +935,15 @@ class SetupPanel(QWidget):
             "scope_polish":   self._scope_polish and POLISH_ENABLED,
             # ⚠ 한글 미반영 모드면 강제 True — 이게 없으면 산출물이 반쪽인 조합이
             #   생긴다(UI 잠금과 이중 안전장치. _sync_errata_lock 주석 참조).
-            "gen_errata":     self._gen_errata or self._output_mode != "hwp",
+            "gen_errata":     (self._gen_errata
+                               or self._output_mode not in self.MODIFY_MODES),
             "deep_screening": True,   # 사전 원문 스크리닝은 항상 수행됨
             "auto_apply":     self._auto_apply and AUTO_APPLY_ENABLED,
             # ★결과물 축 — 새 분기는 **이 값**을 볼 것(클래스 상단 주석 참조).
             "output_mode":    self._output_mode,
             # 파생값(하위 호환) — "한글 파일을 고치지 않는다"만 뜻한다. 어느 산출물인지
             #   구분하지 못하므로 새 분기에 쓰지 말 것.
-            "errata_only":    self._output_mode != "hwp",
+            "errata_only":    self._output_mode not in self.MODIFY_MODES,
         }
 
     def refresh_theme(self):

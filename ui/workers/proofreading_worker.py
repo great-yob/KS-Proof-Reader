@@ -22,6 +22,7 @@ from core import (
 from core.models import HL_DICT, HL_TYPO
 from core.correction_engine import build_engine
 from core import ai_guards
+from core import user_dict_file
 
 
 # AI(생성) 과교정 가드 4종(비한글 잘라내기·괄호 구조·영문 병기·캡션 대량삭제)은
@@ -171,6 +172,23 @@ class ProofreadingWorker(QThread):
             log(f"  그중 실제 각주 {len(footnote_lines)}줄 — 미리보기에 '각주'로 표시합니다.")
         self._emit_pct(8, "텍스트 추출 완료")
 
+        # [1.5] 사용자 첨부 사전 — **모든 교정 로직의 최선행 계층**(사용자 지시 2026-09-03).
+        #     엑셀이 첨부되지 않았으면 udict가 None이라 이 기능은 통째로 잠들어 있고
+        #     기존 파이프라인이 한 글자도 달라지지 않는다(옵션 부재 = 기존 동작).
+        #     첨부됐으면 두 가지가 동시에 켜진다:
+        #       ① 사용자가 적은 원문→교정문이 그대로 교정 카드가 된다([4.6]에서 주입).
+        #       ② 그 사전에 등재된 낱말은 다른 어떤 계층도 고칠 수 없다(보호막).
+        #     ⚠ 여기서 **먼저** 읽는 이유는 ②가 사전 스크리닝([2])보다 앞서야 하기 때문이다.
+        #       스크리닝 결과는 AI 프롬프트 컨텍스트로 들어가므로, 보호 낱말이 '미등재어'로
+        #       실려 나가면 AI에게 고치라고 권하는 셈이 된다.
+        udict = None
+        _udict_path = opts.get("user_dict_path") or ""
+        if _udict_path:
+            udict = user_dict_file.load(_udict_path, logger=log)
+            if udict is not None and not udict:
+                log("  [사용자 사전] 사용할 수 있는 항목이 없습니다 — 기존 교정 로직만 수행합니다")
+                udict = None
+
         # [2] 사전 인프라 준비 + 1차 원문 스크리닝 (항상 ON — 사전이 기본 베이스)
         #     ▸ 사전은 "항상 켜는 기본 도구"다. 원문을 직접 훑어 미등재어(=비단어)를
         #       탐지하는 1차 스크리닝(①)을 매 실행 수행한다 — AI on/off와 무관.
@@ -219,6 +237,22 @@ class ProofreadingWorker(QThread):
                     "    ※ 대부분은 작가 의도 어휘(캐릭터명·외래어·전문용어). "
                     "AI가 진짜 오탈자만 골라 교정하고, AI가 놓친 미등재어는 '검수 필요' 카드로 띄웁니다."
                 )
+
+        # [2.5] 사용자 사전 보호 — 등재 용어를 스크리닝 결과에서 **먼저** 뺀다.
+        #   suspicious_words는 (a) AI 프롬프트 컨텍스트와 (b) 사전 안전망 카드([6])의
+        #   씨앗을 겸한다. 사용자가 "이 표기가 맞다"고 적어 낸 낱말을 '미등재어'로 실어
+        #   보내면 AI에게 고치라고 권하는 셈이고, 안전망은 이미 답이 나온 낱말에 '검수
+        #   필요' 카드를 띄운다. 둘 다 여기서 한 번에 끊는다.
+        #   ⚠ 이건 프롬프트를 바꾸는 게 아니라 **목록에서 빼는** 것이다 — 프롬프트 본문·
+        #     순서 변경은 실측으로 금지돼 있다(memory `gemini-call-hardening-and-prompts`).
+        if udict is not None and suspicious_words:
+            _before = len(suspicious_words)
+            suspicious_words = [sw for sw in suspicious_words
+                                if not udict.covers(sw.split(" (", 1)[0].strip())]
+            _removed = _before - len(suspicious_words)
+            if _removed:
+                log(f"  [사용자 사전] 등재 용어 {_removed}건을 미등재어 목록에서 제외 "
+                    "(AI 컨텍스트·검수 카드에서 함께 빠짐)")
 
         # 스크리닝 결과를 (어휘, clean, 사유) 구조로 1회 파싱 — 안전망/검수 모드 공용.
         #   suspicious_words 포맷: "어휘 (사유)" (nikl_dict.extract_suspicious_words).
@@ -504,6 +538,34 @@ class ProofreadingWorker(QThread):
             except Exception as e:
                 log(f"  [일관성] 후처리 실패 (스킵): {e}")
             self._emit_pct(73, "일관성 보정 완료")
+
+        # [4.6] 사용자 사전 주입 — 사용자가 적은 교정을 목록에 넣고, 같은 자리에서
+        #     보호에 걸리는 다른 교정을 즉시 걷어낸다.
+        #     ⚠ 순서가 셋 다 이유가 있다:
+        #       · [4.5] **뒤** — 일관성 패스는 청크 간 비결정성을 메우려고 변형(조사형 등)을
+        #         복제해 퍼뜨린다. 사용자 사전 카드는 부분문자열로 이미 조사형까지 덮으므로
+        #         앞에 두면 같은 자리에 카드가 두 벌 생긴다.
+        #       · [5] **앞** — 뒤에 두면 사전 재검증이 끝난 목록에 끼어들어 검증을 못 받은
+        #         카드가 섞인다(재검증은 사용자 사전 카드를 건드리지 않지만, 보호에 걸린
+        #         다른 계층의 교정은 여기서 죽어야 [5.6]~[9]가 그 위에 쌓지 않는다).
+        #       · 마지막 방어선은 직렬화 직전의 [9.7]이다 — 여기 이후에도 결정론 패스가
+        #         계속 카드를 만들기 때문에, 이 한 번만으로는 보호가 완결되지 않는다.
+        if udict is not None and not self._stop.is_set():
+            ud_cards = udict.build_corrections(text, logger=log)
+            # 사용자 사전이 이미 말한 원문은 다른 계층 카드보다 우선한다 — 같은 original을
+            #   두 카드가 들고 있으면 적용 단계에서 어느 쪽이 이길지 정의되지 않는다.
+            _ud_orig = {c.original for c in ud_cards}
+            _shadowed = [c for c in merged if c.original in _ud_orig]
+            if _shadowed:
+                _sid = {id(c) for c in _shadowed}
+                merged = [c for c in merged if id(c) not in _sid]
+            merged.extend(ud_cards)
+            if ud_cards:
+                log(f"  [사용자 사전] 본문에서 찾은 등재 교정 {len(ud_cards)}건 추가 "
+                    "(수락 상태로 표시됩니다)")
+            if _shadowed:
+                log(f"  [사용자 사전] 같은 원문을 다르게 고치려던 교정 {len(_shadowed)}건 대체")
+            merged, _ud_dropped = udict.filter_conflicts(merged, logger=log)
 
         # [5] 사전 재검증 (3차) — 항상 수행 (DB 사용 가능 시).
         #     AI가 비표준어로 교정하면 confidence=low로 낮춰 과교정을 억제한다.
@@ -1667,6 +1729,15 @@ class ProofreadingWorker(QThread):
                 log(f"  → 안전망 재개방 {len(revived)}건 — AI 교정이 뒤에서 제외돼 "
                     f"근거가 사라진 미등재어를 검수 카드로 복구")
 
+        # [9.7] 사용자 사전 보호 — **마지막 관문**. [4.6] 이후에도 결정론 패스가 계속
+        #     카드를 만든다([5.6] 사내 페어 · [5.7] 규범표기 · [5.8] 어문 규범 · [6] 안전망 ·
+        #     [7] 띄어쓰기 백스톱 · [7.5] 실단어 · [9.2] 이음매 · [9.6] 안전망 재개방).
+        #     계층마다 검사를 심으면 새 계층이 생길 때마다 빠뜨린다 — 목록이 확정되는
+        #     이 자리에서 한 번 훑는 편이 구조적으로 안전하다(판정식은 user_dict_file
+        #     한 곳뿐이므로 두 번 부른다고 어긋나지 않는다).
+        if udict is not None and merged and not self._stop.is_set():
+            merged, _late = udict.filter_conflicts(merged, logger=log)
+
         # ⚠ **취소 재확인 — 부분 결과를 '정상 완료'로 내보내지 않는다.**
         #   [4]~[9.5]의 각 계층은 `self._stop`이 서면 개별적으로 **조용히 건너뛴다**.
         #   여기서 막지 않으면 사전 재검증([5])·문서 대조 검증([9.5])·이음매 정합([9.2])이
@@ -1710,7 +1781,11 @@ class ProofreadingWorker(QThread):
                 "consistency_flip": c.consistency_flip,   # 검수 패널 '반대 표기로 통일'
                 "spacing_family": list(c.spacing_family),  # 검수 패널 '표기 일관성 제안' 가족 근거
                 "junction_group": c.junction_group,       # 검수 패널 이음매 그룹 전파
-                "status":    "pending",
+                # ★사용자 사전 카드만 **수락 상태로** 검수 화면에 등장한다(사용자 지시
+                #   2026-09-03) — 사용자가 직접 적어 낸 목록이라 다시 물을 이유가 없다.
+                #   거절·직접수정은 그대로 가능하다(검수 패널의 일반 카드와 동일 경로).
+                "status":    ("accepted" if c.source == user_dict_file.SOURCE
+                              else "pending"),
             }
             for i, c in enumerate(merged)
         ]

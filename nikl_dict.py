@@ -787,6 +787,15 @@ class KoreanDictValidator:
                 result.append(item)
                 continue
 
+            # 사용자 첨부 사전(core/user_dict_file)은 재검증 대상이 아니다 — 사내 예외
+            #   화이트리스트(아래 ud_mod.is_exception)와 같은 취지이되 더 강하다. 사용자가
+            #   그 원고를 보고 직접 적어 낸 표기라, 사전에 없다고 low로 떨구면 검수 카드가
+            #   '검수 필요' 배지를 달고 뜬다(review_panel._needs_review) — 사용자에게 이미
+            #   답한 것을 되묻는 셈이다.
+            if item.source == "user_dict":
+                result.append(item)
+                continue
+
             # 델타 기준 — 이 교정이 '새로 만들거나 바꾼' 어절만 검증한다.
             #   원문에 이미 있던 토큰(예: 미등재 외래어 '모즈얀')은 이 교정의 책임이
             #   아니므로 페널티에서 제외한다. 조사 중복 삭제·띄어쓰기처럼 인접 미등재어를

@@ -39,18 +39,26 @@ class ApplyWorker(QThread):
         self.known_pages = known_pages or {}
         # 등장 좌표계 보정표 — `_plan_occurrences`가 채운다(교정본 모드에서만).
         self._occ_plan = {}
-        # ★결과물 축 — "hwp" | "errata" | "memo" | "pdf" (setup_panel `_output_mode`).
+        # ★결과물 축 — "hwp" | "hwp_memo" | "errata" | "memo" | "pdf"
+        #   (setup_panel `_output_mode`).
         #   ⚠ 구버전 옵션(`errata_only` bool)만 오는 호출도 살려 둔다 — 그 값은 "한글
         #     파일을 고치지 않는다"만 뜻하므로 'errata'로 해석한다.
         self.output_mode = self._resolve_mode(options)
         # 파생값 — 한글 파일 무수정 여부. 새 분기는 `output_mode`를 볼 것.
-        self.errata_only = self.output_mode != "hwp"
+        self.errata_only = self.output_mode not in self.MODIFY_MODES
+        # ★'교정본+메모' 추가 실행 — 입력 파일이 **이미 치환된 교정본**이라는 뜻.
+        #   그 경우 치환 단계를 건너뛰고 메모만 단다(같은 자리를 두 번 고치지 않는다).
+        self.source_is_corrected = bool((options or {}).get("source_is_corrected"))
         self._stop       = threading.Event()
+
+    # 한글 본문 글자를 **실제로 바꾸는** 모드. `applied`·`_occ_plan`·S3/S4 재분류가
+    #   전부 이 집합을 기준으로 갈린다 — 새 모드를 더할 땐 여기부터 볼 것.
+    MODIFY_MODES = ("hwp", "hwp_memo")
 
     @staticmethod
     def _resolve_mode(options: dict) -> str:
         mode = (options or {}).get("output_mode")
-        if mode in ("hwp", "errata", "memo", "pdf"):
+        if mode in ("hwp", "hwp_memo", "errata", "memo", "pdf"):
             return mode
         return "errata" if (options or {}).get("errata_only") else "hwp"
 
@@ -91,11 +99,16 @@ class ApplyWorker(QThread):
         errata_only = self.errata_only
         # 실제로 '치환'을 보낼 목록. 교정본 모드가 아니면 비운다 — `real_corrections`
         #   자체는 '수락한 실제 교정'이라는 뜻 그대로 두어야 집계·로그가 진실을 말한다.
-        apply_targets = real_corrections if mode == "hwp" else []
+        #   ⚠ 'hwp_memo' 추가 실행(source_is_corrected)은 입력이 이미 교정본이라
+        #     치환을 다시 하지 않는다 — 메모만 단다.
+        apply_targets = (real_corrections
+                         if mode in self.MODIFY_MODES and not self.source_is_corrected
+                         else [])
         # 메모·PDF 주석의 대상 — 치환은 안 하지만 '어디에 무엇을 적을지'는 같은 목록이다.
         #   ⚠ 검수 플래그(dict_flag)도 주석 대상에 넣는다. 고칠 말은 없어도 "여기 확인
         #     하세요"가 편집자에게 필요한 정보이고, 정오표에는 이미 '확인 필요'로 실린다.
-        annot_targets = (real_corrections + flag_accepted) if mode in ("memo", "pdf") else []
+        annot_targets = ((real_corrections + flag_accepted)
+                         if mode in ("memo", "pdf", "hwp_memo") else [])
 
         # ★겹치는 교정의 **자리 단위 합성** — 네 산출물이 같은 문자열 하나를 말하게 한다.
         #   (mode와 무관하게 먼저 계산한다 — 정오표·메모·주석이 전부 이 결과를 쓴다.)
@@ -105,7 +118,8 @@ class ApplyWorker(QThread):
                 f"흡수된 등장 {len(self._absorbed)}곳")
 
         # ★등장 좌표계 보정 — **교정본 모드에서만**(아래 `_plan_occurrences` 주석).
-        self._occ_plan = self._plan_occurrences(apply_targets) if mode == "hwp" else {}
+        self._occ_plan = (self._plan_occurrences(apply_targets)
+                          if mode in self.MODIFY_MODES else {})
 
         correction_objs = [
             Correction(
@@ -121,6 +135,9 @@ class ApplyWorker(QThread):
         ]
 
         stats, detail = {}, []
+        # ★결합 모드('교정본+메모')의 **메모 쪽** 결과. 치환 detail과 섞으면 정오표가
+        #   같은 자리를 두 번 적는다 — 수치 집계에만 쓴다.
+        memo_detail = []
         out_hwp = ""
         out_pdf = ""
         pdf_report = {}
@@ -208,13 +225,39 @@ class ApplyWorker(QThread):
                     log(f"  적용 결과: 적용 {ok_count}건 · 본문 {occ_count}항목 치환 "
                         f"· 실패 {stats.get('fail', 0)}건")
 
-                    # 교정본 저장
-                    base, ext = os.path.splitext(self.file_path)
-                    out_hwp = base + "_교정본" + ext
-                    log(f"  저장 중: {os.path.basename(out_hwp)}")
-                    editor.save_as(out_hwp)
-                    log(f"  ✓ 저장 완료")
-                    self.progress.emit(85, "교정본 저장 완료")
+                    if mode == "hwp_memo":
+                        # ★결합 모드 — 치환한 자리에 그대로 메모까지 단다. 저장은
+                        #   메모 단계가 한 번만 한다(중간 저장본을 남기지 않는다).
+                        replaced_by = {d.get("original", ""): int(d.get("replaced", 0))
+                                       for d in detail if d.get("applied")}
+                        stats2, detail2, out_hwp = self._run_memo(
+                            editor, annot_targets, log, pages_by_original,
+                            anchor_corrected=True, replaced_by=replaced_by,
+                            reindex_first=True,
+                            out_path=self._hwp_out_path("_교정본(메모)"))
+                        memo_detail = detail2
+                        if self._stop.is_set():
+                            return
+                    else:
+                        # 교정본 저장
+                        out_hwp = self._hwp_out_path("_교정본")
+                        log(f"  저장 중: {os.path.basename(out_hwp)}")
+                        editor.save_as(out_hwp)
+                        log(f"  ✓ 저장 완료")
+                        self.progress.emit(85, "교정본 저장 완료")
+
+                elif (mode == "hwp_memo" and self.source_is_corrected
+                        and annot_targets and not self._stop.is_set()):
+                    # ★'교정본에 메모 추가' — 입력이 이미 교정본이라 치환은 없다.
+                    #   앵커는 교정문이고, 우리가 고친 자리는 빨갛게 칠해져 있으므로
+                    #   그 색으로 자리를 가린다(브리지 `_match_is_red`).
+                    stats, memo_detail, out_hwp = self._run_memo(
+                        editor, annot_targets, log, pages_by_original,
+                        anchor_corrected=True,
+                        out_path=self._hwp_out_path("_교정본(메모)"))
+                    detail = memo_detail
+                    if self._stop.is_set():
+                        return
 
                 elif mode == "memo" and annot_targets and not self._stop.is_set():
                     stats, detail, out_hwp = self._run_memo(
@@ -258,7 +301,8 @@ class ApplyWorker(QThread):
         #   '긴 교정에 먹힘'도 '부분 반영'도 성립하지 않는다 — 그 판정을 돌리면 메모를
         #   못 단 자리(머리말 등)가 '부분 반영 실패'로 둔갑해 거짓 경고가 된다.
         consumed_cnt, partial_cnt, partial_samples = (
-            self._reclassify(detail, real_corrections, log) if mode == "hwp"
+            self._reclassify(detail, real_corrections, log)
+            if mode in self.MODIFY_MODES and not self.source_is_corrected
             else (0, 0, []))
 
         # 정오표 데이터 — 검수 패널의 '등장별 결정'과 브리지의 '등장별 실제 적용 결과'를
@@ -324,8 +368,12 @@ class ApplyWorker(QThread):
         #   ⚠ `applied`는 **한/글 본문 글자를 실제로 바꾼 건수**라는 뜻을 넓히지 않는다.
         #     완료 화면이 그 값으로 '적용 N건'을 그리므로, 메모·주석 수를 여기 담으면
         #     고치지도 않은 문서를 고쳤다고 보고하게 된다. 각자 자기 칸에 싣는다.
-        n_memo     = sum(d.get("memoed", 0) for d in detail) if mode == "memo" else 0
-        n_blocked  = sum(d.get("blocked", 0) for d in detail) if mode == "memo" else 0
+        #   ⚠ 결합 모드('교정본+메모')는 메모 결과가 `memo_detail`에 따로 있다 —
+        #     `detail`은 치환 결과라 `applied`/`occurrences`가 그걸 쓴다.
+        _memo_src = (memo_detail if mode == "hwp_memo"
+                     else detail if mode == "memo" else [])
+        n_memo     = sum(d.get("memoed", 0) for d in _memo_src)
+        n_blocked  = sum(d.get("blocked", 0) for d in _memo_src)
         n_annot    = int((pdf_report or {}).get("annotated") or 0)
         # ★수락했는데 **표시하지 못한 자리** — 교정본의 '부분 반영'에 해당하는 수치다.
         #   메모 불가(머리말)·PDF 미탐·문서에서 못 찾은 등장을 한 숫자로 모은다.
@@ -338,9 +386,12 @@ class ApplyWorker(QThread):
                 f"{n_unmarked}곳 · 정오표에 사유 기록")
 
         self.finished.emit({
-            "applied":      ok_cnt if mode == "hwp" else 0,
+            "applied":      ok_cnt if mode in self.MODIFY_MODES else 0,
+            # ⚠ 추가 실행('교정본에 메모 추가')은 **치환을 하지 않았다** — detail이
+            #   메모 결과라 그대로 세면 고치지도 않은 자리를 고쳤다고 보고하게 된다.
             "occurrences":  (sum(d.get("replaced", 0) for d in detail if d.get("applied"))
-                             if mode == "hwp" else 0),
+                             if mode in self.MODIFY_MODES and not self.source_is_corrected
+                             else 0),
             "failed":       fail_cnt,
             "consumed":     consumed_cnt,
             "partial":      partial_cnt,
@@ -761,9 +812,27 @@ class ApplyWorker(QThread):
         return annotation_body(c.get("original", ""), self._corrected_of(c),
                                c.get("category", ""), c.get("reason", ""))
 
+    def _hwp_out_path(self, suffix: str) -> str:
+        """산출 한글 파일 경로. 추가 실행이 **교정본을 입력으로** 받은 경우에도 이름이
+        `…_교정본_교정본(메모)`으로 겹치지 않도록 원본 기준 경로를 옵션으로 받는다."""
+        forced = (self.options or {}).get("hwp_output_path")
+        if forced:
+            return forced
+        base, ext = os.path.splitext(self.file_path)
+        return base + suffix + ext
+
     def _run_memo(self, editor, targets: list, log,
-                  pages_by_original: dict = None) -> tuple:
-        """메모 모드 — 원고 글자를 바꾸지 않고 각 자리에 한/글 메모를 단다.
+                  pages_by_original: dict = None, *,
+                  anchor_corrected: bool = False, replaced_by: dict = None,
+                  out_path: str = "", reindex_first: bool = False) -> tuple:
+        """메모 모드 — 각 자리에 한/글 메모를 단다.
+
+        ★`anchor_corrected`는 '교정본+메모'(output_mode="hwp_memo") 전용이다. 그 모드는
+          **치환이 끝난 문서**에 메모를 달므로 앵커가 원문이 아니라 **교정문**이어야 한다
+          — 원문은 이미 문서에 없다. 대신 교정문은 원래부터 그 표기였던 자리에도 있으므로
+          브리지가 **빨간 글자색**으로 우리가 고친 자리만 고른다(`_match_is_red`).
+          `skip_occurrences`도 넘기지 않는다 — 거절·제외는 치환 단계가 이미 반영했고,
+          문서에 남은 빨간 자리가 곧 '반영된 자리'다.
 
         ★`pages_by_original`(치환 전 문서에서 실제로 찾은 등장)을 함께 넘긴다 —
           브리지가 등장 상한을 그 수로 잡아 교정본·PDF와 **같은 자리 집합**을 돈다
@@ -773,6 +842,15 @@ class ApplyWorker(QThread):
           컨트롤을 만들 수 없다). 조용히 넘어가면 '메모본이라는데 메모가 없는 파일'이
           나오므로 명시적으로 알리고 정오표만 남긴다.
         """
+        # ★치환 **직후**의 문서는 찾기 색인이 낡아 있다(메모 컨트롤이 색인을 낡게 하는
+        #   것과 같은 부류 — hwp_editor._reindex_document 헤더). 결합 모드는 방금 수백
+        #   곳을 바꿨으므로 첫 묶음 전에 한 번 새로 만든다. 실패해도 그대로 잇는다.
+        if reindex_first:
+            try:
+                editor._reindex_document(log)
+            except Exception as exc:
+                log(f"  [메모] 문서 재색인 실패 — 그대로 진행: {exc}")
+
         inserter = getattr(editor, "insert_memos", None)
         if inserter is None:
             log("  [메모] 이 백엔드는 메모를 달 수 없습니다 — 정오표만 생성합니다")
@@ -781,18 +859,50 @@ class ApplyWorker(QThread):
         # ⚠ `color`를 넘기지 않는다 — 메모 모드는 앵커 글자색도 바꾸지 않는다
         #   (사용자 지정 2026-08-07). 원고는 글자도 서식도 그대로다.
         located = pages_by_original or {}
-        memo_items = [{
-            "original":  c["original"],
-            # ⚠ 겹침이 있으면 **합성 결과**를 적는다 — 교정본이 만들 문자열과 같아야 한다.
-            "corrected": self._corrected_of(c),
-            "reason":    c.get("reason", ""),
-            "source":    c.get("source", "dict"),
-            # ⚠ 치환용 skip이 아니라 **표시용 skip**이다(겹치는 등장까지 뺀다).
-            "skip_occurrences": self._annot_skip_for(c),
-            "memo_text": self._memo_text(c),
-            "occ_total": int(c.get("occurrences") or 0),
-            "doc_occ":   len(located.get(c["original"]) or ()),
-        } for c in targets]
+        replaced_by = replaced_by or {}
+        memo_items = []
+        for c in targets:
+            orig, corr = c["original"], self._corrected_of(c)
+            # 검수 카드(치환 없음)는 글자가 그대로라 앵커도 원문 그대로다 — 빨강도 없다.
+            is_flag = (corr == orig)
+            if anchor_corrected and not is_flag:
+                # 실제로 치환된 자리 수 = 상한. 치환 결과를 모르는 추가 실행에서는
+                #   '표시 대상 등장 수'(등장 − 표시용 skip)로 어림한다.
+                n = replaced_by.get(orig)
+                if n is None:
+                    # 추가 실행 — 치환 결과가 없으므로 '표시 대상 등장 수'로 어림한다.
+                    #   ⚠ 0이면 브리지가 안전 상한(_MEMO_MAX_OCC)까지 훑어 엉뚱한 자리를
+                    #     맴돈다. 문서에서 실제로 센 등장 수를 차선으로 쓴다.
+                    n = max(0, int(c.get("occurrences") or 0)
+                            - len(self._annot_skip_for(c)))
+                    if not n:
+                        n = len(located.get(orig) or ())
+                memo_items.append({
+                    "original":  corr,          # ★앵커 = 교정문(문서에 실재하는 문자열)
+                    "corrected": corr,
+                    "reason":    c.get("reason", ""),
+                    "source":    c.get("source", "dict"),
+                    "skip_occurrences": [],
+                    "memo_text": self._memo_text(c),
+                    "occ_total": n,
+                    "doc_occ":   n,
+                    "red_only":  True,
+                    # 정오표·집계가 원문 기준으로 맞물리도록 원래 문자열을 함께 싣는다.
+                    "anchor_of": orig,
+                })
+                continue
+            memo_items.append({
+                "original":  orig,
+                # ⚠ 겹침이 있으면 **합성 결과**를 적는다 — 교정본이 만들 문자열과 같아야 한다.
+                "corrected": corr,
+                "reason":    c.get("reason", ""),
+                "source":    c.get("source", "dict"),
+                # ⚠ 치환용 skip이 아니라 **표시용 skip**이다(겹치는 등장까지 뺀다).
+                "skip_occurrences": self._annot_skip_for(c),
+                "memo_text": self._memo_text(c),
+                "occ_total": int(c.get("occurrences") or 0),
+                "doc_occ":   len(located.get(orig) or ()),
+            })
 
         def progress_cb(current, total):
             if total > 0:
@@ -817,8 +927,7 @@ class ApplyWorker(QThread):
             #   앵커와 겹치는 자리는 `InsertText`가 죽는다(hwp_editor._reindex_document).
             log(f"  [메모] 메모를 달지 못한 자리 {n_blocked}곳 · 정오표에 사유 기록")
 
-        base, ext = os.path.splitext(self.file_path)
-        out_hwp = base + "_메모본" + ext
+        out_hwp = out_path or self._hwp_out_path("_메모본")
         log(f"  저장 중: {os.path.basename(out_hwp)}")
         editor.save_as(out_hwp)
         log("  ✓ 저장 완료")
@@ -913,8 +1022,9 @@ class ApplyWorker(QThread):
 
         ⚠ 화면 로그 규약: `[태그]` + `n건`, 개별 예시 금지(activity_panel 참조).
         """
-        tag = {"errata": "정오표만", "memo": "메모", "pdf": "PDF 주석"}.get(mode, "정오표만")
-        if mode != "hwp":
+        tag = {"errata": "정오표만", "memo": "메모", "pdf": "PDF 주석",
+               "hwp_memo": "교정본+메모"}.get(mode, "정오표만")
+        if mode not in ApplyWorker.MODIFY_MODES:
             return (f"  [{tag}] 한글 파일을 수정하지 않습니다 "
                     f"· 반영 필요 {len(real_corrections)}건 · 검수 {len(flag_accepted)}건")
         return (f"  [{tag}] 적용할 교정이 없습니다 "

@@ -55,7 +55,8 @@ from ui.styles.theme import current_palette, current_mode, local_qss
 
 # 오류 유형 폴백 라벨(검수 카드와 동일 언어 — review_panel._SOURCE_LABEL과 맞춤)
 _SOURCE_LABEL = {"dict": "사전검증", "ai_typo": "AI 오탈자", "ai_polish": "AI 윤문",
-                 "dict_flag": "검수 필요", "spacing": "띄어쓰기", "punct": "문장부호"}
+                 "dict_flag": "검수 필요", "spacing": "띄어쓰기", "punct": "문장부호",
+                 "user_dict": "사용자 사전"}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1543,14 +1544,14 @@ class ResultPanel(QWidget):
     def _out_mode(self) -> str:
         r = self._result or {}
         m = r.get("output_mode")
-        if m in ("hwp", "errata", "memo", "pdf"):
+        if m in ("hwp", "hwp_memo", "errata", "memo", "pdf"):
             return m
         return "errata" if r.get("errata_only") else "hwp"
 
     def _marked_count(self) -> int:
         """이 모드가 실제로 '표시한' 자리 수(곳). 정오표만 모드는 표시 개념이 없다."""
         r = self._result or {}
-        return int((r.get("memoed") if self._out_mode() == "memo"
+        return int((r.get("memoed") if self._out_mode() in ("memo", "hwp_memo")
                     else r.get("annotated") if self._out_mode() == "pdf"
                     else 0) or 0)
 
@@ -1571,6 +1572,8 @@ class ResultPanel(QWidget):
     _OUT_META = {
         "hwp":    ("hwp",   "HWP (빨간색)",  "교정본",
                    "원고에 반영 + 빨간색 표시", "교정본"),
+        "hwp_memo": ("memo", "HWP (빨간색+메모)", "교정본+메모",
+                     "원고에 반영 + 빨간색 + 메모", "교정본+메모"),
         "memo":   ("memo",  "HWP (메모)",    "메모본",
                    "원고에 미반영 + 메모로 표시", "메모"),
         "pdf":    ("pdf",   "PDF (주석)",    "주석본",
@@ -1578,7 +1581,7 @@ class ResultPanel(QWidget):
         "errata": ("excel", "Excel (정오표)", "정오표",
                    "페이지 + 수정 전 · 후 기록", "정오표만"),
     }
-    _OUT_ORDER = ("hwp", "memo", "pdf", "errata")
+    _OUT_ORDER = ("hwp", "hwp_memo", "memo", "pdf", "errata")
 
     def _produced_modes(self) -> set:
         """이미 만들어진 결과물 — 1차 실행 + 추가 실행 + 1차가 동봉한 정오표.
@@ -1611,6 +1614,13 @@ class ResultPanel(QWidget):
         if mode == "hwp":
             return (f"적용 {int(d.get('applied', 0)):,}건 "
                     f"· 본문 {int(d.get('occurrences', 0)):,}항목")
+        if mode == "hwp_memo":
+            # 결합 모드는 **두 가지를 다** 했다 — 한쪽만 적으면 나머지를 안 한 줄로 읽힌다.
+            #   ⚠ 추가 실행('교정본에 메모 추가')은 치환을 다시 하지 않으므로 적용 수치가
+            #     0이다. 그때는 메모 수치만 적는다.
+            n_app = int(d.get("applied", 0))
+            memo = f"메모 {int(d.get('memoed', 0)):,}항목"
+            return (f"적용 {n_app:,}건 · {memo}" if n_app else memo)
         if mode == "memo":
             # ⚠ 못 단 자리는 `unmarked`로 적는다 — `memo_blocked`는 한/글이 거부한 자리만
             #   세어서, **문서에서 등장을 못 찾아** 지나간 자리가 빠진다. 그러면 화면의

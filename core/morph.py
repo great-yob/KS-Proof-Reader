@@ -15,6 +15,7 @@ kiwipiepy(순수 C++, JVM 불필요)로 표면형을 형태소 분석해 내용 
 
 import re
 import threading
+from functools import lru_cache
 
 # 내용 형태소(어휘 의미를 갖는) 태그 — 조사(JK*)·어미(E*)·기호(S*) 등은 제외.
 #   V : 용언(동사 VV·형용사 VA·보조용언 VX, 불규칙 VV-I/VA-I 포함) → 기본형에 '다' 부착
@@ -334,6 +335,96 @@ def noun_josa_split(text: str, eojeol: str, max_occurrences: int = 4):
         if base and len(base) < len(eojeol):
             return base
     return None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ▌복합명사 붙여쓰기 판정 — 사용자 첨부 사전의 '띄어쓰기 통일' 규칙 전용
+# ══════════════════════════════════════════════════════════════════════════
+# 사용자 사전(core/user_dict_file)의 경계 규칙은 `' 기술' → '기술'`처럼 **공백 하나를
+#   지우라**는 지시다. 그런데 이걸 문자열 그대로 문서 전체에 적용하면 복합명사가 아닌
+#   자리까지 붙는다 — 실측(2026-09-03 · 실파일H · 규칙 2개
+#   → 174곳)에서 '한다. 기술'·'정책, 기술'·'하는 기술을'·'및 기술과'·'각 기술'처럼
+#   **명백히 틀린 자리가 절반을 넘었다.** 그 카드들이 전부 수락 상태로 뜨므로 그대로 두면
+#   사용자가 100장 가까이 거절해야 한다. 그래서 양옆 어절을 형태소로 보고 거른다.
+#
+# ⚠ 앞말과 뒷말의 기준이 **다르다.** 조사는 복합어 **전체**에 붙으므로,
+#     앞말('인공지능 기술'의 '인공지능') → 조사가 있으면 별개 구(句)라는 증거 ⇒ **불가**
+#     뒷말('인공지능 기술의'의 '기술의') → 조사는 정상 ⇒ **가능**
+#   이 비대칭을 놓치면 '인공지능 기술의'처럼 **맞는 자리가 통째로 막힌다**(실측으로 확인).
+#
+# 붙일 수 있는 태그 — 자립 명사와 한자·외국어·숫자 표기.
+#   ⚠ NNB(의존명사 '시·것·수')는 뺀다. 앞말과 띄어 쓰는 것이 규범이라 붙이면 안 된다.
+#   ⚠ XSN(접미사)·XPN(접두사)는 어절 **안**에서만 나오므로 통과시킨다('기술적'의 '적').
+_JOINABLE = frozenset(("NNG", "NNP", "NR", "SL", "SH", "SN", "XSN", "XPN"))
+
+
+def _tokens_of(word: str):
+    """형태소 토큰 목록(분석 불가·kiwi 미가용이면 None)."""
+    kiwi = _get_kiwi()
+    if kiwi is None or not word:
+        return None
+    try:
+        return kiwi.analyze(word)[0][0] or None
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=8192)
+def is_joinable_left(word: str) -> bool:
+    """붙임의 **앞말**이 될 수 있는가 — 조사·어미 없는 순수 체언인가.
+
+    True 예: '인공지능' '복지지갑' '개인정보' 'AI' '2025'
+    False 예: '하는'(VV+ETM) · '복지지갑의'(+JKG) · '한다.'(EF+SF) · '정책,'(+SP)
+              · '및'(MAJ) · '각'(MM) · '시'(NNB) · '있는'(VA+ETM)
+    ⚠ kiwi 미가용·분석 실패면 False(**보수적 차단**) — '붙일지 말지'를 묻는 판정이라
+      모르면 안 붙이는 쪽이 안전하다.
+    """
+    tokens = _tokens_of(word)
+    return bool(tokens) and all(t.tag.split("-")[0] in _JOINABLE for t in tokens)
+
+
+@lru_cache(maxsize=8192)
+def is_joinable_right(word: str) -> bool:
+    """붙임의 **뒷말**이 될 수 있는가 — 체언(+조사)인가(위 ⚠ 비대칭 참조).
+
+    True 예: '기술' '기술의' '기술을' '기술적' '활용'
+    False 예: '있다'(VA+EF) · '및'(MAJ) · '수'(NNB) · '기술.'(+SF — 바깥쪽 부호는
+              호출부가 떼고 넘긴다)
+    """
+    tokens = _tokens_of(word)
+    if not tokens:
+        return False
+    seen_josa = False
+    for t in tokens:
+        tag = t.tag.split("-")[0]
+        if tag.startswith("J"):
+            seen_josa = True
+            continue
+        if seen_josa or tag not in _JOINABLE:
+            return False        # 조사 뒤에 내용 형태소가 또 오면 한 낱말이 아니다
+    return True
+
+
+@lru_cache(maxsize=8192)
+def is_word_split_point(run: str, offset: int) -> bool:
+    """어절 `run`의 `offset` 자리에서 **띄어 써도 되는가** — 붙임의 반대 방향 판정.
+
+    그 자리에서 시작하는 형태소가 **자립 낱말**일 때만 True다. 조사·어미·접미사 앞에서
+    띄우면 낱말이 부서진다(실측: `'기술' → '기술 '` 규칙이 '기술이'를 **'기술 이'** 로
+    쪼갰다). '정보기술개발과'의 '개발'(NNG) 앞은 True, '기술이'의 '이'(JKS) 앞은 False.
+
+    ⚠ XSN(접미사)은 `_JOINABLE`에 들어 있지만 **쪼갤 수는 없다** — '기술적'을 한 낱말로
+      인정하는 것과 '기술 적'으로 띄우는 것은 다른 문제다.
+    ⚠ kiwi 미가용·분석 실패면 False(**보수적 차단**, is_joinable_left와 같은 이유).
+    """
+    tokens = _tokens_of(run)
+    if not tokens or offset <= 0 or offset >= len(run):
+        return False
+    for t in tokens:
+        if t.start == offset:
+            tag = t.tag.split("-")[0]
+            return tag in _JOINABLE and not tag.startswith("XS")
+    return False        # 형태소 경계가 아님 — 낱말 한가운데를 자르는 자리
 
 
 def nominal_boundaries(run: str):

@@ -109,7 +109,10 @@ def _get_morph():
 #   dict_flag : original==corrected 인 '검수 필요' 카드(치환 아님).
 #   ai_polish : 문장 단위 윤문(재사용 가능한 용어 페어 아님).
 #   punct     : 괄호 짝 맞추기 등 위치 의존 문장부호 교정(재사용 가능한 용어 페어 아님).
-_SKIP_SOURCES = {"dict_flag", "ai_polish", "punct"}
+#   user_dict : 사용자가 첨부한 개인 사전(core/user_dict_file). 그 사람의 이번 원고
+#               결정이지 조직이 합의한 용어가 아니고, **수락 상태로 등장**하므로
+#               사람의 판단이 실린 적 없는 accepted가 학습 큐에 쏟아진다.
+_SKIP_SOURCES = {"dict_flag", "ai_polish", "punct", "user_dict"}
 
 
 def _suggest_src(c: dict) -> str:

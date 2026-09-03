@@ -100,6 +100,8 @@ class MainWindow(QMainWindow):
         self.resize(max(w, min_w), max(h, min_h))
 
         self._file_path = ""
+        # 사용자 첨부 사전(.xlsx) 경로 — 비어 있으면 교정 파이프라인이 그 계층을 건너뛴다.
+        self._dict_path = ""
         self._options = {}
         self._corrections = []
         self._extracted_text = ""
@@ -215,18 +217,21 @@ class MainWindow(QMainWindow):
         from ui.widgets.components import FadingStackedWidget
         self.main_stage = FadingStackedWidget()
 
-        from ui.widgets.setup_panel import FilePanel
-        
+        from ui.widgets.setup_panel import AttachPanel
+
         # 1. Setup View (설정 단계)
         setup_widget = QWidget()
         setup_layout = QHBoxLayout(setup_widget)
         setup_layout.setContentsMargins(24, 24, 24, 24)
         setup_layout.setSpacing(24)
-        
+
         self.setup_panel = SetupPanel()
-        self.file_panel = FilePanel()
+        # 우측 칸 = 첨부 2단(위 한글 원고 : 아래 사용자 사전 = 2 : 1) — AttachPanel 참조.
+        self.attach_panel = AttachPanel()
+        # 기존 호출부 호환 — 이 창의 대부분은 '문서 선택 칸' 하나만 알면 된다.
+        self.file_panel = self.attach_panel
         setup_layout.addWidget(self.setup_panel, 1)
-        setup_layout.addWidget(self.file_panel, 1)
+        setup_layout.addWidget(self.attach_panel, 1)
         # ⚠ 좌우 1:1 **고정** — stretch(1, 1)만으로는 반반이 되지 않는다.
         #   QHBoxLayout은 stretch를 나누기 전에 각 칸의 최소폭(minimumSizeHint)을 먼저
         #   확보하므로, 한쪽 내용이 길어지면 그 칸이 넓어지고 반대쪽이 밀린다.
@@ -235,7 +240,7 @@ class MainWindow(QMainWindow):
         #   가로 정책 Ignored는 sizeHint·최소폭을 0으로 취급시켜 폭이 오직 stretch로만
         #   결정되게 한다 — 내용은 각 패널 안에서 줄이거나(파일명 말줄임) 스크롤한다.
         #   ⚠ 세로 정책은 건드리지 말 것(높이는 그대로 채워야 한다).
-        for _panel in (self.setup_panel, self.file_panel):
+        for _panel in (self.setup_panel, self.attach_panel):
             _sp = _panel.sizePolicy()
             _sp.setHorizontalPolicy(QSizePolicy.Ignored)
             _panel.setSizePolicy(_sp)
@@ -287,7 +292,8 @@ class MainWindow(QMainWindow):
         self.rail.step_clicked.connect(self._on_rail_click)
         self.sidebar.update_clicked.connect(self._open_update_dialog)
 
-        self.file_panel.file_selected.connect(self._on_file_selected)
+        self.attach_panel.file_selected.connect(self._on_file_selected)
+        self.attach_panel.dict_selected.connect(self._on_dict_selected)
         self.setup_panel.options_changed.connect(self._refresh_setup_footer)
 
         self.review_panel.counts_changed.connect(self._on_review_counts)
@@ -357,7 +363,10 @@ class MainWindow(QMainWindow):
             msg = "교정 범위를 1개 이상 선택하세요"
         else:
             msg = f"설정: {self.setup_panel.summary_text()}"
-            
+            # 첨부한 사전은 **모든 교정보다 우선**하므로, 시작 직전 한 줄에 드러낸다.
+            if self._dict_path:
+                msg += " / 사용자 사전 우선"
+
         self.footer.set_idle(msg)
         self.footer.set_primary("교정 분석 시작", enabled=can_start, visible=True, show_reset=True)
 
@@ -387,6 +396,21 @@ class MainWindow(QMainWindow):
         self.activity.log(f"파일 선택: {name}")
         self._show_phase("setup")
 
+    def _on_dict_selected(self, dict_path: str):
+        """사용자 사전(.xlsx) 첨부/해제 — 첨부하면 모든 교정 로직보다 앞선다.
+
+        ⚠ 경로만 들고 있다가 분석 시작 시점에 옵션으로 넘긴다. 여기서 읽어 두면
+          첨부 후 사용자가 엑셀을 고쳐도 옛 내용으로 교정하게 된다 — 실제 교정에
+          쓰는 값은 언제나 워커가 그 시점에 읽은 것이어야 한다(DictPanel._peek 주석).
+        """
+        self._dict_path = dict_path
+        self.attach_panel.set_dict(dict_path)
+        if dict_path:
+            self.activity.log(f"사용자 사전 첨부: {os.path.basename(dict_path)}")
+        else:
+            self.activity.log("사용자 사전 첨부 해제")
+        self._refresh_setup_footer()
+
     # ══════════════════════════════════════════════
     # 푸터 1차 액션 (단계별)
     # ══════════════════════════════════════════════
@@ -412,6 +436,9 @@ class MainWindow(QMainWindow):
         if not self._file_path or not self.setup_panel.scopes_selected():
             return
         self._options = self.setup_panel.get_options()
+        # ★사용자 첨부 사전 — 설정 패널이 아니라 첨부 칸이 출처라 여기서 합류시킨다.
+        #   값이 비면 워커가 이 계층을 통째로 건너뛴다(= 기존 교정 로직 그대로).
+        self._options["user_dict_path"] = self._dict_path
         self._consistency_done = False     # 새 분석 = 표기 일관성 단계도 다시
         self._consistency_logged = False
 
@@ -932,7 +959,7 @@ class MainWindow(QMainWindow):
     #     ③ **1차 실행의 수치를 덮어쓰지 않는다** — `applied`가 "본문 글자를 실제로
     #        바꾼 건수"라는 뜻을 넓히지 않기 위해, 추가분은 `extra_outputs` 목록에 싣는다.
     #     ④ **기존 정오표를 덮어쓰지 않는다** — 모드 이름을 붙인 새 파일로 낸다.
-    _EXTRA_LABEL = {"hwp": "교정본", "memo": "메모본",
+    _EXTRA_LABEL = {"hwp": "교정본", "hwp_memo": "교정본+메모", "memo": "메모본",
                     "pdf": "PDF 주석본", "errata": "정오표"}
 
     def _start_extra_output(self, mode: str):
@@ -956,8 +983,28 @@ class MainWindow(QMainWindow):
         opts["output_mode"] = mode
         # 정오표 잠금 규율(setup_panel._sync_errata_lock)을 여기서도 곱한다 — 한글을
         #   고치지 않는 모드는 '표시하지 못한 자리'를 적을 곳이 정오표뿐이다.
-        opts["gen_errata"] = True if mode != "hwp" else self._options.get("gen_errata", True)
+        opts["gen_errata"] = (self._options.get("gen_errata", True)
+                              if mode in SetupPanel.MODIFY_MODES else True)
         opts["errata_output_path"] = self._extra_errata_path(mode)
+
+        # ★'교정본+메모'는 **이미 만든 교정본 위에** 메모를 단다(사용자 지시 2026-09-03).
+        #   ⚠ 불변식①('산출물은 언제나 원본에서 만든다')의 **유일한 예외**이고, 예외인
+        #     이유가 곧 그 불변식의 근거다: 메모 앵커가 원문이면 교정본에서 찾을 수 없다.
+        #     여기서는 반대로 **교정문**을 앵커로 쓰므로 교정본이라야 찾을 수 있다.
+        #     원본에서 다시 치환하면 같은 결과를 두 번 만들 뿐 아니라, 1차 교정본과
+        #     별개의 파일이 되어 사용자가 어느 쪽을 써야 할지 알 수 없게 된다.
+        src = self._file_path
+        if mode == "hwp_memo":
+            done_hwp = self._result.get("hwp_path") or ""
+            if done_hwp and os.path.exists(done_hwp):
+                src = done_hwp
+                opts["source_is_corrected"] = True
+                # 산출 이름은 **원본 기준**으로 짓는다 — 교정본을 입력으로 받았다고
+                #   `…_교정본_교정본(메모).hwp`가 되면 안 된다.
+                base, ext = os.path.splitext(self._file_path)
+                opts["hwp_output_path"] = base + "_교정본(메모)" + ext
+                self.activity.log("[추가] 이미 만든 교정본에 메모를 답니다 "
+                                  "· 교정 자리(빨간색)만 표시")
 
         self._extra_mode = mode
         self._phase = "extra_running"
@@ -971,7 +1018,7 @@ class MainWindow(QMainWindow):
 
         self._cleanup_worker("_extra_worker")
         self._extra_worker = ApplyWorker(
-            self._file_path, self._corrections, opts,
+            src, self._corrections, opts,
             occ_rows=self._applied_occ_rows,
             # 1차 실행이 뜬 쪽 번호를 그대로 — 같은 원본의 같은 장면이다.
             known_pages=self._result.get("pages_by_original") or {},
@@ -998,7 +1045,8 @@ class MainWindow(QMainWindow):
         base, _ext = os.path.splitext(self._file_path)
         # ⚠ 괄호 안 말은 결과 화면의 꼬리표(`ResultPanel._OUT_META[…][4]`)와 **같아야**
         #   한다 — 화면엔 '정오표 (메모)', 파일은 `…_정오표(메모).xlsx`.
-        name = {"hwp": "교정본", "memo": "메모", "pdf": "PDF", "errata": "정오표만"}[mode]
+        name = {"hwp": "교정본", "hwp_memo": "교정본+메모", "memo": "메모",
+                "pdf": "PDF", "errata": "정오표만"}[mode]
         return f"{base}_정오표({name}).xlsx"
 
     def _on_extra_done(self, result: dict):
@@ -1006,7 +1054,7 @@ class MainWindow(QMainWindow):
         mode = result.get("output_mode") or self._extra_mode
         label = self._EXTRA_LABEL.get(mode, "산출물")
         path = (result.get("pdf_path") if mode == "pdf"
-                else result.get("hwp_path") if mode in ("hwp", "memo")
+                else result.get("hwp_path") if mode in ("hwp", "hwp_memo", "memo")
                 else "")
         entry = {
             "mode":         mode,
@@ -1119,6 +1167,7 @@ class MainWindow(QMainWindow):
         self._extra_mode = ""
         self._applied_occ_rows = None
         self._file_path = ""
+        self._dict_path = ""
         self._options = {}
         self._corrections = []
         self._extracted_text = ""
@@ -1130,6 +1179,7 @@ class MainWindow(QMainWindow):
         self._consistency_logged = False
         self._result = {}
         self.file_panel.set_file("")
+        self.attach_panel.set_dict("")
         self.activity.clear()
         self.rail.reset()
         self._show_phase("setup")

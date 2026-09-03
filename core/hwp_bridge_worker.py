@@ -1906,6 +1906,28 @@ class HwpBridge:
         self._normalize_edit_state()
         return False, err2 + where
 
+    # 교정본이 교정 자리에 칠하는 글자색(COLORREF 0x0000FF = 빨강). apply의 CharShape
+    #   적용과 **같은 값**이어야 한다 — 여기 값이 어긋나면 결합 모드가 자리를 못 찾는다.
+    _APPLY_RED = 255
+
+    def _match_is_red(self) -> bool:
+        """지금 찾은 매치(선택 상태)의 글자색이 **교정 표시 빨강**인가.
+
+        ★'교정본+메모'(output_mode="hwp_memo") 전용 판정이다. 그 모드는 치환이 끝난
+          문서에 메모를 다는데, 앵커가 **교정문**이라 원래부터 그 표기였던 자리까지
+          찾힌다('해야한다'→'해야 한다'를 3곳 고쳤는데 '해야 한다'가 원래 20곳 있는
+          문서를 생각해 보라 — 앞의 20곳에 메모가 달린다). 우리가 고친 자리는 빨간색이
+          칠해져 있으므로 그것이 유일하게 믿을 수 있는 표식이다.
+        ⚠ 색을 읽지 못하면 **True**(통과)로 본다. 색 판독 실패로 메모를 잃는 것보다,
+          등장 상한(doc_occ=실제 치환 수)에 기대어 지나가는 편이 덜 나쁘다.
+        """
+        try:
+            cset = self.hwp.HParameterSet.HCharShape
+            self.hwp.HAction.GetDefault("CharShape", cset.HSet)
+            return int(cset.TextColor) == self._APPLY_RED
+        except Exception:
+            return True
+
     def memo(self, corrections, mark_anchor=False):
         """수락된 교정을 **한/글 메모**로 기록한다 (원고 무변경 — 글자도 서식도).
 
@@ -1956,6 +1978,10 @@ class HwpBridge:
             occ_total = int(item.get("occ_total") or 0)
             skip_occ  = set(item.get("skip_occurrences") or [])
             color     = item.get("color", 255)
+            # ★'교정본+메모' 모드 — 앵커가 교정문이라 원래부터 그 표기였던 자리까지
+            #   찾힌다. 우리가 고친 자리는 빨갛게 칠해져 있으므로 그것만 받는다
+            #   (_match_is_red 참조). 다른 모드에선 꺼져 있어 동작이 그대로다.
+            red_only  = bool(item.get("red_only"))
 
             if not original or not body:
                 continue
@@ -2053,6 +2079,13 @@ class HwpBridge:
                             self._advance_past_anchor(cur, original)
                             continue
 
+                        # ★빨강 필터 — 우리가 고치지 않은 자리는 **등장이 아니다**.
+                        #   ⚠ `visited`를 늘리지 않는다(불변식⑥-a의 메모 본문 매치와
+                        #     같은 취급) — 여기서 세면 등장 인덱스가 밀려 상한이 먼저
+                        #     닿고 정작 고친 자리에 메모가 안 달린다.
+                        if red_only and not self._match_is_red():
+                            continue
+
                         if reskip_left > 0:
                             reskip_left -= 1
                             continue
@@ -2118,7 +2151,10 @@ class HwpBridge:
                 stats["fail"] += 1
 
             detail.append({
-                "original":  original_user, "corrected": corrected_user,
+                # ★'교정본+메모'는 앵커가 교정문이라 `original`이 교정문이 된다. 정오표는
+                #   **원문 기준**으로 맞물리므로 원래 문자열을 함께 돌려준다(anchor_of).
+                "original":  item.get("anchor_of") or original_user,
+                "corrected": corrected_user,
                 "reason":    item.get("reason", ""),
                 "source":    item.get("source", "dict"),
                 "color":     color,

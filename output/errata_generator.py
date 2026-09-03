@@ -58,6 +58,7 @@ _C = {
     "unverified":    "FFFFF3E0",   # 연주황   (사전 미등재 주의)
     "dict_flag":     "FFFFF8E1",   # 연앰버   (사전 검수 — 미등재어 점검)
     "spacing":       "FFE0F2F1",   # 연청록   (띄어쓰기 검수 제안 — 자동수정 아님)
+    "user_dict":     "FFE3F2FD",   # 연하늘   (사용자 첨부 사전 — 사용자가 직접 등록)
     "punct":         "FFF3E5F5",   # 연자주   (문장부호 검수 제안 — 괄호 짝 등)
     "fail":          "FFFFEBEE",   # 연분홍   (매칭 실패)
     "rejected":      "FFF2F2F2",   # 연회색   (사용자 거절 — 적용 대상 아님)
@@ -81,6 +82,7 @@ _SOURCE_LABEL = {
     "dict_flag": "사전 검수",
     "spacing":   "띄어쓰기",
     "punct":     "문장부호",
+    "user_dict": "사용자 사전",
 }
 
 # HWP 미등재어 경고 색 (BGR 0x0055FF → 구분 목적)
