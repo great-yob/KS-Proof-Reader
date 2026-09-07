@@ -87,6 +87,11 @@ def main():
     cur_open = conn.execute("SELECT COUNT(*) FROM words WHERE source='opendict'").fetchone()[0]
     stdict_rows = conn.execute(
         "SELECT word,pos,word_type,register,source FROM words WHERE source='stdict'").fetchall()
+    # ⚠ 기존 meta를 통째로 들고 간다 — 새 DB를 만들어 스왑하는 구조라, 아래에서
+    #   다시 쓰지 않는 키는 norm_map과 똑같이 **조용히 사라진다**(2026-09-07 실측:
+    #   stdict 반쪽의 출처인 'stdict_upstream_sha'가 증발했고 아무 오류도 없었다).
+    #   이 스크립트가 갱신하는 것은 opendict 반쪽뿐이므로, 모르는 키는 보존이 정답이다.
+    old_meta = dict(conn.execute("SELECT key,value FROM meta"))
     conn.close()
     print(f"현재 DB: 유니크 {len(cur_words):,} 단어 "
           f"(opendict {cur_open:,} rows · stdict {len(stdict_rows):,} rows 보존)")
@@ -97,6 +102,7 @@ def main():
     t = sqlite3.connect(TMP)
     t.execute("CREATE TABLE words (word TEXT, pos TEXT, word_type TEXT, register TEXT, source TEXT)")
     t.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+    t.executemany("INSERT OR REPLACE INTO meta VALUES(?,?)", sorted(old_meta.items()))
     t.executemany("INSERT INTO words VALUES(?,?,?,?,?)", stdict_rows)
     t.commit()
 
@@ -189,6 +195,12 @@ def main():
     if lost:
         ok = False
         print(f"  ✗ 테이블 소실: {sorted(lost)} — 백업({bak.name})에서 복구 필요")
+    # 같은 이유로 meta 키 소실도 게이트한다(테이블만 보면 위 sha 소실을 못 잡는다).
+    new_meta = {r[0] for r in c.execute("SELECT key FROM meta")}
+    lost_meta = set(old_meta) - new_meta
+    if lost_meta:
+        ok = False
+        print(f"  ✗ meta 키 소실: {sorted(lost_meta)} — 백업({bak.name})에서 복구 필요")
     nm = c.execute("SELECT COUNT(*) FROM norm_map").fetchone()[0] if "norm_map" in new_tabs else 0
     print(f"  norm_map: {nm:,}건 {'✔' if nm > 1000 else '✗ (비정상 — 규범표기 교정이 죽습니다)'}")
     if nm <= 1000:

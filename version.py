@@ -23,7 +23,7 @@ APP_VERSION = "1.7.1"
 # ⚠ 이 값은 '이 빌드가 패키징한 데이터'를 뜻한다. 실제 **로드된** 데이터 버전은
 #   stdict.db의 meta.data_version이 정답이며 `nikl_dict.data_version()`으로 읽는다.
 #   UI·업데이터는 DB 쪽을 우선한다(파일이 어긋나면 즉시 드러나도록).
-DATA_VERSION = "2026.07"
+DATA_VERSION = "2026.09"
 
 # GitHub 릴리스 저장소 — 자동 업데이트 확인 대상(KS-Works-Utility와 동일 계정 규약).
 #   아직 저장소를 만들지 않았다면 업데이터는 graceful하게 비활성된다.
