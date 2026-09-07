@@ -12,7 +12,7 @@ NIKL XML 구조:
   </item>
 """
 
-import argparse, sqlite3, sys, time, zipfile
+import argparse, re, sqlite3, sys, time, zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -53,6 +53,28 @@ BATCH       = 5_000
 
 # ══ XML 파싱 ════════════════════════════════════════
 
+# NIKL 동형이의어 번호 — '각본01'·'ㄴ다고01'처럼 표제어 끝에 붙는 2자리 색인이다.
+#   ⚠ 이걸 떼지 않으면 그 표제어는 **원고 텍스트와 영원히 매칭되지 않는다**. 실측
+#   (2026-09-07): stdict 반쪽 유니크 435,504개 중 110,041개가 번호형이었고, 그 맨꼴
+#   36,302개 가운데 35,836개('가'·'가감하다' 같은 기본어 포함)를 표준국어대사전이
+#   못 대고 우리말샘에만 의존하고 있었다. 커버리지 손실 자체는 0이었지만(우리말샘이
+#   전부 덮음) 그 말은 곧 국가 표준 사전이 1차 방어선 역할을 못 했다는 뜻이다.
+#   우리말샘 공식 export는 번호를 붙이지 않아(실측 0건) 이 문제가 드러나지 않았다.
+#
+#   판정을 '2자리 + 앞이 숫자 아님'으로 좁힌 근거도 실측이다: 번호형 110,041개가
+#   **전부 정확히 2자리**였고(1·3·4자리 0건), 접미 분포가 01:36,272 ≈ 02:36,268 >
+#   03:14,774 … 로 동형이의어 색인 곡선 그대로였다(동형이의어가 둘 이상일 때만
+#   번호가 붙으므로 01과 02는 반드시 짝을 이룬다). 두 사전 어디에도 '코로나19'처럼
+#   숫자로 끝나는 실제 표제어는 없다(양쪽 모두 0건).
+_HOMOGRAPH_NUM = re.compile(r"(?<!\d)\d{2}$")
+
+
+def strip_homograph_num(word: str) -> str:
+    """표제어 끝의 NIKL 동형이의어 번호를 뗀다. 뗐을 때 빈 문자열이면 원형을 지킨다."""
+    bare = _HOMOGRAPH_NUM.sub("", word)
+    return bare if bare else word
+
+
 def parse_xml(xml_bytes: bytes, source: str = "stdict"):
     """
     NIKL 표준국어대사전 XML 파싱.
@@ -82,6 +104,7 @@ def parse_xml(xml_bytes: bytes, source: str = "stdict"):
         # 한자 병기 제거: 사과(沙果) → 사과
         word = word.replace("-", "").replace("^", "")
         word = word.split("(")[0].strip()   # 괄호 이후 제거
+        word = strip_homograph_num(word)    # 동형이의어 번호 제거: 각본01 → 각본
         word = word.strip()
 
         if len(word) >= 1:
