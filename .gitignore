@@ -12,6 +12,7 @@ core/_org_keys.py
 data/*.db
 data/userdict/snapshot.json
 data/전체 내려받기_우리말샘_json_*/
+data/전체 내려받기_표준국어대사전_JSON_*/
 
 # ── 비상업(CC BY-NC) 평가 자산 — 절대 커밋 금지 ─────────
 #   바른 중의성 데이터셋(35,396문장, 원문은 국립국어원/세종). 개발 PC 로컬 전용이며
