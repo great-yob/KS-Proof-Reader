@@ -179,6 +179,9 @@ class ApplyWorker(QThread):
         need_pages_scan = bool(want_pages and locate_targets and not pages_by_original)
         need_editor = (bool(apply_targets) or bool(annot_targets)
                        or mode == "pdf" or need_pages_scan)
+        # 원고의 글자 스타일을 지키려고 빨강 대신 형광펜으로 표시한 자리 수.
+        #   editor가 아예 만들어지지 않는 실행(정오표만 등)도 있어 여기서 미리 잡는다.
+        style_marked_cnt = 0
 
         if need_editor:
             self.progress.emit(10, "HWP 파일 열기 중…")
@@ -211,6 +214,7 @@ class ApplyWorker(QThread):
 
                     stats, detail = editor.apply_corrections(
                         correction_objs, progress_cb=progress_cb, stop_event=self._stop)
+                    style_marked_cnt = getattr(editor, "last_style_marked", 0)
 
                     # 취소 — 저장하지 않고 종료(원본 무변경). finally가 HWP를 닫는다.
                     if self._stop.is_set():
@@ -230,9 +234,14 @@ class ApplyWorker(QThread):
                         #   메모 단계가 한 번만 한다(중간 저장본을 남기지 않는다).
                         replaced_by = {d.get("original", ""): int(d.get("replaced", 0))
                                        for d in detail if d.get("applied")}
+                        # ★형광펜으로 표시한 자리의 문단 좌표 — 그 자리는 빨갛지 않아
+                        #   메모 단계의 빨강 필터에 걸러진다. 이것이 유일한 단서다.
+                        pen_paras_by = {d.get("original", ""): (d.get("pen_paras") or [])
+                                        for d in detail if d.get("applied")}
                         stats2, detail2, out_hwp = self._run_memo(
                             editor, annot_targets, log, pages_by_original,
                             anchor_corrected=True, replaced_by=replaced_by,
+                            pen_paras_by=pen_paras_by,
                             reindex_first=True,
                             out_path=self._hwp_out_path("_교정본(메모)"))
                         memo_detail = detail2
@@ -402,6 +411,9 @@ class ApplyWorker(QThread):
             "to_apply":     len(real_corrections) if errata_only else 0,   # 항목(건)
             "to_apply_occ": (sum(1 for r in errata_rows if r["outcome"] == "todo")
                              if errata_only else 0),                        # 등장(곳)
+            # ★원고의 글자 스타일을 지키려고 빨강 글자 대신 **형광펜**으로 표시한 자리(곳).
+            #   표시를 못 한 게 아니라 표시 **방식**이 다른 것이므로 `unmarked`와 섞지 않는다.
+            "style_marked": style_marked_cnt,
             "memoed":       n_memo,               # 메모를 단 자리(곳)
             "memo_blocked": n_blocked,            # 머리말 등 메모 불가 자리(곳)
             "annotated":    n_annot,              # PDF 주석을 단 자리(곳)
@@ -824,6 +836,7 @@ class ApplyWorker(QThread):
     def _run_memo(self, editor, targets: list, log,
                   pages_by_original: dict = None, *,
                   anchor_corrected: bool = False, replaced_by: dict = None,
+                  pen_paras_by: dict = None,
                   out_path: str = "", reindex_first: bool = False) -> tuple:
         """메모 모드 — 각 자리에 한/글 메모를 단다.
 
@@ -860,6 +873,7 @@ class ApplyWorker(QThread):
         #   (사용자 지정 2026-08-07). 원고는 글자도 서식도 그대로다.
         located = pages_by_original or {}
         replaced_by = replaced_by or {}
+        pen_paras_by = pen_paras_by or {}
         memo_items = []
         for c in targets:
             orig, corr = c["original"], self._corrected_of(c)
@@ -887,6 +901,9 @@ class ApplyWorker(QThread):
                     "occ_total": n,
                     "doc_occ":   n,
                     "red_only":  True,
+                    # ★빨강이 아니라 **형광펜**으로 표시한 자리(원고 글자 스타일 보존).
+                    #   문단 좌표로만 알아볼 수 있어 그대로 실어 보낸다.
+                    "pen_paras": pen_paras_by.get(orig) or [],
                     # 정오표·집계가 원문 기준으로 맞물리도록 원래 문자열을 함께 싣는다.
                     "anchor_of": orig,
                 })

@@ -418,6 +418,10 @@ class HwpBridge:
         # 우리가 만든 메모 서브스토리 id — **문서 단위**로 누적한다(memo() 주석 참조).
         #   None이면 아직 문서를 열지 않았다는 뜻.
         self._memo_stories = None
+        # 문서에 정의된 글자 스타일의 글자모양 지문(apply가 명령마다 새로 받는다).
+        #   비어 있으면 스타일 보호 없이 예전처럼 빨강 글자만 쓴다.
+        self._style_fps = set()
+        self._style_marked = 0
 
     def _dispatch_hwp(self, file_path):
         """확장자에 맞는 HWP 버전을 우선 Dispatch.
@@ -1204,14 +1208,19 @@ class HwpBridge:
             pass
         return {"found": found}
 
-    def apply(self, corrections):
+    def apply(self, corrections, char_styles=None):
         """
         corrections: [{"original", "corrected", "reason", "source", "color"}, ...]
+        char_styles: 문서에 정의된 **글자 스타일**의 글자모양 지문(`core/hwp_styles.py`).
+                     없으면 예전과 똑같이 동작한다.
 
         방식: 각 항목마다 "Find" 액션으로 다음 매치를 찾고
         InsertText로 치환, GetSelectedPos/SelectText로 새 글자를 선택해 빨강 적용.
         GetDefault("AllReplace")로 검색 옵션의 안전한 기본값을 미리 세팅한다.
         """
+        self._style_fps = {tuple(s.get("fp") or []) for s in (char_styles or [])}
+        self._style_fps.discard(())
+        self._style_marked = 0          # 이번 명령에서 형광펜으로 표시한 자리 수
         stats  = {"dict": 0, "ai_typo": 0, "ai_polish": 0, "fail": 0}
         detail = []
 
@@ -1267,6 +1276,9 @@ class HwpBridge:
             #   ⚠ AllReplace 폴백 경로는 등장별 정보가 없어 이 목록이 빈 채로 남는다
             #     (호출부가 '등장별 근거 없음'으로 보고 항목 단위 결과로 폴백한다).
             occ_pages = []
+            # 형광펜으로 표시한 자리의 **문단 좌표** [[list, para], …] — '교정본+메모'
+            #   모드의 메모 단계가 이 자리를 찾아갈 유일한 단서다(아래 표시 분기 주석).
+            pen_paras = []
             # corrected가 original을 부분문자열로 포함하면(괄호 추가류) 찾기-치환이 자기
             #   삽입분을 다시 잡아 무한 증식한다 → 1차 RepeatFind는 랩 감지로, 2차
             #   AllReplace는 폴백 금지로 차단한다. try 밖(폴백)에서도 참조하므로 여기서 정의.
@@ -1419,6 +1431,81 @@ class HwpBridge:
                             count += 1
                             continue
                         try:
+                            # ★치환 **전에** 이 자리의 글자모양을 파라미터셋째로 떠 둔다.
+                            #   ① `InsertText`는 원문이 런 전체를 덮으면 새 글자에 **옆 런의**
+                            #      글자모양을 물린다(실측: 'Figure 1.' KoPub돋움체 Bold →
+                            #      Light). 색을 안 칠해도 서식이 바뀐다.
+                            #   ② 되씌울 때 **필드를 하나씩 옮겨 담지 않고 파라미터셋을 그대로**
+                            #      다시 Execute한다 — 글자 테두리/배경(BorderFill)처럼 값으로
+                            #      복사하기 어려운 항목까지 통째로 따라오고, 결과가 원래와
+                            #      같으면 한/글이 **원래 글자모양 id를 그대로 유지**한다
+                            #      (= 글자 스타일 소속이 살아남는다).
+                            #   ⚠ 그래서 여기서 뜬 뒤 치환이 끝날 때까지 `GetDefault("CharShape")`
+                            #     를 **다시 부르면 안 된다** — 스냅샷이 덮인다.
+                            #   ⚠⚠ 그리고 **같은 객체를 끝까지 들고 가야 한다**. 되씌울 때
+                            #     `self.hwp.HParameterSet.HCharShape`를 다시 꺼내면 값이 빈
+                            #     파라미터셋이 와서 Execute가 조용히 아무 일도 안 한다
+                            #     (실측 2026-09-10: 되씌움이 통째로 무시돼 'Table 2.'가
+                            #     옆 런 글자모양 cs#8을 그대로 뒤집어썼다 — 예외도 로그도 없다).
+                            #   ⚠⚠⚠ **찾기 선택 위에서 읽으면 안 된다.** 그 상태의
+                            #     `GetDefault("CharShape")`는 문서에 따라 글꼴 이름이 빈
+                            #     섞인 값을 돌려준다(실측 2026-09-10 한전 문서: 문단 끝에
+                            #     걸린 매치 3곳 중 2곳이 그랬다). 커서를 **매치 시작**에
+                            #     두고 읽어야 한다 — 한/글은 커서 **뒤쪽** 글자의 모양을
+                            #     돌려주므로 시작=매치의 첫 글자다(매치 끝에 두면 다음
+                            #     런의 모양이 온다. 실측으로 start·start+1만 맞았다).
+                            #     읽은 뒤에는 `MoveSelRight`로 선택을 그대로 되살린다
+                            #     (`SelectText`는 이 환경에서 예외를 던져 쓸 수 없다).
+                            shape_snap = None
+                            style_locked = False
+                            match_end = None
+                            try:
+                                p = self.hwp.GetPos()      # 찾기 직후 커서 = 매치 끝
+                            except Exception:
+                                p = None
+                            # 매치가 문단을 넘어가면(원문에 \r) 위치 셈이 성립하지 않는다 —
+                            #   그때는 스냅샷을 포기하고 예전 경로로 간다(동작 불변).
+                            if (isinstance(p, tuple) and len(p) >= 3 and "\r" not in original
+                                    and p[2] - len(original) >= 0):
+                                match_end = (p[0], p[1], p[2])
+                                start_pos = p[2] - len(original)
+                                try:
+                                    self.hwp.SetPos(p[0], p[1], start_pos)
+                                    cset = self.hwp.HParameterSet.HCharShape
+                                    self.hwp.HAction.GetDefault("CharShape", cset.HSet)
+                                    fp = self._charshape_fingerprint(cset)
+                                    if fp is not None:
+                                        shape_snap = cset
+                                        style_locked = fp in self._style_fps
+                                except Exception:
+                                    shape_snap = None
+                                    style_locked = False
+                                # 선택 되살리기 — 되살아났는지 **커서 위치로 확인**한다.
+                                #   ⚠ 확인은 선택이 아니라 안전장치다: 선택이 없는 채로
+                                #     InsertText를 하면 치환이 아니라 **삽입**이 되어 원고가
+                                #     오염된다. 확인에 실패하면 같은 매치를 다시 찾아 세운다.
+                                restored = False
+                                try:
+                                    for _ in range(len(original)):
+                                        self.hwp.HAction.Run("MoveSelRight")
+                                    now = self.hwp.GetPos()
+                                    restored = (isinstance(now, tuple) and len(now) >= 3
+                                                and tuple(now[:3]) == match_end)
+                                except Exception:
+                                    restored = False
+                                if not restored:
+                                    shape_snap = None
+                                    try:
+                                        self.hwp.SetPos(p[0], p[1], start_pos)
+                                        restored = bool(self.hwp.HAction.Execute(
+                                            "RepeatFind", pset_find.HSet))
+                                    except Exception:
+                                        restored = False
+                                    if not restored:
+                                        err_msg = ("글자모양 확인 뒤 원문 선택을 되살리지 "
+                                                   "못했습니다 — 이 항목은 적용하지 않습니다")
+                                        break
+
                             # 선택의 시작 좌표 저장 (빠른 색상 적용용)
                             sel_start = None
                             try:
@@ -1465,12 +1552,45 @@ class HwpBridge:
                                     except Exception:
                                         break
 
-                            # 빨강 색상 적용
+                            # ★교정 표시 — 자리마다 두 갈래다.
+                            #   · 보통 자리: 떠 둔 글자모양 + 빨강 글자색을 한 번에 되씌운다.
+                            #   · **글자 스타일이 걸린 자리**: 글자색을 바꾸면 한/글이
+                            #     '원래 모양 + 빨강'인 새 글자모양을 만들어 물리는데,
+                            #     HWP는 런의 글자모양 id가 스타일의 것과 **같을 때만**
+                            #     그 글자 스타일로 인식하므로 그 순간 **스타일이 해제된다**
+                            #     (사용자 보고 2026-09-10). 빨강과 스타일 소속은 같은 필드
+                            #     하나를 두고 다투므로 **양립 불가**다. 그래서 글자모양은
+                            #     원래대로 되씌우기만 하고 표시는 **빨강 형광펜**으로 한다 —
+                            #     형광펜은 글자모양이 아니라 런 안의 별도 요소라
+                            #     (`<MARKPENBEGIN>`) 스타일을 건드리지 않는다(실측 확인).
+                            marked_with_pen = False
                             try:
-                                cset = self.hwp.HParameterSet.HCharShape
-                                self.hwp.HAction.GetDefault("CharShape", cset.HSet)
-                                cset.TextColor = 255   # COLORREF 0x0000FF
-                                self.hwp.HAction.Execute("CharShape", cset.HSet)
+                                if shape_snap is not None:
+                                    # ⚠ 새로 꺼내지 말고 **떠 둔 그 객체**를 되씌운다.
+                                    if not style_locked:
+                                        shape_snap.TextColor = self._APPLY_RED
+                                    self.hwp.HAction.Execute("CharShape", shape_snap.HSet)
+                                    if style_locked:
+                                        # ⚠ 형광펜은 **찾기 직후 첫 서식 액션으로는 먹히지
+                                        #   않는다**(실측: 첫 호출은 True를 돌려주고 아무 일도
+                                        #   안 한다). 바로 위 CharShape Execute가 그 한 번을
+                                        #   소진하므로 여기서는 정상 적용된다 — 순서를 바꾸지 말 것.
+                                        marked_with_pen = self._markpen(self._APPLY_RED)
+                                        self._style_marked += 1
+                                        # ★형광펜 자리는 **빨갛지 않다** — '교정본+메모'
+                                        #   모드의 메모 단계가 `_match_is_red`로 자리를
+                                        #   고르므로 그대로 두면 이 자리만 메모를 잃는다.
+                                        #   그래서 **문단 좌표**를 적어 넘긴다. 글자 위치는
+                                        #   뒤이은 치환에 밀리지만 **문단 번호는 밀리지
+                                        #   않는다**(치환은 문단을 만들거나 없애지 않는다).
+                                        if match_end is not None:
+                                            pen_paras.append([match_end[0], match_end[1]])
+                                else:
+                                    # 글자모양을 읽지 못한 자리(혼합 선택 등) — 예전 경로.
+                                    cset = self.hwp.HParameterSet.HCharShape
+                                    self.hwp.HAction.GetDefault("CharShape", cset.HSet)
+                                    cset.TextColor = self._APPLY_RED
+                                    self.hwp.HAction.Execute("CharShape", cset.HSet)
                             except Exception:
                                 try:
                                     self.hwp.HAction.Run("CharShapeTextColorRed")
@@ -1495,7 +1615,11 @@ class HwpBridge:
 
                             replaced += 1
                             pass_replaced += 1
-                            occ_pages.append({"i": count, "page": _pg, "ok": True})
+                            occ_pages.append({"i": count, "page": _pg, "ok": True,
+                                              # 이 자리는 빨강 글자가 아니라 형광펜으로
+                                              #   표시했다(글자 스타일 보존). 정오표가
+                                              #   '어떻게 표시했는지'를 말할 근거.
+                                              "pen": bool(marked_with_pen)})
                         except Exception as e:
                             err_msg = f"교정/색상 적용 실패: {e}"
                             break
@@ -1568,6 +1692,7 @@ class HwpBridge:
                     "path":      path_used,
                     "replaced":  replaced,   # 본문에서 실제 치환된 등장 수
                     "occ_pages": occ_pages,  # 등장별 쪽 번호·치환 여부(정오표 행 근거)
+                    "pen_paras": pen_paras,  # 형광펜으로 표시한 자리의 문단 좌표
                 })
             else:
                 stats["fail"] += 1
@@ -1588,7 +1713,12 @@ class HwpBridge:
                 pct = int(((idx + 1) / total) * 100)
                 _send_progress(pct, f"교정 적용 중… {idx+1}/{total}")
 
-        return {"stats": stats, "detail": detail}
+        # ⚠ 화면 로그 규약(activity_panel): `[태그]` + `n건`, 개별 예시 금지.
+        if self._style_marked:
+            _send_log(f"[글자 스타일] 원고 글자 스타일을 지키려고 빨강 글자 대신 "
+                      f"형광펜으로 표시 {self._style_marked}곳")
+        return {"stats": stats, "detail": detail,
+                "style_marked": self._style_marked}
 
     # ══════════════════════════════════════════════════════════
     # ▌메모 달기 (결과물 축 output_mode="memo")
@@ -1908,7 +2038,90 @@ class HwpBridge:
 
     # 교정본이 교정 자리에 칠하는 글자색(COLORREF 0x0000FF = 빨강). apply의 CharShape
     #   적용과 **같은 값**이어야 한다 — 여기 값이 어긋나면 결합 모드가 자리를 못 찾는다.
+    #   글자 스타일이 걸린 자리에 쓰는 **형광펜도 같은 빨강**이다.
     _APPLY_RED = 255
+
+    # 지문에 쓰는 언어 칸 순서 — 바이너리(한글·영어·한자·일어·기타·기호·사용자)와
+    #   같은 순서여야 한다. `core/hwp_styles.py`의 `_fingerprint()`와 **한 쌍**이다.
+    _FP_LANGS = ("Hangul", "Latin", "Hanja", "Japanese", "Other", "Symbol", "User")
+
+    def _charshape_fingerprint(self, cset):
+        """이미 `GetDefault("CharShape")`로 채워진 파라미터셋 → 지문 튜플(못 읽으면 None).
+
+        ⚠ 여기서 `GetDefault`를 부르지 않는다 — 호출부가 치환 전에 떠 둔 **스냅샷을
+          그대로 되씌워야** 하는데, 다시 부르면 그 스냅샷이 덮인다.
+        ⚠ 한글 글꼴 이름이 비면(혼합 선택 등) **None**을 돌려준다. 그 자리는 판정도
+          복원도 하지 않고 예전 경로로 보낸다 — 빈 글꼴 이름을 되씌우면 서식이 무너진다.
+        ⚠ 필드 구성·순서는 `core/hwp_styles.py`와 정확히 같아야 한다.
+        """
+        try:
+            faces = [getattr(cset, "FaceName" + lang) for lang in self._FP_LANGS]
+            if not faces[0]:
+                return None
+            fp = list(faces)
+            for prefix in ("Ratio", "Spacing", "Size", "Offset"):
+                fp.extend(int(getattr(cset, prefix + lang)) for lang in self._FP_LANGS)
+            attr = ((int(cset.Italic) & 1)
+                    | (int(cset.Bold) & 1) << 1
+                    | (int(cset.UnderlineType) & 3) << 2
+                    | (int(cset.UnderlineShape) & 0xF) << 4
+                    | (int(cset.OutLineType) & 7) << 8
+                    | (int(cset.ShadowType) & 3) << 11
+                    | (int(cset.Emboss) & 1) << 13
+                    | (int(cset.Engrave) & 1) << 14
+                    | (int(cset.SuperScript) & 1) << 15
+                    | (int(cset.SubScript) & 1) << 16)
+            # ⚠ 꺼져 있는 속성의 색은 0으로 눕힌다 — `hwp_styles._fingerprint()`와
+            #   **같은 규칙**이어야 한다(.hwp/.hwpx가 그 칸을 다르게 들고 있어서다).
+            ul_color = int(cset.UnderlineColor) if (attr >> 2) & 3 else 0
+            shadow = int(cset.ShadowColor) if (attr >> 11) & 3 else 0
+            fp.extend([int(cset.Height), attr, int(cset.TextColor),
+                       ul_color, int(cset.ShadeColor), shadow])
+            return tuple(fp)
+        except Exception:
+            return None
+
+    def _markpen(self, color):
+        """선택 범위에 형광펜을 칠한다. 성공 여부(추정)를 돌려준다.
+
+        ⚠ 반환값을 믿지 말 것 — 실측에서 **True를 돌려주고 아무 일도 안 하는 호출**
+          (찾기 직후 첫 서식 액션)과 **False를 돌려주고 칠해지는 호출**이 모두 나왔다.
+          호출부가 순서(CharShape Execute 다음)를 지키는 것이 실제 보장이다.
+        """
+        try:
+            ms = self.hwp.HParameterSet.HMarkpenShape
+            self.hwp.HAction.GetDefault("MarkPenShape", ms.HSet)
+            ms.Color = color
+            self.hwp.HAction.Execute("MarkPenShape", ms.HSet)
+            return True
+        except Exception:
+            return False
+
+    def _consume_pen_para(self, avail, used) -> bool:
+        """지금 매치가 **형광펜으로 표시해 둔 문단**인가.
+
+        '교정본+메모' 모드에서 빨강 대신 형광펜을 쓴 자리를 메모 단계가 알아보게 하는
+        유일한 단서다(`_match_is_red`가 왜 형광펜을 못 읽는지는 그 함수 주석 참조).
+        ⚠ 문단 안에 교정문이 여러 번 나오면 **먼저 만난 자리**를 우리 자리로 본다 —
+          같은 문단·같은 문자열·같은 글자 스타일이 겹칠 때만 어긋나므로 드물고,
+          어긋나도 메모 한 장이 이웃 자리에 갈 뿐 원고는 변하지 않는다.
+        ⚠ 이미 인정한 문단(`used`)도 **True로 돌려준다**. 재탐색 패스에서 이 자리가
+          다시 잡히기 때문인데, 여기서 걸러 버리면 빨강 자리와 달리 `reskip_left`에
+          닿지 못해 **등장 계수가 어긋난다**(멀쩡한 뒷자리가 대신 건너뛰어진다).
+          빨간 자리도 메모를 단 뒤 여전히 빨갛게 잡혀 reskip이 소비하는 것과 같은 취급이다.
+        """
+        try:
+            pos = self.hwp.GetPos()
+        except Exception:
+            return False
+        if not (isinstance(pos, tuple) and len(pos) >= 2):
+            return False
+        key = (pos[0], pos[1])
+        if key in avail:
+            avail.remove(key)
+            used.append(key)
+            return True
+        return key in used
 
     def _match_is_red(self) -> bool:
         """지금 찾은 매치(선택 상태)의 글자색이 **교정 표시 빨강**인가.
@@ -1920,6 +2133,12 @@ class HwpBridge:
           칠해져 있으므로 그것이 유일하게 믿을 수 있는 표식이다.
         ⚠ 색을 읽지 못하면 **True**(통과)로 본다. 색 판독 실패로 메모를 잃는 것보다,
           등장 상한(doc_occ=실제 치환 수)에 기대어 지나가는 편이 덜 나쁘다.
+        ⚠ **글자 스타일이 걸린 자리는 글자색이 아니라 형광펜으로 표시**하므로(apply 참조)
+          이 판정에 걸리지 않는다 — 결합 모드에서 그 자리만 메모가 빠진다. 형광펜으로
+          보완하려 했으나 **불가능하다**: `HMarkpenShape.Color`는 선택 자리의 형광펜이
+          아니라 **마지막으로 쓴 펜 색**을 돌려준다(실측 2026-09-10: 칠하지 않은 자리에서도
+          255가 나왔다). 그 값을 믿으면 모든 자리가 통과해 메모가 엉뚱한 자리에 박힌다 —
+          이 함수가 애초에 막으려던 바로 그 사고다. **다시 넣지 말 것.**
         """
         try:
             cset = self.hwp.HParameterSet.HCharShape
@@ -1982,6 +2201,14 @@ class HwpBridge:
             #   찾힌다. 우리가 고친 자리는 빨갛게 칠해져 있으므로 그것만 받는다
             #   (_match_is_red 참조). 다른 모드에선 꺼져 있어 동작이 그대로다.
             red_only  = bool(item.get("red_only"))
+            # ★형광펜으로 표시한 자리의 문단 좌표(apply가 돌려준 것). 그 자리는 원고의
+            #   글자 스타일을 지키려고 **빨강 대신 형광펜**을 썼으므로 `red_only`에
+            #   걸러진다 — 여기 적힌 문단에서 매치되면 '우리가 고친 자리'로 인정한다.
+            #   ⚠ 글자 위치가 아니라 **문단**만 쓴다: 뒤이은 치환이 글자 위치는 밀지만
+            #     문단 번호는 밀지 않는다(치환은 문단을 만들거나 없애지 않는다).
+            #   ⚠ 한 항목씩 **소비**한다 — 같은 문단에 두 곳이면 두 번만 인정한다.
+            pen_paras = [tuple(x[:2]) for x in (item.get("pen_paras") or []) if len(x) >= 2]
+            pen_used = []
 
             if not original or not body:
                 continue
@@ -2084,7 +2311,8 @@ class HwpBridge:
                         #     같은 취급) — 여기서 세면 등장 인덱스가 밀려 상한이 먼저
                         #     닿고 정작 고친 자리에 메모가 안 달린다.
                         if red_only and not self._match_is_red():
-                            continue
+                            if not self._consume_pen_para(pen_paras, pen_used):
+                                continue
 
                         if reskip_left > 0:
                             reskip_left -= 1
@@ -2351,7 +2579,8 @@ def main():
             elif cmd == "get_text":
                 result = bridge.get_text()
             elif cmd == "apply":
-                result = bridge.apply(req["corrections"])
+                result = bridge.apply(req["corrections"],
+                                      char_styles=req.get("char_styles"))
             elif cmd == "memo":
                 result = bridge.memo(req["corrections"],
                                      mark_anchor=req.get("mark_anchor", True))

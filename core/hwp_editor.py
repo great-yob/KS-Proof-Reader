@@ -135,6 +135,10 @@ class HwpEditor:
         # 메모 재색인이 만드는 중간 저장본(아래 `_reindex_document`). 끝나면 지운다.
         self._stage_file = None
         self._reindexing = False
+        # ★문서에 정의된 **글자 스타일**의 글자모양 지문(`core/hwp_styles.py`).
+        #   교정 표시 빨강이 글자 스타일을 해제하는 것을 막기 위해 apply에 실어 보낸다.
+        #   None = 아직 안 읽음, [] = 읽을 수 없음(그 경우 예전 동작 그대로).
+        self._char_styles = None
 
     def open(self):
         """32비트 서브프로세스를 시작하고 HWP 파일을 엽니다."""
@@ -227,6 +231,26 @@ class HwpEditor:
     #   중단할 수 없으므로, 배치 사이에서 stop_event를 확인한다.
     _APPLY_BATCH = 10
 
+    def _char_style_fingerprints(self) -> list:
+        """★문서의 **글자 스타일** 글자모양 지문 — 한 번만 읽어 캐시한다.
+
+        빨강 교정 표시가 글자 스타일을 해제하는 것을 막기 위한 정보다(자세한 근거는
+        `core/hwp_styles.py` 머리말). 읽기는 COM이 아니라 **파일 직접 판독**이라
+        한/글이 문서를 연 상태와 무관하고, 실패하면 빈 목록이라 예전 동작으로
+        조용히 되돌아간다 — 스타일 보호는 교정의 전제가 아니라 보강이다.
+        """
+        if self._char_styles is not None:
+            return self._char_styles
+        try:
+            from .hwp_styles import char_style_fingerprints
+            self._char_styles = char_style_fingerprints(self.file_path, self.logger)
+        except Exception:
+            self._char_styles = []
+        if self._char_styles and self.logger:
+            self.logger(f"  [글자 스타일] 원고에 정의된 글자 스타일 "
+                        f"{len(self._char_styles)}종 확인 — 해당 자리는 형광펜으로 표시")
+        return self._char_styles
+
     def apply_corrections(self, corrections: list,
                           progress_cb=None,
                           stop_event: threading.Event = None) -> tuple:
@@ -260,8 +284,11 @@ class HwpEditor:
         #   여기서 한 번 정렬한다(브리지도 배치 내에서 같은 키로 재정렬 → 순서 동일).
         corr_data.sort(key=lambda c: len(c.get("original") or ""), reverse=True)
 
+        char_styles = self._char_style_fingerprints()
+
         stats_total  = {"dict": 0, "ai_typo": 0, "ai_polish": 0, "fail": 0}
         detail_total = []
+        style_marked = 0        # 글자 스타일 보존 위해 형광펜으로 표시한 자리 수
         total = len(corr_data)
         done  = 0
 
@@ -280,6 +307,9 @@ class HwpEditor:
             result = self._send_cmd({
                 "cmd": "apply",
                 "corrections": batch,
+                # 배치마다 함께 보낸다 — 목록이 스무 줄 남짓이라 비용이 없고,
+                #   브리지가 상태를 들고 있지 않아도 되어 재색인·재시작에 강하다.
+                "char_styles": char_styles,
             }, progress_cb=batch_cb,
                total=total)
 
@@ -289,10 +319,17 @@ class HwpEditor:
             for k, v in (result.get("stats") or {}).items():
                 stats_total[k] = stats_total.get(k, 0) + v
             detail_total.extend(result.get("detail") or [])
+            style_marked += int(result.get("style_marked") or 0)
             done += len(batch)
             if progress_cb is not None:
                 progress_cb(done, total)
 
+        # ⚠ 브리지가 낸 같은 뜻의 로그는 `[Worker stderr]` 접두사 탓에 화면에서
+        #   통째로 감춰진다(activity_panel._DROP) — 사용자에게 보일 줄은 여기서 낸다.
+        if style_marked and self.logger:
+            self.logger(f"  [글자 스타일] 원고 글자 스타일을 지키려고 빨강 글자 대신 "
+                        f"형광펜으로 표시 {style_marked}곳")
+        self.last_style_marked = style_marked
         return stats_total, detail_total
 
     # 메모는 등장 1곳당 0.08초(실측 2026-08-07 · 본문 20곳 1.5초)라 치환보다 무겁다.
