@@ -84,6 +84,9 @@ def push(logger=None) -> int:
     log = logger or (lambda *_: None)
     if not available():
         return 0
+    if not auth.can_contribute():
+        # 기여 대상이 아니다(관리자·지정자만 — 서버 RLS도 거부한다). 큐는 건드리지 않는다.
+        return 0
     try:
         from core import event_queue
         pend = event_queue.pending(limit=500)

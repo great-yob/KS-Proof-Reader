@@ -14,7 +14,17 @@ ks-works(사내 근태앱)와 **동일한 Supabase Auth**(email/password)로 로
 ks-works 규칙 미러(src/contexts/AuthContext.tsx):
   · 입력에 '@'가 없으면 사번/프리픽스로 보고 '@kyungsungmedia.com'을 붙인다.
   · supabase.auth.signInWithPassword 와 동일한 password grant.
-  · 로그인 후 employees.terminated_at(퇴사자 차단)·role(admin/employee) 확인.
+
+**계정은 두 종류다(2026-10-16 분리)** — 신원은 서버 함수 `ksai_my_profile()`이 판정한다:
+  · `employee` — ks-works 직원(employees). 기존 계정 그대로. 퇴사 시 거부.
+    비밀번호는 **ks-works가 관리**한다(같은 auth.users — 앱에서 바꾸면 ks-works
+    비밀번호와 관리자용 평문 미러가 함께 어긋난다).
+  · `member`   — 앱 전용 회원(ksai_members). ks-works 명부에 없으므로 ks-works는
+    로그인 직후 로그아웃시키고 RLS도 막는다. 관리자가 앱의 '사용자 관리'에서 만들며
+    초기 비밀번호 ks2026 → 첫 로그인 때 변경이 강제된다(must_change_password).
+  ⚠ employees를 직접 SELECT하지 말 것 — ks-works RLS상 직원 토큰은 전 직원의 인사
+    정보 전 열을 읽을 수 있다. 앱이 받는 신원은 이름·권한·상태뿐이어야 한다.
+  서버 소스 정본: server/supabase/ (마이그레이션 + Edge Function 2종).
 
 **오프라인 유예(GRACE_DAYS=7)** — 게이트가 회사 전체를 잠그는 단일 장애점이 되지
 않도록, 서버 검증 *실패의 종류*를 구분한다:
@@ -200,17 +210,23 @@ def _http(method: str, url: str, headers: dict, body=None) -> tuple:
         return 0, {"_error": str(e)}
 
 
-def _fetch_profile(c: dict, access_token: str, uid: str) -> tuple:
+def _fetch_profile(c: dict, access_token: str) -> tuple:
     """(status, profile|None) 반환. status!=200 은 **네트워크/서버 실패**이지 '미등록'이
-    아니다 — 둘을 뭉뚱그리면 회선 장애가 퇴사 처리와 같은 취급을 받아 세션이 날아간다."""
+    아니다 — 둘을 뭉뚱그리면 회선 장애가 퇴사 처리와 같은 취급을 받아 세션이 날아간다.
+
+    신원은 서버 함수 `ksai_my_profile()` 하나로만 묻는다(2026-10-16). 예전엔
+    employees를 직접 SELECT했는데, ks-works의 RLS상 직원 토큰은 **전 직원의 전 열**
+    (휴대폰·생년월일·휴직 여부…)을 읽을 수 있었다 — 앱이 4개 열만 골랐을 뿐이다.
+    이 함수는 ① ks-works 직원(employees)과 ② 앱 전용 회원(ksai_members)을 함께
+    판정하고 이름·권한·상태만 돌려준다. 200 + null = 어느 쪽에도 없음(미등록).
+    """
     status, js = _http(
-        "GET",
-        f"{c['url']}/rest/v1/employees"
-        f"?select=id,name,role,terminated_at&auth_user_id=eq.{uid}",
+        "POST", f"{c['url']}/rest/v1/rpc/ksai_my_profile",
         {"apikey": c["anon_key"], "Authorization": f"Bearer {access_token}",
-         "Accept": "application/json"})
-    if status == 200 and isinstance(js, list):
-        return 200, (js[0] if js else None)
+         "Content-Type": "application/json", "Accept": "application/json"},
+        {})
+    if status == 200:
+        return 200, (js if isinstance(js, dict) else None)
     return status, None
 
 
@@ -233,19 +249,27 @@ def _apply_token_response(c: dict, js: dict) -> tuple:
     _state["exp"] = time.time() + int(js.get("expires_in", 3600))
     if rt:
         _state["refresh_token"] = rt
-    status, prof = _fetch_profile(c, at, uid)
+    status, prof = _fetch_profile(c, at)
     if status != 200:
         return "net", None
-    if prof is None:                    # 200인데 행이 없음 = employees 미등록
+    if prof is None:                    # 200인데 null = 직원도 앱 회원도 아님(미등록)
         return "rejected", None
-    if prof.get("terminated_at"):       # 퇴사자 차단(ks-works와 동일)
+    if not prof.get("active", False):   # 퇴사(직원) 또는 사용 중지(앱 회원)
         return "rejected", None
     user = {
         "uid": uid,
-        "employee_id": prof.get("id"),
+        "kind": prof.get("kind") or "employee",       # employee | member
+        "employee_id": prof.get("employee_id"),
         "name": prof.get("name"),
         "email": (js.get("user") or {}).get("email"),
         "role": prof.get("role") or "employee",
+        # 직원 계정의 비밀번호는 ks-works가 관리한다(같은 auth.users) — 앱은 회원만 바꾼다.
+        "can_change_password": bool(prof.get("can_change_password")),
+        "must_change_password": bool(prof.get("must_change_password")),
+        # 공유 뇌 이벤트 기여 권한(관리자 + 지정자). 서버 RLS가 최종 판정이고, 이 값은
+        #   비기여자의 앱이 이벤트를 아예 쌓지 않게 하는 데 쓴다(쌓으면 업로드가 매번
+        #   거부돼 로컬 큐만 끝없이 자란다).
+        "brain_access": bool(prof.get("brain_access")),
     }
     _state["user"] = user
     _state["verified_at"] = time.time()
@@ -283,7 +307,7 @@ def login(email_or_prefix: str, password: str) -> dict:
                     "error": "계정 정보를 확인하지 못했습니다(네트워크 확인 후 다시 시도)."}
         if outcome != "ok" or user is None:
             _clear()
-            return {"ok": False, "error": "계정 정보를 확인할 수 없습니다(퇴사 처리 또는 미등록)."}
+            return {"ok": False, "error": "사용할 수 없는 계정입니다(사용 중지·퇴사 또는 미등록)."}
         _state["loaded"] = True
         _persist()
     return {"ok": True, "user": user}
@@ -412,6 +436,78 @@ def grace_days_left() -> int:
         return 0
     left = _GRACE_SECONDS - (time.time() - verified_at)
     return max(0, int(left // 86400) + 1) if left > 0 else 0
+
+
+def call_function(name: str, body: dict) -> tuple:
+    """Edge Function 호출(사용자 JWT). 반환 (status, json|None). 토큰이 없으면 (401, None).
+
+    서비스 키가 필요한 작업(계정 생성·비밀번호 변경)은 전부 서버 함수가 한다 —
+    퍼블릭 릴리스에 서비스 키를 넣을 수는 없다.
+    """
+    c = _cfg()
+    if not c.get("url") or not c.get("anon_key"):
+        return 0, {"error": "서버 설정이 없습니다(관리자 문의)."}
+    at = access_token()
+    if not at:
+        return 401, {"error": "로그인 세션이 없습니다. 다시 로그인해 주세요."}
+    return _http(
+        "POST", f"{c['url']}/functions/v1/{name}",
+        {"apikey": c["anon_key"], "Authorization": f"Bearer {at}",
+         "Content-Type": "application/json"},
+        body)
+
+
+def _error_text(status: int, js, fallback: str) -> str:
+    if status == 0:
+        return "서버에 연결할 수 없습니다(네트워크 확인)."
+    if isinstance(js, dict):
+        msg = js.get("error") or js.get("msg") or js.get("message")
+        if msg:
+            return str(msg)
+    return fallback
+
+
+def change_password(current_password: str, new_password: str) -> dict:
+    """앱 전용 회원의 본인 비밀번호 변경. 반환 {ok, error?}.
+
+    ⚠ ks-works 직원 계정은 서버가 거부한다(같은 auth.users라 ks-works 비밀번호까지
+      바뀐다) — 직원은 ks-works 마이페이지에서 바꾼다. 강제 변경 플래그도 서버가
+      **실제 변경과 함께** 내리므로, 여기서는 성공 시 로컬 상태만 맞춘다.
+    """
+    if not current_password or not new_password:
+        return {"ok": False, "error": "비밀번호를 입력하세요."}
+    status, js = call_function("ksai-change-password", {
+        "current_password": current_password, "new_password": new_password})
+    if status == 200 and isinstance(js, dict) and js.get("ok"):
+        with _lock:
+            u = _state.get("user")
+            if u:
+                u["must_change_password"] = False
+                _persist()
+        return {"ok": True}
+    return {"ok": False, "error": _error_text(status, js, "비밀번호를 변경하지 못했습니다.")}
+
+
+def must_change_password() -> bool:
+    """초기 비밀번호 계정이라 변경이 강제되는가(서버 프로필 기준)."""
+    u = current_user()
+    return bool(u) and bool(u.get("must_change_password"))
+
+
+def can_change_password() -> bool:
+    """앱에서 비밀번호를 바꿀 수 있는 계정인가(앱 전용 회원만 — 직원은 ks-works에서)."""
+    u = current_user()
+    return bool(u) and bool(u.get("can_change_password"))
+
+
+def can_contribute() -> bool:
+    """공유 뇌 이벤트에 기여하는 계정인가(서버 프로필 brain_access).
+
+    값이 없는 옛 저장 세션은 False — 노이즈를 막는 쪽이 안전하다(다음 온라인
+    검증에서 서버 값으로 갱신된다).
+    """
+    u = current_user()
+    return bool(u) and bool(u.get("brain_access"))
 
 
 def logout():

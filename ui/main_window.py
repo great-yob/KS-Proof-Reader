@@ -288,6 +288,8 @@ class MainWindow(QMainWindow):
         self.header.curator_requested.connect(self._open_curator_panel)
         self.header.login_requested.connect(self._open_login_dialog)
         self.header.logout_requested.connect(self._logout)
+        self.header.password_change_requested.connect(self._open_password_dialog)
+        self.header.members_requested.connect(self._open_member_admin)
 
         self.rail.step_clicked.connect(self._on_rail_click)
         self.sidebar.update_clicked.connect(self._open_update_dialog)
@@ -728,7 +730,16 @@ class MainWindow(QMainWindow):
         """검토/auto_apply 결정을 용어 단위 학습 이벤트로 로컬 큐(data/event_queue.db)에
         적재한다(공유 용어 뇌 DO-3). 전적으로 부수효과 — 어떤 실패도 교정 적용을 막지
         않는다. 서버 업로드는 없다(DO-4). 문맥 스니펫은 저장하지 않는다(프라이버시).
+
+        ⚠ 공유 뇌 기여자(관리자 + 지정자, 2026-10-16)가 아니면 **기록부터 하지 않는다** —
+          교정 전문 인력이 아닌 사용자의 결정은 합의 집계의 노이즈이고, 서버도 거부한다.
         """
+        try:
+            from core import auth
+            if not auth.can_contribute():
+                return
+        except Exception:
+            return
         try:
             from core import event_queue
             n = event_queue.record_corrections(
@@ -847,6 +858,27 @@ class MainWindow(QMainWindow):
         except Exception:
             self._log_auth_error("재로그인")
             self.close()
+
+    def _open_password_dialog(self):
+        """비밀번호 변경(앱 전용 회원). 직원 계정은 헤더 메뉴가 ks-works로 안내한다."""
+        try:
+            from ui.widgets.password_dialog import PasswordChangeDialog
+            dlg = PasswordChangeDialog(self)
+            if dlg.exec():
+                self.activity.log("  [계정] 비밀번호 변경 완료")
+            dlg.deleteLater()
+        except Exception:
+            self._log_auth_error("비밀번호 변경")
+
+    def _open_member_admin(self):
+        """사용자 관리(관리자) — ks-works에 등록하지 않는 앱 전용 사용자 추가·관리."""
+        try:
+            from ui.widgets.member_admin_dialog import MemberAdminDialog
+            dlg = MemberAdminDialog(self)
+            dlg.exec()
+            dlg.deleteLater()
+        except Exception:
+            self._log_auth_error("사용자 관리")
 
     def _log_auth_error(self, where: str):
         """인증 관련 슬롯의 예외를 로그로 흡수 — 선택적 로그인이 앱을 종료시키지 않게 한다."""

@@ -61,7 +61,7 @@ class LoginDialog(QDialog):
             "\n로그인하면 공유 용어 사전(동기화·큐레이션)도 함께 활성화됩니다.", wrap=True))
 
         self._id = QLineEdit()
-        self._id.setPlaceholderText("사내 이메일 ID")
+        self._id.setPlaceholderText("로그인 ID (사내 ID 또는 이메일)")
         self._pw = QLineEdit()
         self._pw.setPlaceholderText("비밀번호")
         self._pw.setEchoMode(QLineEdit.Password)
@@ -248,5 +248,17 @@ def require_login(parent=None) -> "dict | None":
     dlg.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
     ok = dlg.exec()
     user = dlg.user if ok else None
+    mode = dlg._mode
     dlg.deleteLater()
+    if user and user.get("must_change_password") and mode == "verified":
+        # 초기 비밀번호(ks2026) 계정 — 바꾸기 전에는 통과시키지 않는다(게이트 안에서).
+        #   ⚠ 오프라인 유예 통과(mode="offline")에선 서버에 못 닿아 바꿀 수 없으므로
+        #     강제하지 않는다 — 막으면 유예가 무의미해진다. 다음 온라인 실행에서 강제된다.
+        from ui.widgets.password_dialog import PasswordChangeDialog
+        pw = PasswordChangeDialog(parent, forced=True, gate=True)
+        changed = pw.exec()
+        pw.deleteLater()
+        if not changed:
+            return None
+        user = dict(user, must_change_password=False)
     return user
