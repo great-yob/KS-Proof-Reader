@@ -1624,6 +1624,10 @@ class ResultPanel(QWidget):
             #     0이다. 그때는 메모 수치만 적는다.
             n_app = int(d.get("applied", 0))
             memo = f"메모 {int(d.get('memoed', 0)):,}항목"
+            # ★메모를 못 단 자리도 드러낸다 — 예전엔 결합 모드에서 이 수치가 늘 0이라
+            #   메모 68곳 중 9곳이 빠져도 화면엔 아무 표시가 없었다(2026-10-16 감사).
+            if d.get("unmarked"):
+                memo += f" · 메모 못 함 {int(d['unmarked']):,}항목"
             return (f"적용 {n_app:,}건 · {memo}" if n_app else memo)
         if mode == "memo":
             # ⚠ 못 단 자리는 `unmarked`로 적는다 — `memo_blocked`는 한/글이 거부한 자리만

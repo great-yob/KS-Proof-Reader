@@ -36,6 +36,17 @@ sys.excepthook = _excepthook
 
 
 def main():
+    # ★업데이터가 받아 둔 새 사전을 **무엇보다 먼저** 제자리로 옮긴다 — 사전 DB를 한 번이라도
+    #   열면 그 폴더는 이 프로세스가 끝날 때까지 바꿀 수 없다(datapaths.apply_pending_data).
+    try:
+        import datapaths
+        _pend = datapaths.apply_pending_data()
+        if _pend.startswith("failed"):
+            print(f"[데이터] 대기 중인 사전 교체 실패 — 다음 시작에 다시 시도: {_pend}",
+                  file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
     # 백그라운드 스레드 연산 시 메인(UI) 스레드의 GIL 확보 빈도를 극대화하여 프레임 드랍 방지
     sys.setswitchinterval(0.001)
 

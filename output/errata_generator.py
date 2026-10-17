@@ -37,6 +37,7 @@ import os
 import unicodedata
 from datetime import datetime
 from openpyxl import Workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import (
     Font, PatternFill, Alignment, Border, Side,
 )
@@ -261,7 +262,8 @@ def _build_sheet(wb: Workbook, title: str, subtitle: str,
         # ⚠ 'todo'도 포함한다 — 메모·PDF 모드에서 **표시조차 못 한 자리**(머리말이라
         #   한/글이 메모를 거부했거나 PDF에서 원문을 못 찾은 경우)가 여기로 실린다.
         #   빼면 편집자는 메모가 달린 줄 알고 그 자리를 지나친다.
-        if note and outcome in ("failed", "applied", "todo"):
+        #   'review'(검수 카드)도 메모·주석 대상이라 같은 사유가 실린다.
+        if note and outcome in ("failed", "applied", "todo", "review"):
             reason = f"{reason} ◆ {note}" if reason else note
         _wcell(ws, row, 4, reason, fill, border,
                align=Alignment(horizontal="left", vertical="top", wrap_text=True))
@@ -405,7 +407,16 @@ def _row_height(original, corrected, reason) -> float:
 
 
 def _wcell(ws, row, col, value, fill, border, align=None, font=None):
+    # ★원고에서 온 문자열은 엑셀이 **해석하지 않게** 쓴다(2026-10-16 감사에서 실측한 두 경로):
+    #   ① openpyxl이 거부하는 제어문자(\x00~\x08 등)가 **하나만** 있어도 `IllegalCharacterError`로
+    #     정오표 전체가 만들어지지 않았다 → 지운다(눈에 안 보이는 문자라 내용 손실이 없다).
+    #   ② '='로 시작하는 문자열은 openpyxl이 **수식**으로 저장해 셀에 `#NAME?`·`#REF!`가
+    #     떴다 → 값을 넣은 뒤 자료형을 문자열로 고정한다.
+    if isinstance(value, str):
+        value = ILLEGAL_CHARACTERS_RE.sub("", value)
     cell = ws.cell(row=row, column=col, value=value)
+    if isinstance(value, str) and cell.data_type == "f":
+        cell.data_type = "s"
     cell.fill   = fill
     cell.border = border
     if align:

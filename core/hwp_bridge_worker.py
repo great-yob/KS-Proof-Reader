@@ -72,6 +72,25 @@ def _ws_strip(s: str) -> str:
         return ""
     return re.sub(r"\s+", "", s)
 
+
+def _file_stamp(path):
+    """파일의 (수정 시각 ns, 크기, 파일 id). 없으면 None — '이번에 새로 써졌는가' 판정용."""
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+    except OSError:
+        return None
+
+
+def _written(path, before) -> bool:
+    """저장 직전 스탬프(before) 이후 path가 **새로 써졌는가**(내용이 있는 파일로).
+
+    ⚠ '파일이 존재한다'로 판정하면 안 된다 — 대상이 잠겨 저장이 실패해도 이전 실행의
+      파일이 그대로 남아 있어 성공처럼 보인다(save_as·export_pdf 주석의 실측 사고).
+    """
+    now = _file_stamp(path)
+    return now is not None and now[1] > 0 and now != before
+
 # 부모(64비트)와 JSON을 주고받기 전에 stdio를 UTF-8로 고정.
 # 한국 Windows에서 32비트 Python의 기본 인코딩은 CP949라
 # 한국어가 포함된 JSON을 그대로 쓰면 부모 쪽 utf-8 디코더가 깨진다.
@@ -1055,8 +1074,16 @@ class HwpBridge:
             pass
         return None
 
-    # 한 원문당 훑을 등장 상한 — apply의 max_iters와 같은 값(정합).
-    _LOCATE_MAX_OCC = 100
+    # 한 원문당 훑을 등장 상한 — apply의 전체 매치 상한과 같은 값(정합).
+    #   ⚠ 예전 100은 apply와 함께 등장 100곳 넘는 원문의 뒤쪽 쪽 번호를 비우고, 그 수를
+    #     doc_occ로 받는 메모·PDF까지 101번째 이후 자리를 못 보게 만들었다. 실제 비용은
+    #     아래 전체 예산(budget·time_budget)이 묶는다.
+    _LOCATE_MAX_OCC = 5000
+
+    # apply 상한(apply 주석 참조) — 건너뛰지 않은 매치 / 전체 매치(안전판) / 생존 신호 간격.
+    _APPLY_MAX_REPLACE = 1000
+    _APPLY_MAX_MATCHES = 5000
+    _APPLY_HEARTBEAT = 50
 
     def locate(self, originals, budget=4000, time_budget=60.0):
         """각 원문의 **등장별 쪽 번호**를 찾기만으로 수집한다(치환 없음 — 문서 무변경).
@@ -1306,7 +1333,13 @@ class HwpBridge:
             #   단일 패스 유지 예외: self_matching(재탐색이 삽입분을 다시 잡아 증식 위험).
             try:
                 count = 0
-                max_iters = 100
+                # ★상한은 **건너뛰지 않은** 매치로 센다(`count - skipped_seen`). 예전엔
+                #   `max_iters = 100`이 건너뛴 매치까지 세어, 등장 172곳 중 171곳이 제외
+                #   (excluded — 반복되는 긴 기관명 속 부분문자열)이고 진짜 등장이
+                #   155번째인 교정이 **영원히 적용되지 못했다**(실측 2026-10-16, 실파일). 그 실패는
+                #   S3가 '긴 교정에 포함(정상)'으로 재분류해 화면엔 '실패 0건'으로 나갔다.
+                #   전체 매치 상한(_APPLY_MAX_MATCHES)은 폭주 방지용 안전판으로만 남긴다
+                #   — 자기 재매칭 폭주는 아래 self_matching 가드가 따로 막는다.
                 _MAX_PASSES = 8
                 _first_pass_replaced = None   # 회수 로그용(패스 0 치환 수)
                 skipped_seen = 0              # 지금까지 스킵 판정한 등장 수(재탐색 시 재스킵 대상)
@@ -1314,7 +1347,7 @@ class HwpBridge:
                 # ⚠ 자기 재매칭(무한 증식) 방지 — corrected가 original을 부분문자열로
                 #   포함하면(괄호 추가 '센터)'→'(센터)', '…참고]'→'…참고])') RepeatFind가
                 #   문서 끝에서 처음으로 되돌아가(wrap-around) 방금 삽입한 텍스트를 다시
-                #   잡아 괄호를 max_iters까지 무한 증식시킨다('((((…' / '))))…' 오염).
+                #   잡아 괄호를 매치 상한까지 무한 증식시킨다('((((…' / '))))…' 오염).
                 #   일반 교정은 corrected에 original이 없어 자연 종료되므로 영향 없다.
                 #   self_matching일 때만 매 검색 전 커서를 기록해, RepeatFind가 '뒤로'
                 #   점프하면(=wrap) 루프를 끊는다. (self_matching은 위에서 정의됨)
@@ -1373,7 +1406,15 @@ class HwpBridge:
                     #   지나간다(전역 인덱스 유지, 상단 재스킵 주석 참조).
                     reskip_left = skipped_seen
 
-                    while count < max_iters:
+                    while ((count - skipped_seen) < self._APPLY_MAX_REPLACE
+                           and count < self._APPLY_MAX_MATCHES):
+                        # 등장이 많은 낱말 하나에서 출력이 끊기면 부모의 유휴 타임아웃
+                        #   (_send_cmd, 120초)이 '한/글 행업'으로 오판해 브리지를 죽인다
+                        #   (메모 루프가 실측으로 겪은 것과 같은 부류). 진행률은 그대로 두고
+                        #   신호만 보낸다.
+                        if count and count % self._APPLY_HEARTBEAT == 0:
+                            _send_progress(int(idx / max(1, total) * 100),
+                                           f"교정 적용 중… {idx + 1}/{total} ({count}곳)")
                         # self_matching이면 검색 직전 커서를 기록(랩어라운드 감지용)
                         prev_cursor = None
                         if self_matching:
@@ -1771,7 +1812,11 @@ class HwpBridge:
     # ⚠ 예전엔 메모 본문 끝에 '· 이 낱말 N곳 중 k번째'를 붙였다. 사용자 지정으로
     #   **제거**했다(2026-08-10) — 반복 횟수는 정오표가 등장 1곳 = 1행으로 말하고,
     #   말풍선에 또 적으면 편집자가 읽을 것만 늘어난다. 되살리려면 그 결정부터 확인할 것.
-    _MEMO_MAX_OCC = 100
+    # 등장 수를 모를 때(전자동 등)의 안전 상한 / 등장 수를 알 때의 절대 상한.
+    #   ⚠ 예전엔 하나(100)로 둘 다 했다 — doc_occ가 172여도 100에서 잘려 101번째
+    #     이후 등장(제외 자리를 지나 155번째에 있던 진짜 등장 등)에 메모가 닿지 못했다.
+    _MEMO_FALLBACK_OCC = 100
+    _MEMO_MAX_OCC = 5000
     _MEMO_MAX_PASSES = 4
     # 메모 컨트롤 하나가 문단 위치에서 차지하는 칸 수(실측 2026-08-07, 한/글 2010).
     #   삽입 전 15~19에 있던 4글자 낱말이 삽입 후 23~27로 밀렸다 → 8칸.
@@ -2230,7 +2275,7 @@ class HwpBridge:
             #   doc_occ는 아무것도 바꾸지 않은 문서를 같은 RepeatFind로 센 값이라
             #   메모가 만든 매치에 부풀 수도 없다 — occ_total보다 엄격히 낫다.
             doc_occ = int(item.get("doc_occ") or 0)
-            occ_cap = doc_occ or occ_total or self._MEMO_MAX_OCC
+            occ_cap = doc_occ or occ_total or self._MEMO_FALLBACK_OCC
             occ_cap = min(occ_cap, self._MEMO_MAX_OCC)
 
             try:
@@ -2433,11 +2478,18 @@ class HwpBridge:
         except Exception:
             pass
 
-        if os.path.exists(output_path):
+        # ★성공 판정은 '파일이 있다'가 아니라 **'이번에 새로 써졌다'**다. 예전엔 존재만
+        #   봤는데, 이전 실행의 PDF가 뷰어에 열려(잠겨) 있으면 아래 삭제가 실패하고
+        #   한/글도 덮어쓰지 못한다 — 그런데 옛 파일이 그대로 있으니 '변환 성공'으로
+        #   보고했고, 주석 단계는 **이미 주석이 달린 옛 PDF**를 다시 읽었다(실측 2026-10-16).
+        before = _file_stamp(output_path)
+        locked = False
+        if before is not None:
             try:
                 os.remove(output_path)
             except Exception:
-                pass
+                locked = True
+                _send_log("[PDF] 이전 PDF를 지우지 못했습니다 — 다른 프로그램이 열고 있을 수 있음")
 
         # 한/글 2010에서 세 경로 모두 17쪽 전체를 정상 출력했다(실측). 앞의 것이
         #   실패하는 버전이 있을 수 있어 순서대로 폴백한다.
@@ -2459,7 +2511,7 @@ class HwpBridge:
                 self.hwp.HAction.Execute(action, pset.HSet)
             except Exception as exc:
                 last = f"{action}: {exc}"
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            if _written(output_path, before):
                 _send_log(f"[PDF] {action} 성공 — {os.path.getsize(output_path)}B")
                 return {"pdf": output_path, "size": os.path.getsize(output_path)}
 
@@ -2467,10 +2519,14 @@ class HwpBridge:
             self.hwp.SaveAs(output_path, "PDF", "")
         except Exception as exc:
             last = f"SaveAs: {exc}"
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        if _written(output_path, before):
             _send_log(f"[PDF] SaveAs 성공 — {os.path.getsize(output_path)}B")
             return {"pdf": output_path, "size": os.path.getsize(output_path)}
 
+        if locked:
+            raise RuntimeError(
+                f"PDF 파일을 덮어쓸 수 없습니다 — '{os.path.basename(output_path)}'이(가) "
+                "다른 프로그램(PDF 뷰어 등)에 열려 있으면 닫고 다시 시도하세요.")
         raise RuntimeError(
             "PDF로 저장하지 못했습니다. 한/글에 PDF 변환 기능(한컴 PDF)이 설치돼 "
             f"있는지 확인하세요. 마지막 오류: {last or '알 수 없음'}"
@@ -2481,25 +2537,40 @@ class HwpBridge:
         # HWP 2010 (8.5.x)은 `SaveAs(Path, Format, arg)` 3개 인자를 요구하며,
         # 1개만 주면 DISP_E_BADPARAMCOUNT (-2147352562)로 실패한다.
         # Open과 동일한 폴백 패턴 적용.
+        #
+        # ★★예외가 없다고 저장된 게 아니다(실측 2026-10-16). 대상 파일이 다른 한/글에
+        #   열려 있으면 `SaveAs`는 예외 없이 **False**를 돌려주고 파일은 그대로다. 예전엔
+        #   반환값을 보지 않아 '저장 완료'로 보고했고, 사용자는 **이전 실행의 교정본**을
+        #   새 결과로 받았다. 게다가 문서가 저장되지 않은 채(dirty) 닫히면서 원본 파일에
+        #   대한 '저장할까요?' 모달이 좀비 한/글에 남았다(→ close의 Clear(1)).
+        #   그래서 반환값 False와 '파일이 이번에 새로 써졌는가'를 둘 다 확인한다.
         ext = os.path.splitext(output_path)[1].lower()
         fmt = _HWP_FORMAT_BY_EXT.get(ext, "")
 
-        last_exc = None
+        before = _file_stamp(output_path)
+        last = ""
         for args, label in (
             ((output_path, fmt, ""), "3-args (HWP 2010 표준)"),
             ((output_path, fmt),     "2-args"),
             ((output_path,),         "1-arg"),
         ):
             try:
-                self.hwp.SaveAs(*args)
+                ret = self.hwp.SaveAs(*args)
+            except Exception as exc:
+                last = f"{label}: {exc}"
+                _send_log(f"[저장] SaveAs 실패 — {last}")
+                continue
+            if ret is not False and _written(output_path, before):
                 _send_log(f"[저장] SaveAs 성공 — {label}, fmt={fmt or 'auto'}")
                 return {"saved": output_path}
-            except Exception as exc:
-                last_exc = exc
-                _send_log(f"[저장] SaveAs 실패 — {label}: {exc}")
-                continue
+            last = f"{label}: 반환값 {ret!r} · 파일이 갱신되지 않음"
+            _send_log(f"[저장] SaveAs 실패 — {last}")
 
-        raise RuntimeError(f"HWP SaveAs 모든 시그니처 시도 실패: {last_exc}")
+        if before is not None and not _written(output_path, before):
+            raise RuntimeError(
+                f"'{os.path.basename(output_path)}'을(를) 저장하지 못했습니다 — 같은 이름의 "
+                "파일이 한/글 등 다른 프로그램에 열려 있으면 닫고 다시 시도하세요.")
+        raise RuntimeError(f"HWP SaveAs 모든 시그니처 시도 실패: {last}")
 
     def close(self):
         # 워처가 아직 살아있으면(open 중 예외 등) 정리
@@ -2510,6 +2581,16 @@ class HwpBridge:
                 pass
             self._hider = None
         if self.hwp:
+            # ★변경을 **버리고** 닫는다(Clear(1) = hwpDiscard). 저장하지 않은(저장에
+            #   실패했거나 취소된) 문서를 그대로 Quit하면 한/글이 **원본 파일**에 대한
+            #   '저장할까요?' 모달(기본 버튼 '저장')을 띄운 채 남는다 — 브리지가 15초 뒤
+            #   kill되면 그 모달이 주인 없는 창으로 화면에 떠 있고, '저장'을 누르면 원고
+            #   원본이 교정 내용으로 덮어써진다(실측 2026-10-16). 저장할 것은 이미
+            #   save_as가 저장했으므로 여기서 버릴 것은 없다.
+            try:
+                self.hwp.Clear(1)
+            except Exception:
+                pass
             try:
                 self.hwp.Quit()
             except Exception:

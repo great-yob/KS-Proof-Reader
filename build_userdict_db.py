@@ -53,6 +53,19 @@ DATA_DIR = Path(__file__).parent / "data"
 DB_PATH = DATA_DIR / "userdict.db"
 STDICT_PATH = DATA_DIR / "stdict.db"
 DEFAULT_SNAPSHOT = DATA_DIR / "userdict" / "snapshot.json"
+# ★빌드본(앱 안의 서버 동기화가 이 모듈을 부른다)에서는 위 경로가 **번들 내부**
+#   (`_internal/data`)가 된다(2026-10-17 감사). 그래서 ① 동기화 결과를 번들 안에 쓰고
+#   ② stdict.db를 못 찾아 **동형이의어 가드(가드 2·3)가 조용히 꺼졌다** — '[경고] … 없음'
+#   출력은 창 없는 앱에서 아무에게도 보이지 않는다. 쓰기는 사용자 폴더, 사전은 앱이 실제로
+#   쓰는 사전(`datapaths.data_dir`)으로 고친다. 개발 환경에서는 둘 다 위 값 그대로다.
+try:
+    import datapaths as _dp
+    DB_PATH = _dp.userdict_runtime_path()
+    STDICT_PATH = _dp.data_dir() / "stdict.db"
+    if _dp.is_frozen():
+        DEFAULT_SNAPSHOT = _dp.cache_dir() / "userdict" / "snapshot.json"
+except Exception:
+    pass
 
 _SCOPES = {"all", "spacing"}
 

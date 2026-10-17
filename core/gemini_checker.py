@@ -66,6 +66,27 @@ _QUOTA_KEYWORDS = (
 def _is_quota_error(msg: str) -> bool:
     return any(k in msg for k in _QUOTA_KEYWORDS)
 
+
+# ★429에는 두 종류가 있다 — **분당**(RPM·분당 입력 토큰)과 **일일**(RPD).
+#   Gemini는 어느 한도에 걸렸는지 `quotaId`로 알려 준다(소문자화한 메시지 기준):
+#     'generaterequestsperdayperprojectpermodel-freetier'   → 일일, 오늘은 끝
+#     'generaterequestsperminuteperprojectpermodel-freetier' → 분당, 수십 초면 풀린다
+#   예전엔 둘을 가리지 않고 429면 그 모델을 **실행 끝까지 차단**했다(2026-10-16 감사).
+#   분당 한도는 청크 몇 개를 연달아 보내면 흔히 닿는데, 그때마다 1순위 모델(500 RPD)을
+#   버리고 하위 모델(3.5-flash 20 RPD)로 내려가 실행 대부분을 그 모델로 돌았다.
+#   그래서 **일일 한도라는 증거가 있을 때만** 차단한다.
+def _is_daily_quota(msg: str) -> bool:
+    return "perday" in msg or "per day" in msg
+
+
+def _retry_delay_s(msg: str) -> float:
+    """429 응답이 알려 준 대기 시간(초) — `RetryInfo.retryDelay: '33s'`. 없으면 0."""
+    m = re.search(r"retry_?delay\W{0,4}(\d+(?:\.\d+)?)s", msg)
+    return float(m.group(1)) if m else 0.0
+
+
+_RPM_WAIT_CAP = 60.0      # 분당 한도 대기의 상한(초) — 서버 값이 이상해도 오래 멈추지 않게
+
 # S9: 일시 오류(429/5xx/타임아웃/네트워크) 재시도 백오프(초). 무료 티어 15 RPM의
 #   분당 할당량 회복을 고려해 두 번째 대기를 길게 둔다. 총 시도 = 1 + len(딜레이).
 _RETRY_DELAYS = (5.0, 15.0)
@@ -648,6 +669,7 @@ class GeminiChecker:
 
             transient = False
             forced_fallback = False
+            rpm_wait = 0.0          # 분당 한도 429가 알려 준 대기(초) — 백오프에 반영
             last_idx = len(models_to_try) - 1
             for idx, model_id in enumerate(models_to_try):
                 try:
@@ -691,7 +713,7 @@ class GeminiChecker:
                     #   무료 티어는 모델별로 한도가 따로라(3.5-lite 500 RPD, 3.1-lite 500 RPD)
                     #   한쪽이 마르면 다른 쪽이 살아 있다. 백오프로 기다리는 것보다 훨씬 빠르고,
                     #   재시도 소진 후 청크를 통째로 버리는 '조용한 교정 누락'도 막는다.
-                    if _is_quota_error(msg):
+                    if _is_quota_error(msg) and _is_daily_quota(msg):
                         self._quota_blocked.add(model_id)
                         remaining = [m for m in models_to_try
                                      if m not in self._quota_blocked]
@@ -704,6 +726,23 @@ class GeminiChecker:
                         if logger:
                             logger("  [AI] 모든 후보 모델의 한도가 소진됨 — 백오프 후 재시도")
                         transient = True
+                        break
+                    if _is_quota_error(msg):
+                        # ★분당 한도(또는 종류를 알 수 없는 429) — **차단하지 않는다**.
+                        #   다음 모델로 넘기되, 마지막 후보였다면 서버가 알려 준 만큼 기다린다
+                        #   (`_is_daily_quota` 주석). 종류를 모르는 429를 일일로 오판하면 실행
+                        #   내내 좋은 모델을 버리고, 분당으로 오판하면 청크마다 한 번 빨리 실패할
+                        #   뿐이다 — 그래서 증거가 없으면 이쪽으로 둔다.
+                        rpm_wait = max(rpm_wait, _retry_delay_s(msg))
+                        transient = True
+                        if idx < last_idx:
+                            # ⚠ 고정을 풀지 않는다 — 풀면 이번에 성공한 백업 모델로 **재고정**돼
+                            #   1분 뒤 풀릴 1순위로 다시는 돌아오지 않는다(백업이 3.5-flash면
+                            #   일일 20회짜리로 실행 내내 돈다). 다음 청크는 1순위부터 다시 묻는다.
+                            if logger:
+                                logger(f"  [AI] '{model_id}' 분당 한도 — "
+                                       f"다음 모델 '{models_to_try[idx + 1]}'로 전환")
+                            continue
                         break
                     # 일시 오류(5xx/타임아웃/네트워크)는 재시도 대상
                     transient = _is_transient_error(msg)
@@ -726,7 +765,9 @@ class GeminiChecker:
             if forced_fallback and attempt < max_tries - 1:
                 continue   # 딜레이 없이 다음 시도(=퇴각 프롬프트)로
             if transient and attempt < max_tries - 1:
-                delay = _RETRY_DELAYS[attempt]
+                # 분당 한도라면 서버가 말한 시간만큼은 기다린다 — 그보다 짧게 쉬면 같은
+                #   429를 또 맞고 재시도만 소진한다.
+                delay = max(_RETRY_DELAYS[attempt], min(rpm_wait, _RPM_WAIT_CAP))
                 if logger:
                     logger(f"  [AI] 일시 오류({type(last_exc).__name__}) — "
                            f"{delay:.0f}초 후 재시도 ({attempt + 2}/{max_tries})")

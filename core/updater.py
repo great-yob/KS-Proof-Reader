@@ -210,6 +210,22 @@ def download(info: dict, progress: Optional[Callable[[int, int], None]] = None,
 # ▌설치
 # ══════════════════════════════════════════════════════
 
+def _discard_download(zip_path) -> None:
+    """`download()`가 만든 임시 폴더(ksproof-upd-*)를 지운다 — 설치가 끝나면 필요 없다.
+
+    ⚠ **우리가 만든 폴더일 때만** 지운다(이름 접두사 + %TEMP% 바로 아래). 호출자가
+      다른 곳의 zip을 넘겼다면 손대지 않는다 — 업데이터가 %TEMP%를 통째로 지운 사고
+      (_HELPER 주석)와 같은 부류를 다시 만들지 않기 위함이다.
+    """
+    try:
+        d = Path(zip_path).resolve().parent
+        if (d.name.startswith("ksproof-upd-")
+                and d.parent == Path(tempfile.gettempdir()).resolve()):
+            shutil.rmtree(d, ignore_errors=True)
+    except Exception:
+        pass
+
+
 def install_data(zip_path: Path, logger: Optional[Callable[[str], None]] = None,
                  dest: Optional[Path] = None) -> bool:
     """데이터 패키지를 user_dir()/data 에 설치한다. 앱 재시작만 필요(교체 아님).
@@ -233,8 +249,11 @@ def install_data(zip_path: Path, logger: Optional[Callable[[str], None]] = None,
         staging = dest.parent / "data.new"
         shutil.rmtree(staging, ignore_errors=True)
         staging.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(zip_path) as z:
-            z.extractall(staging)
+        try:
+            with zipfile.ZipFile(zip_path) as z:
+                z.extractall(staging)
+        finally:
+            _discard_download(zip_path)      # 풀었으면 zip은 필요 없다(131MB)
         # 최소 무결성 — stdict.db가 있고 열리는가.
         db = staging / "stdict.db"
         if not db.exists():
@@ -250,11 +269,31 @@ def install_data(zip_path: Path, logger: Optional[Callable[[str], None]] = None,
             log(f"  ✗ 데이터 무결성 실패(단어 {n:,} · 테이블 {sorted(tabs)}) — 설치 취소")
             shutil.rmtree(staging, ignore_errors=True)
             return False
+        # ★검증을 마쳤다는 표식 — 지금 못 바꾸면 다음 시작 때 `datapaths.apply_pending_data`가
+        #   이 표식이 있는 대기본만 제자리로 옮긴다(표식이 없으면 끊긴 미완성본으로 보고 버린다).
+        from datapaths import _PENDING_READY
+        (staging / _PENDING_READY).write_text("ok", encoding="ascii")
         old = dest.parent / "data.old"
         shutil.rmtree(old, ignore_errors=True)
-        if dest.exists():
-            dest.rename(old)
-        staging.rename(dest)
+        try:
+            if dest.exists():
+                dest.rename(old)
+            try:
+                staging.rename(dest)
+            except OSError:
+                if old.exists() and not dest.exists():
+                    old.rename(dest)            # 되돌림 — 지금 쓰는 사전을 잃지 않는다
+                raise
+        except OSError:
+            # ★실행 중인 앱이 사전을 열어 두고 있어 폴더를 못 바꾼다(두 번째 업데이트부터
+            #   언제나 그렇다 — `datapaths.apply_pending_data` 주석). 실패가 아니다: 검증된
+            #   대기본을 남겨 두면 다음 시작 때 사전을 열기 **전에** 교체된다.
+            log(f"  ✔ 데이터 설치 준비 완료({n:,} 단어) — 앱을 다시 시작하면 적용됩니다.")
+            return True
+        try:
+            (dest / _PENDING_READY).unlink()
+        except OSError:
+            pass
         shutil.rmtree(old, ignore_errors=True)
         log(f"  ✔ 데이터 설치 완료({n:,} 단어) — 앱을 다시 시작하면 적용됩니다.")
         return True
@@ -275,6 +314,11 @@ def install_data(zip_path: Path, logger: Optional[Callable[[str], None]] = None,
 # ⚠ 배치 본문은 **ASCII만** 쓴다. cmd는 .bat을 OEM 코드페이지(한국어 Windows=949)로
 #   읽는데 이 파일은 UTF-8로 저장되므로, 한글 주석을 넣으면 깨진 바이트가 섞인다.
 #   (예전엔 chcp 65001로 버텼지만 창이 없으면 그마저 의미가 없다.)
+# ⚠⚠ 마지막 `rmdir`의 대상 `{tmp}`는 **이 업데이트 전용 작업 폴더**여야 한다
+#   (`install_app`의 `work`). 예전엔 `staging.parent`를 넘겼는데 그게 곧 `%TEMP%`
+#   자체라, 인앱 업데이트를 할 때마다 **사용자의 임시 폴더 전체**(다른 프로그램의
+#   임시·복구 파일 포함)를 재귀 삭제했다(2026-10-16 감사에서 발견). `{tmp}`에는
+#   `tempfile.mkdtemp()`가 만든 폴더 말고는 절대 넘기지 말 것.
 _HELPER = r"""@echo off
 rem KS-AI Editor updater helper: wait for the app to exit, swap the folder, relaunch.
 :wait
@@ -365,17 +409,24 @@ def install_app(zip_path: Path, logger: Optional[Callable[[str], None]] = None,
             log("  ✗ 개발 환경에서는 앱 자동 업데이트를 수행하지 않습니다.")
             return False
         dst = app_dir()
-        staging = Path(tempfile.mkdtemp(prefix="ksproof-app-"))
-        with zipfile.ZipFile(zip_path) as z:
-            z.extractall(staging)
+        # ★이 업데이트 **전용** 작업 폴더 — 패키지(pkg/)와 헬퍼 배치가 여기 들어가고,
+        #   헬퍼가 마지막에 지우는 것도 이 폴더뿐이다(_HELPER의 ⚠⚠ 주석 — 예전엔
+        #   staging.parent = %TEMP% 전체를 지웠다).
+        work = Path(tempfile.mkdtemp(prefix="ksproof-app-"))
+        staging = work / "pkg"
+        try:
+            with zipfile.ZipFile(zip_path) as z:
+                z.extractall(staging)
+        finally:
+            _discard_download(zip_path)      # 풀었으면 zip은 필요 없다(93MB)
         exe = dst / f"{Path(sys.executable).name}"
         if not (staging / exe.name).exists():
             log("  ✗ 앱 패키지에 실행 파일이 없습니다 — 설치 취소")
-            shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(work, ignore_errors=True)
             return False
-        bat = staging.parent / "ks_update.bat"
+        bat = work / "ks_update.bat"
         bat.write_text(_HELPER.format(pid=os.getpid(), src=str(staging), dst=str(dst),
-                                      exe=str(exe), tmp=str(staging.parent),
+                                      exe=str(exe), tmp=str(work),
                                       arp=_arp_update_cmds(version) if version else ""),
                        encoding="utf-8")
         # CREATE_NO_WINDOW — 콘솔은 생기되 화면에 보이지 않는다(HWP 브리지 워커와 동일

@@ -32,6 +32,16 @@ from typing import Optional
 # ══════════════════════════════════════════════════════
 
 def _resolve_db_path() -> Path:
+    # ★사전(stdict.db)과 **같은 규칙**으로 찾는다(datapaths — 데이터 버전이 가장 높은 데이터
+    #   폴더 우선). 예전엔 번들 내부·EXE 옆만 봐서, 데이터 패키지에 새 eomun.db가 들어 있어도
+    #   인앱 데이터 업데이트(사용자 폴더 설치)가 **반영되지 않았다**(2026-10-17 감사).
+    try:
+        from datapaths import find_data
+        p = find_data("eomun.db")
+        if p is not None:
+            return p
+    except Exception:
+        pass
     candidates = []
     if getattr(sys, "frozen", False):
         candidates.append(Path(sys._MEIPASS) / "data" / "eomun.db")            # type: ignore[attr-defined]

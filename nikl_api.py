@@ -33,7 +33,13 @@ _mem: dict = {}         # 세션 인메모리 캐시 {word: bool}
 _conn: Optional[sqlite3.Connection] = None
 _last_call = 0.0
 _key_cache: Optional[str] = None
-_disabled = False       # 키 없음/requests 없음 → 영구 비활성(재시도 안 함)
+_disabled = False       # 키 없음/requests 없음/API 오류 응답 → 이 실행 동안 비활성(재시도 안 함)
+_last_error = ""        # 마지막 API 오류(코드·메시지) — 호출 측 로그용
+
+# 캐시 형식 버전. 2 = '오류 응답을 미등재로 영구 캐시'하던 결함(아래 _parse_response)을
+#   고친 판. 이전 판이 쌓은 **미등재(found=0)** 항목은 오류 응답이 섞였을 수 있어 한 번
+#   비운다 — 등재(found=1)는 실제 표제어가 일치해야만 기록되므로 그대로 둔다.
+_CACHE_VER = 2
 
 
 def _norm(w: str) -> str:
@@ -64,10 +70,35 @@ def _get_conn() -> Optional[sqlite3.Connection]:
             _conn.execute(
                 "CREATE TABLE IF NOT EXISTS cache "
                 "(word TEXT PRIMARY KEY, found INTEGER, ts TEXT)")
+            _migrate_cache(_conn)
             _conn.commit()
         except Exception:
             _conn = None
     return _conn
+
+
+def _migrate_cache(conn) -> None:
+    """캐시 형식 버전이 낮으면 미등재 항목을 비운다(_CACHE_VER 주석).
+
+    ⚠ 테이블 이름은 `nikl_cache_meta`다 — 같은 api_cache.db를 onterm_api가 함께 쓰므로
+      범용 이름(meta 등)을 피하고, 온용어 캐시(onterm_cache)는 건드리지 않는다.
+    """
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS nikl_cache_meta "
+                     "(key TEXT PRIMARY KEY, value TEXT)")
+        row = conn.execute(
+            "SELECT value FROM nikl_cache_meta WHERE key='cache_ver'").fetchone()
+        if row is None or int(row[0] or 0) < _CACHE_VER:
+            conn.execute("DELETE FROM cache WHERE found=0")
+            conn.execute("INSERT OR REPLACE INTO nikl_cache_meta VALUES('cache_ver', ?)",
+                         (str(_CACHE_VER),))
+    except Exception:
+        pass
+
+
+def last_error() -> str:
+    """이번 실행에서 우리말샘 API가 돌려준 오류(없으면 ""). 오류가 나면 조회가 멈춘다."""
+    return _last_error
 
 
 def _get_key() -> str:
@@ -124,21 +155,64 @@ def available() -> bool:
         return False
 
 
+def _api_error(text: str) -> str:
+    """응답이 **API 오류 응답**이면 '코드 메시지', 아니면 "".
+
+    실측(2026-10-16, 무효 키): HTTP 200 + `<error><error_code>020</error_code>
+    <message>Unregistered key</message></error>` — req_type=json을 줘도 XML이 온다.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if text[0] in "{[":
+        try:
+            import json
+            d = json.loads(text)
+            e = d.get("error") if isinstance(d, dict) else None
+            if e:
+                if isinstance(e, dict):
+                    return f"{e.get('error_code', '')} {e.get('message', '')}".strip() or "error"
+                return str(e)
+            return ""
+        except Exception:
+            pass
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(text)
+        err = root if root.tag.lower() == "error" else root.find(".//error")
+        if err is not None:
+            code = (err.findtext("error_code") or "").strip()
+            msg = (err.findtext("message") or "").strip()
+            return f"{code} {msg}".strip() or "error"
+    except Exception:
+        pass
+    return ""
+
+
 def _parse_response(text: str):
     """응답(JSON 또는 XML)에서 (total, [word, ...]) 추출. 실패 시 (None, []).
 
     우리말샘 API는 req_type=json을 줘도 인증오류·설정에 따라 XML로 응답하기도 한다.
     두 포맷을 모두 파싱해 폴백이 조용히 무력화되지 않게 한다.
+
+    ★★(None, [])은 '확인 불가'(캐시 안 함), (0, [])은 '미등재 확정'(영구 캐시)이다 —
+      둘을 섞으면 안 된다. 예전엔 오류 응답(루트가 `<error>`인 XML — `.//error`는 루트
+      자신을 못 찾는다 — 또는 `{"error": …}` JSON)이 total 0으로 읽혀 **조회한 낱말이
+      전부 '미등재'로 영구 캐시**됐다. 키를 교체·회수하는 순간 모든 사용자 PC의 캐시가
+      오염되는 경로였다(2026-10-16 감사, 무효 키로 실측). 그래서 이제 **결과 형식이
+      확인될 때만**(channel / total 요소가 있을 때만) 숫자를 돌려준다.
     """
     text = (text or "").strip()
-    if not text:
+    if not text or _api_error(text):
         return None, []
     if text[0] in "{[":
         try:
             import json
             d = json.loads(text)
-            ch = d.get("channel", d) or {}
-            total = int(ch.get("total", 0) or 0)
+            ch = d.get("channel") if isinstance(d, dict) else None
+            if not isinstance(ch, dict) or "total" not in ch:
+                return None, []                 # 알 수 없는 형식 — 확인 불가
+            total = int(ch.get("total") or 0)
             items = ch.get("item", []) or []
             if isinstance(items, dict):
                 items = [items]
@@ -148,10 +222,10 @@ def _parse_response(text: str):
     try:
         import xml.etree.ElementTree as ET
         root = ET.fromstring(text)
-        if root.find(".//error") is not None:   # <error><message>Unregistered key</message>
-            return None, []
         tot_el = root.find(".//total")
-        total = int(tot_el.text) if (tot_el is not None and tot_el.text) else 0
+        if tot_el is None or not (tot_el.text or "").strip():
+            return None, []                     # 알 수 없는 형식 — 확인 불가
+        total = int(tot_el.text)
         words = [(w.text or "") for w in root.findall(".//item/word")]
         return total, words
     except Exception:
@@ -160,7 +234,7 @@ def _parse_response(text: str):
 
 def _query_api(word: str) -> Optional[bool]:
     """라이브 우리말샘 조회. True/False, 오류 시 None(캐시 안 함)."""
-    global _last_call
+    global _last_call, _disabled, _last_error
     key = _get_key()
     if not key:
         return None
@@ -178,6 +252,13 @@ def _query_api(word: str) -> Optional[bool]:
         r = requests.get(_API_URL, params=params, timeout=_TIMEOUT)
         _last_call = time.time()
         if r.status_code != 200:
+            return None
+        err = _api_error(r.text)
+        if err:
+            # 키 무효·회수·한도 초과 등 — 같은 응답이 낱말마다 반복되므로 이 실행 동안은
+            #   더 묻지 않는다(호출 측은 last_error()로 사유를 로그에 남긴다).
+            _disabled = True
+            _last_error = err
             return None
         total, words = _parse_response(r.text)
     except Exception:

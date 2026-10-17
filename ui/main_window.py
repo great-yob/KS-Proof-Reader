@@ -118,6 +118,9 @@ class MainWindow(QMainWindow):
         #   슬롯에 둔다(1차 결과 dict를 덮어쓰면 안 되므로 완료 핸들러가 다르다).
         self._extra_worker = None
         self._extra_mode = ""
+        # 적용 워커의 **치명적이지 않은** 경고 — 완료 화면이 뜬 뒤 한 번에 보여 준다
+        #   (`_on_worker_warning` 주석).
+        self._pending_warnings = []
         # 1차 적용에 넘긴 등장별 결정 스냅숏 — 추가 산출물이 **같은 결정**을 쓰게 한다.
         self._applied_occ_rows = None
         self._sync_workers = []   # 공유 용어 뇌 동기화 워커(단명, fire-and-forget)
@@ -724,6 +727,8 @@ class MainWindow(QMainWindow):
         self._apply_worker.log_message.connect(self.activity.log)
         self._apply_worker.finished.connect(self._on_apply_done)
         self._apply_worker.error.connect(self._on_error)
+        self._apply_worker.warning.connect(self._on_worker_warning)
+        self._pending_warnings = []
         self._apply_worker.start()
 
     def _capture_correction_events(self):
@@ -973,6 +978,7 @@ class MainWindow(QMainWindow):
             self.rail.set_step_result("done", f"적용 : {applied}건")
         self.running_panel.set_animating(False)
         self._show_phase("result")
+        self._flush_warnings()
 
     # ══════════════════════════════════════════════
     # 결과물 추가 — 검토를 다시 거치지 않고 산출물을 하나 더
@@ -1027,16 +1033,22 @@ class MainWindow(QMainWindow):
         #     별개의 파일이 되어 사용자가 어느 쪽을 써야 할지 알 수 없게 된다.
         src = self._file_path
         if mode == "hwp_memo":
-            done_hwp = self._result.get("hwp_path") or ""
+            done_hwp, done_rows = self._corrected_hwp()
             if done_hwp and os.path.exists(done_hwp):
                 src = done_hwp
                 opts["source_is_corrected"] = True
+                # 치환 결과의 정본 = 그 교정본을 만든 실행의 정오표 행(ApplyWorker 주석).
+                opts["base_errata_rows"] = done_rows
                 # 산출 이름은 **원본 기준**으로 짓는다 — 교정본을 입력으로 받았다고
                 #   `…_교정본_교정본(메모).hwp`가 되면 안 된다.
                 base, ext = os.path.splitext(self._file_path)
                 opts["hwp_output_path"] = base + "_교정본(메모)" + ext
                 self.activity.log("[추가] 이미 만든 교정본에 메모를 답니다 "
                                   "· 교정 자리(빨간색)만 표시")
+            else:
+                # 교정본이 없다(1차가 메모본·PDF·정오표만) — 원본에서 결합 모드를 그대로
+                #   돈다(치환 + 메모). 결과는 1차 실행의 결합 모드와 같다.
+                self.activity.log("[추가] 교정본이 없어 원본에서 교정본+메모를 새로 만듭니다")
 
         self._extra_mode = mode
         self._phase = "extra_running"
@@ -1059,7 +1071,28 @@ class MainWindow(QMainWindow):
         self._extra_worker.log_message.connect(self.activity.log)
         self._extra_worker.finished.connect(self._on_extra_done)
         self._extra_worker.error.connect(self._on_extra_error)
+        self._extra_worker.warning.connect(self._on_worker_warning)
+        self._pending_warnings = []
         self._extra_worker.start()
+
+    def _corrected_hwp(self) -> tuple:
+        """이번 결과에서 **교정본**(치환만 한 `_교정본.hwp`)의 (경로, 정오표 행) — 없으면 ("", []).
+
+        ★`result["hwp_path"]`를 그대로 쓰면 안 된다(2026-10-16 감사 실측). 그 칸은
+          '1차 실행이 만든 한글 파일'이라 1차가 **메모본**이면 `_메모본.hwp`가 들어 있다.
+          메모본은 글자를 하나도 고치지 않은 파일인데 그것을 교정본으로 여겨 메모만 달자
+          `_교정본(메모).hwp`에 교정 51건 중 **0건**이 반영됐다 — 이름은 교정본인데 원고
+          그대로인 파일이 조용히 나왔다.
+        ⚠ 결합 모드('교정본+메모') 산출물도 후보가 아니다 — 이미 메모가 달려 있어 그 위에
+          또 달면 메모가 겹친다(그 모드는 이미 만들었으니 추가 버튼도 잠겨 있다).
+        """
+        r = self._result or {}
+        if r.get("output_mode") == "hwp" and r.get("hwp_path"):
+            return r["hwp_path"], list(r.get("errata_rows") or [])
+        for e in (r.get("extra_outputs") or []):
+            if e.get("mode") == "hwp" and e.get("path"):
+                return e["path"], list(e.get("errata_rows") or [])
+        return "", []
 
     def _extra_errata_path(self, mode: str) -> str:
         """추가 실행이 쓸 정오표 경로 — **언제나** 모드 이름을 붙인다.
@@ -1122,6 +1155,11 @@ class MainWindow(QMainWindow):
             "memo": f"메모 {entry['memoed']}곳"
                     + (f" · 표시 못 함 {entry['unmarked'] or entry['memo_blocked']}곳"
                        if (entry["unmarked"] or entry["memo_blocked"]) else ""),
+            # 결합 모드 — 교정본 위에 단 실행은 치환이 0건이라 메모 수치만 남는다.
+            "hwp_memo": ((f"적용 {entry['applied']}건 · " if entry["applied"] else "")
+                         + f"메모 {entry['memoed']}곳"
+                         + (f" · 표시 못 함 {entry['unmarked']}곳"
+                            if entry["unmarked"] else "")),
             "pdf":  f"주석 {entry['annotated']}곳"
                     + (f" · 미탐 {entry['pdf_missing']}건"
                        if entry["pdf_missing"] else ""),
@@ -1130,6 +1168,27 @@ class MainWindow(QMainWindow):
         # ⚠ 화면 로그 규약: `[태그]` + 수치를 앞에, 구분은 ' · '(' — '는 잘린다).
         self.activity.log(f"✓ [추가] {label} 생성 완료 · {detail}")
         self._finish_extra()
+        self._flush_warnings()
+
+    def _on_worker_warning(self, message: str):
+        """적용 워커의 **치명적이지 않은** 문제(정오표 저장 실패·PDF 주석 실패 등).
+
+        ★뒤이어 finished가 온다 — 그래서 여기서는 화면을 바꾸지 않고 모아 두기만 한다.
+          예전엔 이것이 `error`를 타고 `_on_error`로 갔다: 모달을 띄우고 **설정 화면으로**
+          되돌리는데, 그 모달의 중첩 이벤트 루프 안에서 finished가 먼저 처리돼 결과 화면이
+          그려졌다가 모달을 닫는 순간 설정으로 튕겼다(2026-10-16 감사, MainWindow 실측).
+          완료한 작업의 결과 화면을, 곁가지 하나의 실패가 지운 셈이다.
+        """
+        self.activity.log(message, level="err")
+        self._pending_warnings.append(message)
+
+    def _flush_warnings(self):
+        """모아 둔 경고를 결과 화면이 뜬 **다음에** 한 번에 보여 준다(모달은 다음 틱에 —
+        완료 핸들러 안에서 띄우면 그 중첩 루프가 또 다른 신호를 먼저 처리한다)."""
+        msgs, self._pending_warnings = self._pending_warnings, []
+        if msgs:
+            QTimer.singleShot(0, lambda: QMessageBox.warning(
+                self, "일부 결과물을 만들지 못했습니다", "\n\n".join(msgs)))
 
     def _on_extra_error(self, message: str):
         """추가 산출물 실행 중 오류 — **결과 화면에 머문다**.

@@ -2231,11 +2231,30 @@ class ReviewPanel(QWidget):
             return (o is not None and o.get("status") != "rejected"
                     and o["c"].get("status") != "rejected")
 
+        def flag_only(ci):
+            """고칠 말이 없는 '검수 필요' 카드(원문 = 교정문)인가 — 합성 전 값으로 판정."""
+            c = self._corrections[ci]
+            return (c.get("source") == "dict_flag"
+                    and (c.get("_compose_base") or c.get("corrected", ""))
+                    == c.get("original", ""))
+
         # 겉 등장(uid)별로 그 안에 든 속 교정들을 모은다 — 살아 있는 것만.
         by_outer, part_n = {}, {}
         for out_uid, out_ci, in_ci, in_pos, in_uid in self._overlap_pairs():
-            if alive(occ_by_uid.get(out_uid)) and alive(occ_by_uid.get(in_uid)):
-                by_outer.setdefault((out_uid, out_ci), []).append((in_pos, in_ci))
+            o_out, o_in = occ_by_uid.get(out_uid), occ_by_uid.get(in_uid)
+            if not (alive(o_out) and alive(o_in)):
+                continue
+            # ★겉이 '검수 필요' 카드면 **제외(excluded)된 조각은 합성하지 않는다**(사용자 결정
+            #   2026-10-17). '수락 구간 안의 제외 조각은 합성한다'는 규칙의 전제는 "편집자가
+            #   이미 그 구간을 고치기로 했다"인데, 검수 필요 카드의 수락은 '확인했다'일 뿐 고치기로
+            #   한 게 아니다. 그대로 두면 어절 경계 규칙이 일부러 보호한 자리가 검수 카드 수락
+            #   하나로 띄어졌다 — '국가형긴급복지지원' 안의 '긴급복지지원'→'긴급복지 지원'이
+            #   합성돼 낱말이 '국가형긴급복지 지원'이 됐다(감사 실측: 20원고 중 3개·4장).
+            #   ⚠ 같은 자리의 중복 카드('테이블수' 검수 + '테이블수'→'테이블 수')는 제외 조각이
+            #     아니라 그대로 합성한다 — 사실상 띄어쓰기 카드를 보여 주는 것이라 무해하다.
+            if o_in.get("excluded") and flag_only(out_ci):
+                continue
+            by_outer.setdefault((out_uid, out_ci), []).append((in_pos, in_ci))
         for o in self._occ:
             if alive(o) and isinstance(o.get("pos"), int):
                 part_n[o["ci"]] = part_n.get(o["ci"], 0) + 1

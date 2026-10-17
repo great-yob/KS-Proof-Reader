@@ -170,6 +170,13 @@ def pull(logger=None) -> dict:
     except Exception as e:
         log(f"  [동기화] 스냅샷 v{ver} 빌드 실패: {e}")
         return {"pulled": False, "ver": local_ver}
+    # 방금 빌드한 파일을 곧바로 쓰게 한다 — 로더는 import 때 위치를 정해 두므로, 데이터
+    #   패키지의 옛 스냅샷을 보고 있었다면 재시작 전까지 새 스냅샷이 반영되지 않는다.
+    try:
+        from core import userdict
+        userdict.reload()
+    except Exception:
+        pass
     log(f"  [동기화] 사내 용어 사전 v{ver} 적용 (이전 v{local_ver})")
     return {"pulled": True, "ver": ver, "prev": local_ver}
 

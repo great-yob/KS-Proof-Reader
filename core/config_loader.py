@@ -79,25 +79,50 @@ def user_data_dir() -> Path:
     return d
 
 
+def _load_ini(path: Path) -> configparser.ConfigParser:
+    """config.ini 하나를 읽는다 — 읽지 못해도 **앱을 죽이지 않는다**(빈 설정으로).
+
+    ★`utf-8-sig`로 읽는다. 메모장 등이 붙이는 BOM이 있으면 첫 줄이 BOM 문자 + `[API]`가 되어
+      `MissingSectionHeaderError`가 나고, MainWindow 생성 중 예외로 **앱이 뜨지 않았다**
+      (2026-10-16 감사 실측). 형식이 깨진 파일도 같은 이유로 무시하고 알리기만 한다.
+    ⚠ `interpolation=None` — 비밀번호·키에 '%'가 있으면 기본 보간이 조회 때 예외를 낸다.
+    """
+    cp = configparser.ConfigParser(interpolation=None)
+    if not path.exists():
+        return cp
+    try:
+        cp.read(path, encoding="utf-8-sig")
+    except (configparser.Error, OSError, UnicodeDecodeError) as exc:
+        print(f"[설정] '{path}'를 읽지 못해 무시합니다: {exc}", file=sys.stderr, flush=True)
+        cp = configparser.ConfigParser(interpolation=None)
+    return cp
+
+
 class ConfigLoader:
     """API 키 및 앱 설정 관리"""
 
     def __init__(self):
         self._base_dir = _get_base_dir()
-        self._cfg = configparser.ConfigParser()
 
         # 읽기는 두 곳을 **병합**한다(뒤가 우선):
         #   ① EXE 옆 config.ini      — 배포자가 넣어 주는 조직 설정/키 override(선택)
         #   ② 사용자 폴더 config.ini — 앱이 저장하는 개인 설정(테마·창 크기)
         # 쓰기는 항상 ②. 설치 폴더가 읽기 전용(Program Files 등)이어도 설정이 저장된다.
+        #
+        # ★②에는 **②에서 읽은 것과 앱이 바꾼 것만** 쓴다(`_user_cfg`). 예전엔 병합본을
+        #   통째로 썼다 — 테마를 한 번 바꾸는 순간 ①의 배포자 값이 ②로 **복제**되고, ②가
+        #   뒤라 이기므로 그 뒤 배포자가 ①을 바꿔도 영영 반영되지 않았다(2026-10-16 감사).
         side = self._base_dir / "config.ini"
         if getattr(sys, "frozen", False):
             self._cfg_path = user_data_dir() / "config.ini"
         else:
             self._cfg_path = side          # 개발 환경은 기존 그대로 레포 루트
-        paths = [p for p in dict.fromkeys([side, self._cfg_path]) if p.exists()]
-        if paths:
-            self._cfg.read(paths, encoding="utf-8")
+        self._side_cfg = (_load_ini(side) if side != self._cfg_path
+                          else configparser.ConfigParser(interpolation=None))
+        self._user_cfg = _load_ini(self._cfg_path)
+        self._cfg = configparser.ConfigParser(interpolation=None)     # 읽기용 병합본
+        for cp in (self._side_cfg, self._user_cfg):
+            self._cfg.read_dict({sec: dict(cp[sec]) for sec in cp.sections()})
 
     # ── Gemini API 키 ─────────────────────────────────
 
@@ -128,10 +153,7 @@ class ConfigLoader:
 
     def set_gemini_key(self, key: str):
         """사용자가 직접 입력한 키를 config.ini에 저장"""
-        if not self._cfg.has_section("API"):
-            self._cfg.add_section("API")
-        self._cfg.set("API", "GEMINI_API_KEY", key)
-        self._save()
+        self._set("API", "GEMINI_API_KEY", key)
 
     def has_valid_gemini_key(self) -> bool:
         key = self.get_gemini_key()
@@ -193,13 +215,18 @@ class ConfigLoader:
 
     # ── 서버/앱 설정 ──────────────────────────────────
 
+    def _getint(self, section: str, key: str, fallback: int) -> int:
+        """정수 설정 — 값이 숫자가 아니어도 예외 대신 기본값(손으로 고친 config.ini 대비)."""
+        try:
+            return self._cfg.getint(section, key, fallback=fallback)
+        except ValueError:
+            return fallback
+
     def get_server_port(self) -> int:
-        return self._cfg.getint("SERVER", "PORT", fallback=8765)
+        return self._getint("SERVER", "PORT", 8765)
 
     def get_window_size(self) -> tuple:
-        w = self._cfg.getint("APP", "WIDTH", fallback=1400)
-        h = self._cfg.getint("APP", "HEIGHT", fallback=860)
-        return w, h
+        return self._getint("APP", "WIDTH", 1400), self._getint("APP", "HEIGHT", 860)
 
     # ── 테마 (light / dark) ───────────────────────────
 
@@ -208,22 +235,39 @@ class ConfigLoader:
         return "dark" if val == "dark" else "light"
 
     def set_theme(self, mode: str):
-        if not self._cfg.has_section("APP"):
-            self._cfg.add_section("APP")
-        self._cfg.set("APP", "THEME", "dark" if str(mode).lower() == "dark" else "light")
-        self._save()
+        self._set("APP", "THEME", "dark" if str(mode).lower() == "dark" else "light")
 
     # ── 내부 ──────────────────────────────────────────
+
+    def _set(self, section: str, key: str, value: str):
+        """값 하나를 바꾼다 — 병합본(읽기)과 사용자 설정(쓰기) 양쪽에."""
+        for cp in (self._cfg, self._user_cfg):
+            if not cp.has_section(section):
+                cp.add_section(section)
+            cp.set(section, key, value)
+        self._save()
 
     def _save(self):
         """설정 저장 — 실패해도 **절대 예외를 올리지 않는다**.
 
         ⚠ 호출부가 테마 토글 같은 UI 이벤트라, 읽기 전용 폴더에서 예외가 나면 앱이
           죽는다. 저장 실패는 '설정이 유지되지 않는' 정도의 열화로 끝내야 한다.
+        ★사용자 설정만 쓴다(`__init__` 주석). 예전 버전이 이미 복제해 둔 배포자 값 —
+          [APP] 밖에서 ①과 **값이 똑같은** 항목 — 은 여기서 걸러 낸다. 지금 실제 값이
+          같으므로 동작은 그대로이고, 다음에 배포자가 ①을 바꾸면 그대로 반영된다.
         """
+        out = configparser.ConfigParser(interpolation=None)
+        for sec in self._user_cfg.sections():
+            for k, v in self._user_cfg.items(sec, raw=True):
+                if (sec != "APP" and self._side_cfg.has_option(sec, k)
+                        and self._side_cfg.get(sec, k, raw=True) == v):
+                    continue
+                if not out.has_section(sec):
+                    out.add_section(sec)
+                out.set(sec, k, v)
         try:
             self._cfg_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self._cfg_path, "w", encoding="utf-8") as f:
-                self._cfg.write(f)
+                out.write(f)
         except OSError:
             pass

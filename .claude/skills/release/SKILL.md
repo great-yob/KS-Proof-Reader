@@ -107,13 +107,17 @@ UI·업데이터·빌드 스크립트만 고친 릴리스에 그걸 돌리는 �
 그래서 **바뀐 파일 목록으로** 경로를 정한다(사용자 지시 2026-07-23).
 
 ```bash
-GUARD='^(nikl_dict|nikl_api|onterm_api)\.py$|^core/(correction_engine|correction_merger|gemini_checker|prompts|ai_guards|consistency_pass|morph|models|eomun_rules|spelling_pairs|josa_rules|bracket_rules|quote_rules|spacing_rules|userdict)\.py$|^ui/workers/(proofreading|apply)_worker\.py$|^(data|eval)/|^(update_stdict|update_opendict|build_stdict_part|build_norm_map|build_userdict_db|setup_dict)\.py$'
+GUARD='^(nikl_dict|nikl_api|onterm_api)\.py$|^core/(correction_engine|correction_merger|gemini_checker|prompts|ai_guards|consistency_pass|consistency_family|junction_pass|realword|user_dict_file|morph|models|eomun_rules|spelling_pairs|josa_rules|bracket_rules|quote_rules|spacing_rules|userdict)\.py$|^ui/workers/(proofreading|apply)_worker\.py$|^(data|eval)/|^(update_stdict|update_opendict|build_stdict_part|build_norm_map|build_userdict_db|setup_dict)\.py$'
 LAST=$(git describe --tags --abbrev=0 --match 'v*')
 git diff --name-only $LAST..HEAD
 git diff --name-only $LAST..HEAD | grep -E "$GUARD" && echo "⇒ 전체 게이트" || echo "⇒ 빠른 릴리스"
 ```
 
 - **하나라도 걸리면 → 전체 게이트**(1-b 수행). 교정 판단이 달라질 수 있는 파일들이다.
+  ⚠ **새 교정 모듈을 만들면 이 목록에도 넣을 것.** 2026-10-16 감사 때 워커가 실제로 쓰는
+  `junction_pass`·`consistency_family`·`realword`·`user_dict_file` 넷이 빠져 있어, 그것만
+  고친 릴리스가 골드셋 없이 '빠른 릴리스'로 나갈 수 있었다. 점검법:
+  `grep -ohE "from core(\.[a-z_]+)? import [a-z_]+" ui/workers/proofreading_worker.py | sort -u`.
 - **하나도 안 걸리면 → 빠른 릴리스**(1-b 생략). UI·업데이터·빌드·문서만 바뀐 경우.
 - **판정이 애매하면 전체 게이트**로 간다. 빠른 경로는 편의고, 게이트는 안전장치다.
 

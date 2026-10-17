@@ -34,32 +34,79 @@ from typing import Optional
 # ▌DB 경로 결정 (eomun_rules._resolve_db_path와 동일 우선순위)
 # ══════════════════════════════════════════════════════
 
+def _snapshot_ver_of(p: Path) -> int:
+    """파일 p의 meta.snapshot_ver(못 읽으면 -1). 읽기 전용으로 열고 곧바로 닫는다."""
+    try:
+        con = sqlite3.connect(p.as_uri() + "?mode=ro", uri=True)
+        try:
+            row = con.execute("SELECT value FROM meta WHERE key='snapshot_ver'").fetchone()
+        finally:
+            con.close()
+        return int(row[0]) if row and str(row[0]).isdigit() else -1
+    except Exception:
+        return -1
+
+
 def _resolve_db_path() -> Path:
-    candidates = []
+    """userdict.db 위치 — 후보 중 **스냅샷 버전이 가장 높은** 파일(같으면 앞 순서).
+
+    후보: ① 서버 동기화가 빌드한 것(`datapaths.userdict_runtime_path`) ② 데이터 패키지에
+    든 것(사전과 같은 탐색 순서 — 사용자 폴더·EXE 옆·번들 내부). 번들 내부는 예전 빌드본이
+    동기화 결과를 잘못 쓰던 곳이라, 이미 받아 둔 스냅샷을 잃지 않으려고 후보에 남긴다.
+    ★예전엔 번들 내부·EXE 옆만 봐서, 데이터 패키지의 새 userdict.db가 인앱 데이터
+      업데이트(사용자 폴더 설치)로 들어와도 **반영되지 않았다**(2026-10-17 감사).
+    없으면 빌더가 쓸 자리를 돌려준다 — 동기화가 처음 빌드하면 `reload()`가 그대로 집는다.
+    """
+    cands = []
+    try:
+        import datapaths as _dp
+        cands.append(_dp.userdict_runtime_path())
+        cands += [d / "userdict.db" for d in _dp._ordered_candidates()]
+    except Exception:
+        pass
     if getattr(sys, "frozen", False):
-        candidates.append(Path(sys._MEIPASS) / "data" / "userdict.db")          # type: ignore[attr-defined]
-        candidates.append(Path(sys.executable).parent / "data" / "userdict.db")
+        cands.append(Path(sys._MEIPASS) / "data" / "userdict.db")          # type: ignore[attr-defined]
+        cands.append(Path(sys.executable).parent / "data" / "userdict.db")
     else:
-        candidates.append(Path(__file__).resolve().parent.parent / "data" / "userdict.db")
-    for p in candidates:
-        if p.exists():
-            return p
-    return candidates[-1]
+        cands.append(Path(__file__).resolve().parent.parent / "data" / "userdict.db")
+    cands = list(dict.fromkeys(cands))
+    existing = [p for p in cands if p.exists()]
+    if not existing:
+        return cands[0]
+    return max(existing, key=lambda p: (_snapshot_ver_of(p), -existing.index(p)))
 
 
 DB_PATH = _resolve_db_path()
 
 _local = threading.local()
+_gen = 0          # reload()마다 증가 — 스레드마다 들고 있는 연결을 새 파일로 바꾸게 한다
+
+
+def reload() -> Path:
+    """서버 동기화가 새로 빌드한 뒤 — 위치를 다시 고르고 캐시를 비운다(재시작 없이 반영)."""
+    global DB_PATH, _gen
+    DB_PATH = _resolve_db_path()
+    _gen += 1
+    exception_set.cache_clear()
+    return DB_PATH
 
 
 def _conn() -> Optional[sqlite3.Connection]:
     if not DB_PATH.exists():
         return None
-    if not hasattr(_local, "conn") or _local.conn is None:
+    c = getattr(_local, "conn", None)
+    if c is not None and getattr(_local, "gen", None) != _gen:
+        try:
+            c.close()
+        except Exception:
+            pass
+        c = _local.conn = None
+    if c is None:
         try:
             c = sqlite3.connect(str(DB_PATH), check_same_thread=False)
             c.execute("PRAGMA cache_size = -2048")
             _local.conn = c
+            _local.gen = _gen
         except sqlite3.Error:
             _local.conn = None
     return _local.conn

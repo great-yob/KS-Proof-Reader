@@ -294,6 +294,15 @@ class ProofreadingWorker(QThread):
                 kept_flags.append((word, clean, reason))
             if online_hits:
                 log(f"  → 우리말샘 API: 로컬 DB 누락 실재어 {online_hits}건 확인·제외 (거짓 검수 방지)")
+            # 키 무효·한도 초과 등 API 오류 — 조회는 거기서 멈추고(nikl_api) 결과는 캐시하지
+            #   않는다. 사유를 남기지 않으면 온라인 확인이 꺼진 줄 아무도 모른다.
+            try:
+                from nikl_api import last_error as _api_last_error
+                _api_err = _api_last_error()
+            except Exception:
+                _api_err = ""
+            if _api_err:
+                log(f"  ⚠ 우리말샘 API 오류({_api_err}) — 이번 실행은 온라인 사전 확인을 건너뜁니다.")
             dict_flags = kept_flags
 
         # 온용어 API 캐싱 폴백(2단) — 우리말샘에도 없는 **기관 전문용어**(법령·정보통신·

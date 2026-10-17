@@ -20,6 +20,12 @@ class ApplyWorker(QThread):
     log_message = Signal(str)
     finished = Signal(dict)    # {"applied", "failed", "hwp_path", "errata_path", "fail_samples"}
     error    = Signal(str)
+    # ★치명적이지 않은 문제(정오표 저장 실패·PDF 주석 실패 등) — **뒤이어 finished가 온다.**
+    #   예전엔 이것도 `error`로 보냈는데, 받는 쪽(`MainWindow._on_error`)은 실패로 보고
+    #   모달을 띄운 뒤 설정 화면으로 되돌린다. 그 모달의 중첩 루프 안에서 finished가 먼저
+    #   처리돼 결과 화면이 그려졌다가, 모달을 닫는 순간 **설정 화면으로 튕겼다**
+    #   (2026-10-16 감사 실측). 끝나는 신호(error)와 알리는 신호(warning)를 가른다.
+    warning  = Signal(str)
 
     def __init__(self, file_path: str, corrections: list, options: dict,
                  occ_rows: list = None, known_pages: dict = None, parent=None):
@@ -277,6 +283,9 @@ class ApplyWorker(QThread):
                 elif mode == "pdf" and not self._stop.is_set():
                     out_pdf = self._run_pdf_export(editor, log)
 
+                elif self._stop.is_set():
+                    pass        # 취소 — 아래 공통 관문이 끝낸다('수정하지 않습니다' 안내도 생략)
+
                 else:
                     # 치환은 없다. 문서를 연 것은 쪽 번호를 읽기 위해서일 뿐이다.
                     log(self._no_apply_log(mode, real_corrections, flag_accepted))
@@ -299,6 +308,24 @@ class ApplyWorker(QThread):
             pdf_report = self._run_pdf_annotate(out_pdf, annot_targets, log,
                                                 pages_by_original)
 
+        # ★취소 공통 관문 — 여기까지 왔는데 취소됐다면 **결과물을 내지 않는다.**
+        #   ⚠ 예전엔 치환·메모 단계 안에서만 취소를 확인했다. 그래서 쪽 번호 확인 중에
+        #     취소하면 메모·PDF 분기를 건너뛴 채 아래로 내려와 정오표를 만들고 finished를
+        #     보냈다 — 사용자는 취소를 눌렀는데 '메모본 생성 완료 · 메모 0곳'이 떴다
+        #     (2026-10-16 감사 실측). PDF는 변환만 끝난 **주석 없는 `_주석.pdf`**가 남았다.
+        #   ⚠ 한글 산출물을 **이미 저장했다면**(`out_hwp`) 늦게 눌린 취소는 무시하고 끝까지
+        #     간다 — 파일은 디스크에 있는데 '만들지 않았다'고 알리면 그게 거짓말이다.
+        if self._stop.is_set() and not out_hwp:
+            if out_pdf:
+                try:
+                    os.remove(out_pdf)      # 이번 실행이 방금 만든 주석 없는 변환본
+                except OSError:
+                    pass
+            log("  ⚠ 취소 — 결과물을 만들지 않았습니다 (원본 파일 무변경).")
+            self.error.emit("사용자에 의해 취소되었습니다.\n"
+                            "결과물은 만들지 않았고 원본 파일은 변경되지 않았습니다.")
+            return
+
         # 정오표 머리말에 적을 교정 범위 — 윤문 옵션이 켜져있으면 polish, 아니면 typo.
         #   ⚠ 이름이 `mode`였는데 결과물 축(`mode`)과 겹쳐 조용히 덮어쓰고 있었다.
         #     둘은 완전히 다른 축이므로 이름을 갈라 둔다.
@@ -319,10 +346,20 @@ class ApplyWorker(QThread):
         #   '✔ 적용'으로, 사용자가 거절한 항목은 '✖ 실패'로 잘못 기록됐다(정합성 버그).
         #   gen_errata가 꺼져 있어도 만들어 결과에 동봉한다 — 완료 화면의 '정오표 생성'
         #   수동 버튼이 같은 데이터로 진실된 정오표를 만들 수 있게(main_window가 사용).
-        errata_rows = self._build_errata_rows(
-            detail, pages_by_original,
-            pdf_pages=(pdf_report or {}).get("pages_by_original") or {},
-            pdf_marked=(pdf_report or {}).get("marked_occ") or {})
+        base_rows = self.options.get("base_errata_rows")
+        if mode == "hwp_memo" and self.source_is_corrected and base_rows:
+            # ★'교정본에 메모 추가' — 치환 결과는 **그 교정본을 만든 실행**의 정오표가 정본이다.
+            #   여기 detail은 메모 결과뿐이라 그것으로 행을 만들면 메모 순번(빨간 자리 순)이
+            #   패널 등장 번호로 읽혀, 부분 거절이 있으면 엉뚱한 행이 '실패'가 된다.
+            errata_rows = [dict(r) for r in base_rows]
+            self._overlay_memo_notes(errata_rows, detail)
+        else:
+            errata_rows = self._build_errata_rows(
+                detail, pages_by_original,
+                pdf_pages=(pdf_report or {}).get("pages_by_original") or {},
+                pdf_marked=(pdf_report or {}).get("marked_occ") or {})
+            if mode == "hwp_memo" and memo_detail:
+                self._overlay_memo_notes(errata_rows, memo_detail)
 
         errata_path = None
         if self.options.get("gen_errata", True) and errata_rows:
@@ -347,7 +384,7 @@ class ApplyWorker(QThread):
                 )
             except Exception as exc:
                 # I5: 무음 실패 방지 — 오류를 사용자에게 알림(교정 적용 자체는 완료됨)
-                self.error.emit(f"정오표 생성 실패 (교정은 적용됨): {exc}")
+                self.warning.emit(f"정오표 생성 실패 (교정은 적용됨): {exc}")
 
         self.progress.emit(100, "완료")
 
@@ -387,12 +424,14 @@ class ApplyWorker(QThread):
         # ★수락했는데 **표시하지 못한 자리** — 교정본의 '부분 반영'에 해당하는 수치다.
         #   메모 불가(머리말)·PDF 미탐·문서에서 못 찾은 등장을 한 숫자로 모은다.
         #   이게 없으면 세 산출물의 표시 자리 수 차이가 화면 어디에도 안 나온다.
-        n_unmarked = (sum(1 for r in errata_rows
-                          if r["outcome"] == "todo" and r["note"])
-                      if mode in ("memo", "pdf") else 0)
+        #   ⚠ 결합 모드도 센다 — 치환은 됐어도 메모를 못 단 자리는 '표시 못 함'이다.
+        n_unmarked = (sum(1 for r in errata_rows if r.get("unmarked"))
+                      if mode in ("memo", "pdf", "hwp_memo") else 0)
         if n_unmarked:
-            log(f"  [{'메모' if mode == 'memo' else 'PDF'}] 표시하지 못한 자리 "
-                f"{n_unmarked}곳 · 정오표에 사유 기록")
+            # ⚠ 결합 모드는 정오표를 끌 수 있다 — 그때 '정오표에 사유 기록'은 거짓말이다.
+            log(f"  [{'PDF' if mode == 'pdf' else '메모'}] 표시하지 못한 자리 "
+                f"{n_unmarked}곳 · "
+                + ("정오표에 사유 기록" if errata_path else "정오표를 끈 실행이라 사유 미기록"))
 
         self.finished.emit({
             "applied":      ok_cnt if mode in self.MODIFY_MODES else 0,
@@ -885,7 +924,7 @@ class ApplyWorker(QThread):
                 n = replaced_by.get(orig)
                 if n is None:
                     # 추가 실행 — 치환 결과가 없으므로 '표시 대상 등장 수'로 어림한다.
-                    #   ⚠ 0이면 브리지가 안전 상한(_MEMO_MAX_OCC)까지 훑어 엉뚱한 자리를
+                    #   ⚠ 0이면 브리지가 안전 상한(_MEMO_FALLBACK_OCC)까지 훑어 엉뚱한 자리를
                     #     맴돈다. 문서에서 실제로 센 등장 수를 차선으로 쓴다.
                     n = max(0, int(c.get("occurrences") or 0)
                             - len(self._annot_skip_for(c)))
@@ -942,7 +981,9 @@ class ApplyWorker(QThread):
             # ⚠ 조용히 사라지면 안 된다. 사유는 두 갈래이고 정오표에 각각 적힌다 —
             #   머리말·꼬리말 스토리는 한/글이 메모를 아예 거부하고, 이미 메모가 달린
             #   앵커와 겹치는 자리는 `InsertText`가 죽는다(hwp_editor._reindex_document).
-            log(f"  [메모] 메모를 달지 못한 자리 {n_blocked}곳 · 정오표에 사유 기록")
+            #   ⚠ 여기서 '정오표에 사유 기록'이라고 하지 않는다 — 결합 모드는 정오표를 끌
+            #     수 있다. 기록 여부는 정오표를 만든 뒤 `표시하지 못한 자리` 줄이 말한다.
+            log(f"  [메모] 메모를 달지 못한 자리 {n_blocked}곳")
 
         out_hwp = out_path or self._hwp_out_path("_메모본")
         log(f"  저장 중: {os.path.basename(out_hwp)}")
@@ -969,7 +1010,7 @@ class ApplyWorker(QThread):
             path = exporter(out_pdf)
         except Exception as exc:
             log(f"  [PDF] 변환 실패: {exc} — 정오표만 생성합니다")
-            self.error.emit(f"PDF 변환 실패 (정오표는 생성됩니다): {exc}")
+            self.warning.emit(f"PDF 변환 실패 (정오표는 생성됩니다): {exc}")
             return ""
         try:
             size_mb = os.path.getsize(path) / 1_048_576
@@ -996,7 +1037,7 @@ class ApplyWorker(QThread):
         if not pdf_annotator.available():
             log("  [PDF] 주석 라이브러리가 없어 주석을 달지 못했습니다 "
                 "(PDF 변환본은 그대로 남습니다)")
-            self.error.emit(
+            self.warning.emit(
                 "PDF 주석 라이브러리를 불러오지 못해 주석 없이 변환본만 저장했습니다.\n"
                 f"({pdf_annotator.unavailable_reason()})")
             return {}
@@ -1019,7 +1060,7 @@ class ApplyWorker(QThread):
             rep = pdf_annotator.annotate(pdf_path, items, logger=log)
         except Exception as exc:
             log(f"  [PDF] 주석 실패: {exc} (변환본은 그대로 남습니다)")
-            self.error.emit(f"PDF 주석 실패 (변환본은 저장됨): {exc}")
+            self.warning.emit(f"PDF 주석 실패 (변환본은 저장됨): {exc}")
             return {}
 
         log(f"  [PDF] 주석 {rep.get('annotated', 0)}곳 · 항목 {rep.get('items', 0)}건")
@@ -1050,6 +1091,53 @@ class ApplyWorker(QThread):
     # ══════════════════════════════════════════════════════
     # ▌정오표 행(= 등장 1곳) 구성
     # ══════════════════════════════════════════════════════
+    @staticmethod
+    def _memo_miss_note(e) -> str:
+        """메모 단계의 등장 기록 하나 → 표시 실패 사유("" = 메모를 달았다)."""
+        if e is None:
+            return "이 등장을 문서에서 찾지 못해 메모를 달지 못했습니다 (수동 확인 필요)"
+        if e.get("blocked"):
+            return e.get("note") or "이 자리에는 메모를 달 수 없습니다"
+        if not e.get("ok"):
+            return "이 자리에 메모를 달지 못했습니다 (수동 확인 필요)"
+        return ""
+
+    def _overlay_memo_notes(self, rows: list, memo_detail: list) -> None:
+        """결합 모드('교정본+메모') — 치환 결과로 만든 정오표 행에 **메모 결과**를 겹친다.
+
+        ★왜 필요한가(2026-10-16 감사 · 05.hwp 실측): 결합 모드의 정오표는 치환 detail로만
+          만들어져, 메모 68곳 중 9곳이 실패해도(`RPC_E_SERVERFAULT`·못 찾음) **사유가 한
+          줄도 없었다.** 로그는 '정오표에 사유 기록'이라고 안내했고 결과 화면에도 누락이
+          보이지 않았다 — 메모 전용 모드에만 있던 통로가 결합 모드엔 없었던 것이다.
+
+        ★자리 맞추기: 메모 단계는 앵커가 **교정문**이고 빨강(또는 형광펜)으로 우리가 고친
+          자리만 골라 문서 순으로 센다(브리지 `memo`의 `visited`). 그 k번째 자리는 치환
+          단계가 실제로 바꾼 자리 중 문서 순 k번째다 — `_build_errata_rows`가 그 순번을
+          `red_rank`로 행에 남겨 둔다. 검수 카드(글자 불변)는 원문 앵커라 등장 번호(`occ`)
+          그대로다.
+        ⚠ 글자는 이미 고쳐졌으므로 `outcome`은 바꾸지 않는다(적용은 적용이다) — 사유만 잇고
+          `unmarked`로 표시해 집계에 들어가게 한다.
+        """
+        by_key = {}
+        for d in memo_detail or []:
+            by_key.setdefault((d.get("original", ""), d.get("corrected", "")), d)
+        for r in rows:
+            if r.get("note"):
+                continue        # 이미 다른 사유가 있다(긴 교정에 포함 등) — 메모 대상이 아니다
+            d = by_key.get((r.get("original", ""), r.get("corrected", "")))
+            occ = {e.get("i"): e for e in ((d or {}).get("occ_pages") or [])}
+            if r.get("outcome") == "applied" and r.get("red_rank") is not None:
+                miss = self._memo_miss_note(occ.get(r["red_rank"]))
+                if miss:
+                    r["note"] = "교정은 반영됨 · " + miss
+                    r["unmarked"] = True
+            elif (r.get("outcome") == "review" and r.get("occ_accepted")
+                    and r.get("occ") is not None):
+                miss = self._memo_miss_note(occ.get(r["occ"]))
+                if miss:
+                    r["note"] = miss
+                    r["unmarked"] = True
+
     def _build_errata_rows(self, detail: list, pages_by_original: dict,
                            pdf_pages: dict = None, pdf_marked: dict = None) -> list:
         """교정 단위 결과를 **등장 단위 정오표 행**으로 펼친다.
@@ -1095,6 +1183,12 @@ class ApplyWorker(QThread):
             occ_pages = (d or {}).get("occ_pages") or []
             page_by_i = {e.get("i"): e.get("page") for e in occ_pages}
             replaced_i = {e.get("i") for e in occ_pages if e.get("ok")}
+            # 치환한 자리의 문서 순 순번 — 결합 모드 메모가 빨간 자리를 세는 좌표계다
+            #   (`_overlay_memo_notes`). 치환 detail일 때만 의미가 있다.
+            red_rank_of = ({b: j for j, b in enumerate(sorted(
+                               x for x in replaced_i if isinstance(x, int)))}
+                           if mode in self.MODIFY_MODES and not self.source_is_corrected
+                           else {})
             located   = pages_by_original.get(orig) or []
             err       = (d or {}).get("error", "") or ""
             # ★브리지가 말하는 등장 번호는 **보정 후 좌표계**다(교정본 모드에서 긴 교정에
@@ -1151,8 +1245,28 @@ class ApplyWorker(QThread):
                     page = page_by_i.get(bk)
 
                 note = ""
+                unmarked = False
+
+                def annot_note() -> str:
+                    """메모·PDF 모드에서 이 등장의 표시 실패 사유("" = 표시됨)."""
+                    if mode == "memo":
+                        e = next((x for x in occ_pages if x.get("i") == k), None)
+                        return self._memo_miss_note(e)
+                    if mode == "pdf":
+                        if orig not in pdf_pages:
+                            return "PDF에서 이 원문을 찾지 못해 주석을 달지 못했습니다"
+                        if k not in (pdf_marked.get(orig) or ()):
+                            return ("PDF에서 이 등장을 찾지 못해 주석을 달지 못했습니다 "
+                                    "(수동 확인 필요)")
+                    return ""
+
                 if flag_only and accepted:
                     outcome = "review"
+                    # ★검수 카드도 메모·주석 대상이다(annot_targets) — 표시를 못 했으면
+                    #   똑같이 드러낸다. 예전엔 이 경로가 사유를 아예 보지 않았다.
+                    if r.get("status") == "accepted" and mode in ("memo", "pdf"):
+                        note = annot_note()
+                        unmarked = bool(note)
                 elif r.get("status") != "accepted":
                     outcome = "rejected"
                 elif self.errata_only:
@@ -1171,21 +1285,8 @@ class ApplyWorker(QThread):
                     #   등장별 실적(memo=occ_pages의 ok / pdf=marked_occ)을 그대로 본다
                     #   — 안 그러면 세 산출물의 표시 자리 수가 말없이 갈린다
                     #   (사용자 보고 2026-08-08: "반영된 항목이 다 다른 것 같다").
-                    if mode == "memo":
-                        e = next((x for x in occ_pages if x.get("i") == k), None)
-                        if e is not None and e.get("blocked"):
-                            note = e.get("note") or "이 자리에는 메모를 달 수 없습니다"
-                        elif e is not None and not e.get("ok"):
-                            note = ("이 자리에 메모를 달지 못했습니다 (수동 확인 필요)")
-                        elif e is None:
-                            note = ("이 등장을 문서에서 찾지 못해 메모를 달지 못했습니다 "
-                                    "(수동 확인 필요)")
-                    elif mode == "pdf":
-                        if orig not in pdf_pages:
-                            note = "PDF에서 이 원문을 찾지 못해 주석을 달지 못했습니다"
-                        elif k not in (pdf_marked.get(orig) or ()):
-                            note = ("PDF에서 이 등장을 찾지 못해 주석을 달지 못했습니다 "
-                                    "(수동 확인 필요)")
+                    note = annot_note()
+                    unmarked = bool(note)
                 elif d is None:
                     outcome, note = "failed", "적용 목록에서 누락됨 (수동 확인 필요)"
                 elif k in unfound_k:
@@ -1230,6 +1331,14 @@ class ApplyWorker(QThread):
                     "color":     c.get("color", 0),
                     "outcome":   outcome,
                     "note":      note,
+                    # ── 정오표 칸이 아니라 집계·결합 모드 메모 대조용 ──
+                    #   수락했는데 메모·주석으로 표시하지 못한 자리(결과 화면의 '표시 못 함').
+                    "unmarked":  unmarked,
+                    "occ":       k,
+                    "occ_accepted": r.get("status") == "accepted",
+                    # 치환한 자리의 문서 순 순번(결합 모드 메모의 좌표 — _overlay_memo_notes).
+                    "red_rank":  (red_rank_of.get(bk)
+                                  if outcome == "applied" and not note else None),
                 })
         return rows
 
