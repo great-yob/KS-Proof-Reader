@@ -719,9 +719,13 @@ class MainWindow(QMainWindow):
         #   ⚠ 스냅숏으로 들고 있는다 — 결과 화면의 '결과물 추가'가 **같은 결정**을
         #     써야 하는데, 그때 패널을 다시 물으면 그 사이 상태가 달라졌을 수 있다.
         self._applied_occ_rows = self.review_panel.get_occurrence_rows()
+        # ★검수 패널이 등장을 찾은 추출 텍스트도 넘긴다 — 교정본의 skip 번호를 브리지가
+        #   실제로 만날 매치 순서로 정하는 데 쓴다(ApplyWorker._plan_by_replay). 빠지면
+        #   종전 보정으로 돌아가 '앞 교정이 만든 원문'에 번호가 밀린다.
         self._apply_worker = ApplyWorker(self._file_path, self._corrections,
                                          self._options,
                                          occ_rows=self._applied_occ_rows,
+                                         full_text=self._extracted_text,
                                          parent=self)
         self._apply_worker.progress.connect(self._on_worker_progress)
         self._apply_worker.log_message.connect(self.activity.log)
@@ -1071,6 +1075,9 @@ class MainWindow(QMainWindow):
             occ_rows=self._applied_occ_rows,
             # 1차 실행이 뜬 쪽 번호를 그대로 — 같은 원본의 같은 장면이다.
             known_pages=self._result.get("pages_by_original") or {},
+            # 원본의 추출 텍스트 — 교정본 계획용(_start_apply 주석). 입력이 이미 교정본인
+            #   '교정본에 메모 추가'는 치환이 없어 쓰이지 않는다.
+            full_text=self._extracted_text,
             parent=self)
         self._extra_worker.progress.connect(self._on_worker_progress)
         self._extra_worker.log_message.connect(self.activity.log)

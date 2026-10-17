@@ -5,12 +5,109 @@ ui/workers/apply_worker.py — HWP 교정 적용 QThread 워커
 """
 
 import os
+import re
 import threading
+import unicodedata
+from array import array
 
 from PySide6.QtCore import QThread, Signal
 
 from core import Correction, HwpEditor
 from core.models import HL_DICT, occurrence_skipped
+
+
+# ══════════════════════════════════════════════════════
+# ▌브리지 치환 루프의 평문 재현 — 적용 계획(`ApplyWorker._plan_by_replay`) 전용
+# ══════════════════════════════════════════════════════
+# ★한/글 찾기는 영문 대소문자를 구분하지 않는다(실측 2026-10-17: 'AI'로 찾으면 'ai'까지
+#   2,101곳 — 추출문에서 대소문자를 가려 세면 2,061곳). 검수 패널은 가려 세므로, 재현할 때는
+#   찾기 쪽만 한/글처럼 접는다. 글자 수가 바뀌지 않는 ASCII만 접는다(위치가 어긋나면 안 된다).
+_ASCII_FOLD = str.maketrans({chr(c): chr(c + 32) for c in range(65, 91)})
+
+# 브리지가 찾기·치환 문자열에서 지우는 글자 — `hwp_bridge_worker._INVISIBLE_RE`와 **같은
+#   집합**이어야 한다(그쪽을 바꾸면 여기도). 브리지 모듈은 win32com을 들여와 import할 수 없다.
+_BRIDGE_INVISIBLE = re.compile(
+    "[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180e\u200b-\u200f"
+    "\u202a-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0]")
+
+
+def _bridge_text(s: str) -> str:
+    """브리지 `apply`가 실제로 찾고 넣는 문자열(`\\n`→`\\r` 뒤 `_clean`). 개행은 추출문처럼 `\\n`."""
+    s = unicodedata.normalize("NFC", (s or "").replace("\n", "\r"))
+    return _BRIDGE_INVISIBLE.sub("", s).strip().replace("\r", "\n")
+
+
+class _BridgeReplay:
+    """추출 텍스트 위에서 브리지 치환 루프(`hwp_bridge_worker.HwpBridge.apply`)를 그대로 돈다.
+
+    글자마다 출처를 들고 다닌다 — 원문 위치(≥0) 또는 그 글자를 넣은 교정의 꼬리표(<0).
+    그래야 매치가 '원문에 원래 있던 등장'인지 '앞 교정이 만든 글자'인지 가를 수 있다.
+    ⚠ 브리지 루프의 규칙을 바꾸면 여기도 같이 바꿀 것 — 긴 원문 우선(호출부)·문서 처음부터
+      순차 찾기·건너뛴 매치 뒤에서 재개·패스마다 이전 건너뜀 재소비(reskip)·자기 재매칭
+      항목은 단일 패스·상한 둘.
+    """
+
+    _MAX_PASSES = 8           # 브리지 apply의 _MAX_PASSES
+    _MAX_REPLACE = 1000       # HwpBridge._APPLY_MAX_REPLACE
+    _MAX_MATCHES = 5000       # HwpBridge._APPLY_MAX_MATCHES
+
+    def __init__(self, text: str):
+        self.s = text
+        self.sf = text.translate(_ASCII_FOLD)
+        self.prov = array("l", range(len(text)))
+
+    def scan(self, o: str, k: str, decide, tag: int):
+        """원문 o를 교정문 k로 — **확정하지 않고** [(번호, 원문 위치|None, 치환?)]와 다음 상태를 낸다.
+
+        decide(번호, 원문 위치|None) → 치환하면 True. 원문 위치는 매치가 앞 교정에 **한 글자도
+        건드려지지 않은 원문 그대로**일 때만 주어진다(그 밖은 None).
+        """
+        s, sf, prov = self.s, self.sf, self.prov
+        of, kf, n = o.translate(_ASCII_FOLD), k.translate(_ASCII_FOLD), len(o)
+        self_matching = o in k          # ⚠ 브리지와 같이 대소문자를 가려 판정한다
+        count = skipped = 0
+        out = []
+        for _ in range(self._MAX_PASSES):
+            if of not in sf:
+                break
+            pos, reskip, reps = 0, skipped, []
+            while count - skipped < self._MAX_REPLACE and count < self._MAX_MATCHES:
+                i = sf.find(of, pos)
+                if i < 0:
+                    break
+                pos = i + n
+                if reskip:                      # 이전 패스에서 건너뛴 매치 — 소비만 한다
+                    reskip -= 1
+                    continue
+                a = prov[i]
+                at = (a if a >= 0 and prov[i + n - 1] - a == n - 1
+                      and min(prov[i:i + n]) >= 0 else None)
+                hit = bool(decide(count, at))
+                out.append((count, at, hit))
+                count += 1
+                if hit:
+                    reps.append(i)
+                else:
+                    skipped += 1
+            if reps:
+                ps, pf, pp, last = [], [], array("l"), 0
+                mark = array("l", [tag]) * len(k)
+                for i in reps:
+                    ps += (s[last:i], k)
+                    pf += (sf[last:i], kf)
+                    pp += prov[last:i]
+                    pp += mark
+                    last = i + n
+                ps.append(s[last:])
+                pf.append(sf[last:])
+                pp += prov[last:]
+                s, sf, prov = "".join(ps), "".join(pf), pp
+            if self_matching or not reps:
+                break
+        return out, (s, sf, prov)
+
+    def commit(self, state):
+        self.s, self.sf, self.prov = state
 
 
 class ApplyWorker(QThread):
@@ -28,7 +125,8 @@ class ApplyWorker(QThread):
     warning  = Signal(str)
 
     def __init__(self, file_path: str, corrections: list, options: dict,
-                 occ_rows: list = None, known_pages: dict = None, parent=None):
+                 occ_rows: list = None, known_pages: dict = None,
+                 full_text: str = None, parent=None):
         super().__init__(parent)
         self.file_path   = file_path
         self.corrections = corrections
@@ -37,6 +135,10 @@ class ApplyWorker(QThread):
         #   유일한 진실 원천이다(ReviewPanel.get_occurrence_rows 주석 참조).
         #   None이면 교정 단위 정보만으로 재구성한다(구버전 호출 폴백).
         self.occ_rows    = occ_rows
+        # ★검수 패널이 등장을 찾은 **바로 그 추출 텍스트**(원본 파일 기준) — 교정본 모드의
+        #   skip 번호를 브리지 치환 루프 재현으로 정하는 데 쓴다(`_plan_by_replay`).
+        #   없으면 종전 보정(`_plan_occurrences_legacy`)으로 간다.
+        self.full_text   = full_text or ""
         # ★이미 떠 둔 쪽 번호({원문: [쪽, …]}) — **추가 산출물** 실행 전용.
         #   같은 원본 파일의 **같은 장면**에서 뜬 값이므로 다시 뜰 이유가 없다. 재수집은
         #   등장당 9ms(실측)의 순수 낭비이고, 더 나쁘게는 1차 실행의 정오표와 추가
@@ -117,10 +219,13 @@ class ApplyWorker(QThread):
                          if mode in ("memo", "pdf", "hwp_memo") else [])
 
         # ★겹치는 교정의 **자리 단위 합성** — 네 산출물이 같은 문자열 하나를 말하게 한다.
+        #   합성 값은 검수 화면이 만든 카드 값이고, 여기서는 흡수된 속 등장만 가린다.
         #   (mode와 무관하게 먼저 계산한다 — 정오표·메모·주석이 전부 이 결과를 쓴다.)
         self._composed, self._absorbed = self._compose_spots(real_corrections)
-        if self._composed:
-            log(f"  [합성] 겹치는 교정 {len(self._composed)}건 · "
+        if self._absorbed:
+            n_comp = sum(1 for c in real_corrections
+                         if c.get("_compose_base") not in (None, c.get("corrected", "")))
+            log(f"  [합성] 겹치는 교정 {n_comp}건 · "
                 f"흡수된 등장 {len(self._absorbed)}곳")
 
         # ★등장 좌표계 보정 — **교정본 모드에서만**(아래 `_plan_occurrences` 주석).
@@ -394,7 +499,7 @@ class ApplyWorker(QThread):
         if consumed_cnt:
             log(f"  → 실패 {stats.get('fail', 0)}건 중 {consumed_cnt}건은 이미 반영된 "
                 f"중복(정상)으로 제외 → 실제 실패 {fail_cnt}건"
-                + (f" (부분 반영 {partial_cnt}건 포함)" if partial_cnt else ""))
+                + (f" (반영 수 불일치 {partial_cnt}건 포함)" if partial_cnt else ""))
 
         # 진단: (진짜) 실패 사유 샘플 + 부분 반영 항목
         fail_samples = []
@@ -498,13 +603,21 @@ class ApplyWorker(QThread):
     #   (예: '고립예방' ⊂ '고립예방사업')는 그대로 보호된다. 실측(실파일 고독사):
     #   겹치는 자리 14곳 중 6곳이 합성 대상, 나머지 8곳은 겉이 속을 이미 흡수.
     def _compose_spots(self, targets: list) -> tuple:
-        """겹치는 수락 교정을 자리 단위로 합성한다.
+        """겹치는 수락 교정 중 **검수 화면이 이미 합성한** 겉 교정과, 그 합성에 흡수된 속 등장.
 
-        반환 ({ci: 합성 교정문}, {(ci, occ) — 겉 교정에 흡수된 속 등장}).
+        반환 ({}, {(ci, occ) — 겉 교정에 흡수된 속 등장}). 첫 값(합성 교정문)은 언제나 비어
+        있다 — `_corrected_of`가 카드 값을 그대로 쓴다.
 
-        ⚠ 한 교정의 **모든 참여 등장이 같은 합성 결과**일 때만 채택한다. 자리마다 결과가
-          다르면 `Correction` 하나로 표현할 수 없고, 억지로 하나를 고르면 나머지 자리가
-          틀린 문자열로 바뀐다 — 그때는 합성을 포기하고 종전대로 둔다(무회귀).
+        ★여기서 **다시 합성하지 않는다**(2026-10-17). 합성은 검수 화면(`ReviewPanel.
+          _compose_overlaps`)이 하고, 그 값이 카드에 보인 값 — 곧 **정본**이다. 예전엔 여기서
+          한 번 더 합성했는데 두 가지 사고가 났다(실측 · 감사 20원고 중 한 원고, 3건):
+            ① 화면이 이미 합성한 값 위에 **또** 얹었다 — 교정문이 원문을 품는 괄호·따옴표
+               보충 카드('…포함'→'…포함)')는 합성 뒤에도 원문이 남아 있어 두 번 들어갔다
+               (카드 '…포함))' → 교정본 '…포함))))').
+            ② 화면이 합성을 포기한 자리를 **다른 규칙**(가장 넓은 '적용 대상' 구간)으로
+               합성해, 카드에 없는 문자열이 문서에 들어갔다.
+          그래서 이 함수는 흡수 표시만 한다 — 그 속 등장은 겉 교정이 합성값으로 한 번에
+          치환하므로 정오표·메모·주석에서 행·표시를 만들지 않는다.
         """
         rows = self.occ_rows or []
         if not rows or not targets:
@@ -512,62 +625,38 @@ class ApplyWorker(QThread):
         ci_of = self._ci_of()
         tgt = {ci_of.get(id(c)) for c in targets}
         tgt.discard(None)
+        # 화면이 합성한 겉 교정 — 카드 값이 합성 전 값(`_compose_base`)과 다르다.
+        composed_ci = {ci for ci in tgt
+                       if self.corrections[ci].get("_compose_base")
+                       not in (None, self.corrections[ci].get("corrected", ""))}
+        if not composed_ci:
+            return {}, set()
 
-        # 참여 등장 — 수락 교정의, 사용자가 거절하지 않은, 위치를 아는 등장.
-        parts = []
+        # 참여 등장(수락 교정의, 거절되지 않은, 위치를 아는 등장)과 흡수할 수 있는 겉 등장.
+        #   ⚠ 겉 등장은 **실제로 치환되는 자리**(보이는 수락 등장)만 친다. 제외(excluded)·가려진
+        #     겉 등장은 그 자리를 바꾸지 않으므로 속 등장을 흡수할 수 없다 — 실측(2026-10-17):
+        #     제외된 '과학 연구 지원' 속의, 화면에 보이는 수락 카드 '연구 지원'을 흡수로 쳤더니
+        #     교정본에서만 그 자리가 빠졌다.
+        parts, outers = [], []
         for r in rows:
             ci = r.get("ci")
             if ci not in tgt or r.get("status") == "rejected":
                 continue
             s, e = r.get("pos"), r.get("end")
-            if isinstance(s, int) and isinstance(e, int) and e > s:
-                parts.append((s, e, ci, r.get("occ", 0)))
-        if not parts:
+            if not (isinstance(s, int) and isinstance(e, int) and e > s):
+                continue
+            parts.append((s, e, ci, r.get("occ", 0)))
+            if (ci in composed_ci and r.get("status") == "accepted"
+                    and not r.get("excluded") and not r.get("shadowed")):
+                outers.append((s, e))
+        if not outers:
             return {}, set()
-
-        # 각 등장을 **가장 넓은** 포함 구간에 붙인다(3중 중첩도 맨 바깥으로 모인다).
-        groups = {}
-        for s, e, ci, k in parts:
-            best = None
-            for s2, e2, ci2, k2 in parts:
-                if (s2, e2, ci2, k2) == (s, e, ci, k):
-                    continue
-                if s2 <= s and e <= e2 and (e2 - s2) > (e - s):
-                    if best is None or (e2 - s2) > (best[1] - best[0]):
-                        best = (s2, e2, ci2, k2)
-            if best is not None:
-                groups.setdefault(best, []).append((s, e, ci, k))
-        if not groups:
-            return {}, set()
-
-        # 겉 교정문에 속 교정을 문서 순으로 얹는다(브리지의 순차 치환과 같은 결과).
-        per_ci = {}
-        for (s, e, ci, k), inners in groups.items():
-            cur = self.corrections[ci].get("corrected", "")
-            for s2, _e2, ci2, _k2 in sorted(inners, key=lambda t: t[0]):
-                io = self.corrections[ci2].get("original", "")
-                ic = self.corrections[ci2].get("corrected", "")
-                if io and io in cur:
-                    cur = cur.replace(io, ic, 1)
-            per_ci.setdefault(ci, {})[k] = (cur, [(c2, k2) for _s, _e, c2, k2 in inners])
-
-        composed, absorbed = {}, set()
-        for ci, per_occ in per_ci.items():
-            base = self.corrections[ci].get("corrected", "")
-            occs = [k for _s, _e, c2, k in parts if c2 == ci]
-            values = {per_occ.get(k, (base, ()))[0] for k in occs}
-            if len(values) != 1:
-                continue                      # 자리마다 결과가 다르다 — 합성 포기
-            value = values.pop()
-            if value == base:
-                continue                      # 겉이 속을 이미 흡수 — 바뀔 것이 없다
-            composed[ci] = value
-            for k in occs:
-                absorbed.update(per_occ.get(k, (base, ()))[1])
-        return composed, absorbed
+        absorbed = {(ci, k) for s, e, ci, k in parts
+                    if any(s2 <= s and e <= e2 and (e2 - s2) > (e - s) for s2, e2 in outers)}
+        return {}, absorbed
 
     def _corrected_of(self, c: dict) -> str:
-        """이 교정이 실제로 쓸 교정문 — 겹침이 있으면 합성 결과."""
+        """이 교정이 실제로 쓸 교정문 — **카드에 보인 값**(겹침 합성은 검수 화면이 이미 했다)."""
         ci = self._ci_of().get(id(c))
         composed = getattr(self, "_composed", None) or {}
         if ci is not None and ci in composed:
@@ -594,7 +683,113 @@ class ApplyWorker(QThread):
         return cache
 
     def _plan_occurrences(self, apply_targets: list) -> dict:
-        """치환하면 **사라지는 등장**을 걷어내고, 남은 것을 다시 번호 매긴다.
+        """교정본 모드의 skip 번호 계획 — 브리지가 **실제로 만날 매치 순서**로 정한다.
+
+        검수 패널이 쓴 추출 텍스트가 있으면 브리지 치환 루프를 재현해 정하고
+        (`_plan_by_replay`), 없거나 재현이 깨지면 종전 보정(`_plan_occurrences_legacy`)을 쓴다.
+        반환 형식은 둘이 같다: {ci: {"skip": [브리지 번호…], "survivors": [패널 등장 번호|None…]}}.
+        """
+        if self.full_text and self.occ_rows and apply_targets:
+            try:
+                return self._plan_by_replay(apply_targets)
+            except Exception as exc:        # 재현이 깨져도 적용은 종전대로 간다
+                # 화면엔 '[적용 계획] 재현 계획 건너뜀'만(activity_panel 스킵 규칙), 사유는 원문 로그에.
+                self.log_message.emit(f"  [적용 계획] 재현 계획 건너뜀: {exc}")
+        return self._plan_occurrences_legacy(apply_targets)
+
+    def _plan_by_replay(self, apply_targets: list) -> dict:
+        """★브리지 치환 루프를 추출 텍스트에서 그대로 돌려 보고 skip 번호를 정한다.
+
+        ★풀려는 문제(감사 2026-10-16 치명 3 · 2026-10-17 실기 재검증 — 교정본이 검수 화면과
+          다른데 정오표·S4·대시보드는 전부 '적용'이라고 말했다):
+          브리지는 원문을 **문서 처음부터 순차 찾기**로 치환하고, skip 번호는 그 찾기가 만나는
+          매치 순서로 센다. 그런데 앞서 치환한 긴 교정이 문서를 바꿔 놓으면 그 순서가 검수
+          패널이 센 등장 순서와 달라진다. 실측으로 확인한 길은 넷이다.
+            · **새로 생긴 원문** — '고용복지 정책'→'고용복지정책'이 '복지정책'을 만들고,
+              '복지정책'→'복지 정책'이 그것을 다시 띄운다. 번호가 밀려 수락한 자리 4곳은 그대로,
+              어절 경계 규칙이 보호한 '고용복지정책' 5곳은 띄어졌다(거절 0건에서도 난다).
+            · **숨은 속 카드** — 보이는 카드를 거절(또는 검수 필요)해도 그 안에 가려진 카드가
+              그 자리를 바꿨다('출산월'(검수) 속 '월이→다리' → '출산다리').
+            · **부분 겹침** — '자립 지원 대상'에 걸친 두 카드 중 화면은 하나만 보여 주는데
+              교정본은 둘 다 바꿨다. 화면·정오표·메모·PDF대로 **보이는 카드만** 적용한다
+              (사용자 결정 2026-10-17).
+            · **대소문자** — 한/글 찾기는 영문 대소문자를 가리지 않는다(실측, `_ASCII_FOLD`).
+          실기 E2E(한/글 2010): 같은 결정에서 현행 13·128·5곳 불일치 → 이 계획 0곳, 재현 결과와
+          실제 교정본이 8회 모두 한 글자도 다르지 않았다. 감사 20원고 × 2시나리오 시뮬레이션
+          불일치 35·423곳 → 0곳.
+
+        규칙: 매치가 ① 앞 교정이 한 글자도 건드리지 않은 원문 그대로이고 ② 그 자리가 검수
+          화면에 **보이는 수락 등장**(가려지지 않음 · 제외 아님 · 흡수 아님 —
+          `occurrence_skipped`와 같은 판정)이면 치환, 그 밖은 전부 건너뛴다. 그러면 교정본은
+          '원문에서 보이는 수락 카드 자리만 그 카드 값으로 바꾼 문서'가 된다.
+        ⚠ 안전판 둘 — 재현이 틀리면 종전보다 나빠질 수 있으므로:
+          · 한 교정이 의도한 자리를 재현에서 **다 만나지 못하면** 그 교정만 종전 계획으로 간다
+            (재현은 그 종전 결정을 그대로 흉내 내 다음 교정의 문서 상태를 맞춘다).
+          · 결과가 계획 없는 종전 경로와 같은 교정은 계획에 넣지 않는다 — 대부분의 교정이
+            지금까지와 **같은 경로**를 그대로 탄다(20원고 실측 3,560건 중 3,410건).
+        ⚠ 브리지의 `_clean`이 바꾸는 원문(앞뒤 공백·불가시 문자)은 패널 위치와 맞대 볼 수
+          없어 종전 계획으로 보낸다.
+        """
+        log = self.log_message.emit
+        legacy = self._plan_occurrences_legacy(apply_targets)
+        ci_of, by_ci = self._ci_of(), self._by_ci()
+        # 브리지와 같은 순서 — hwp_editor.apply_corrections와 브리지 apply가 둘 다 원문 길이
+        #   내림차순 **안정 정렬**을 한다(apply_targets 순서가 correction_objs 순서다).
+        order = sorted(apply_targets, key=lambda c: len(c.get("original") or ""), reverse=True)
+        replay = _BridgeReplay(self.full_text)
+        plan = {}
+        n_changed = n_skip = n_fallback = 0
+        for c in order:
+            ci = ci_of.get(id(c))
+            if ci is None:
+                continue
+            o_raw = (c.get("original") or "").replace("\r", "\n")
+            o, k = _bridge_text(o_raw), _bridge_text(self._corrected_of(c))
+            if not o or not k or o == k:
+                continue                        # 브리지도 이 항목을 건너뛴다
+            tag = -(ci + 2)
+            rows = [r for r in by_ci.get(ci, []) if isinstance(r.get("pos"), int)]
+            absorbed = self._absorbed_occ(ci)
+            want = {r["pos"] for r in rows
+                    if not occurrence_skipped(r) and not r.get("shadowed")
+                    and r.get("occ") not in absorbed}
+            hidden = {r["pos"] for r in rows if r.get("shadowed") and not r.get("excluded")}
+            old_skip = self._skip_from(legacy, c)
+            res = None
+            if rows and o == o_raw:
+                res, state = replay.scan(o, k, lambda _n, at, _w=want: at in _w, tag)
+                if {at for _n, at, hit in res if hit} != want:
+                    res = None                  # 의도한 자리를 다 만나지 못했다 — 믿지 않는다
+            if res is None:
+                n_fallback += 1
+                sk = set(old_skip)
+                _res, state = replay.scan(o, k, lambda n, _at, _s=sk: n not in _s, tag)
+                if ci in legacy:
+                    plan[ci] = legacy[ci]
+                replay.commit(state)
+                continue
+            replay.commit(state)
+            occ_at = {r["pos"]: r.get("occ") for r in rows}
+            skip = [n for n, _at, hit in res if not hit]
+            surv = [occ_at.get(at) if at is not None else None for _n, at, _hit in res]
+            base = sorted(set(c.get("skip_occurrences") or []) | absorbed)
+            if skip != base or surv != [r.get("occ") for r in rows]:
+                plan[ci] = {"skip": skip, "survivors": surv}
+            if skip != old_skip:
+                n_changed += 1
+            # 앞 교정이 만든 글자이거나 화면에 숨은 자리라서 건너뛴 매치(거절·제외와 별개)
+            n_skip += sum(1 for _n, at, hit in res
+                          if not hit and (at is None or at in hidden))
+        # ⚠ 화면 로그 규약: `[태그]` + `n건`, 개별 예시 금지(activity_panel 참조).
+        if n_changed or n_skip:
+            log(f"  [적용 계획] 겹침 보정 {n_changed}건 · 건너뛸 자리 {n_skip}곳")
+        if n_fallback:
+            log(f"  [적용 계획] 위치 재현 실패 {n_fallback}건 · 종전 계획 사용")
+        return plan
+
+    def _plan_occurrences_legacy(self, apply_targets: list) -> dict:
+        """(종전 보정 — 추출 텍스트가 없을 때의 폴백) 치환하면 **사라지는 등장**을 걷어내고,
+        남은 것을 다시 번호 매긴다. ⚠ '새로 생기는' 등장은 보지 못한다(`_plan_by_replay`).
 
         ★풀려는 문제(실측 2026-08-08 · 사용자 보고 "교정본에만 '해야한다' 미반영"):
           apply는 **긴 원문 우선**으로 치환한다. 그래서 '고려해야한다'가 먼저 바뀌면
@@ -717,9 +912,11 @@ class ApplyWorker(QThread):
           뒤 '메세지를'을 달면 '키메세지를' 속 등장이 죽는다(같은 항목 집합에서
           '키메세지'만 빼면 12/12 성공).
 
-        ⚠ 치환(`_plan_occurrences`)에는 이 규칙을 쓰지 않는다 — 긴 교정이 부분문자열을
-          그대로 남기는 경우(‘뱃지만들기’→‘뱃지 만들기’) 짧은 교정이 그 자리도
-          정규화해야 하기 때문이다(`ReviewPanel._derive` 주석).
+        ⚠ 치환에는 이 목록을 그대로 쓰지 않는다 — 메모·PDF는 문서를 바꾸지 않아 패널 번호가
+          곧 찾기 번호지만, 교정본은 앞 교정이 문서를 바꿔 번호가 달라진다. 교정본에서도 같은
+          원칙(숨은 자리는 바꾸지 않는다)을 지키되 **브리지 번호로** 계산하는 것이 재현 계획
+          (`_plan_by_replay`)이다(2026-10-17 — 예전엔 '숨은 자리는 짧은 교정이 마저 정규화'를
+          바랐으나, 그게 거절한 겉 카드 자리까지 바꿨다).
         """
         base = list(c.get("skip_occurrences") or [])
         ci = self._ci_of().get(id(c))
@@ -737,14 +934,18 @@ class ApplyWorker(QThread):
           한 번에 치환하므로, 여기서 또 치환하면 같은 자리를 두 번 건드린다
           (`_compose_spots`).
         """
+        return self._skip_from(getattr(self, "_occ_plan", None) or {}, c)
+
+    def _skip_from(self, plan: dict, c: dict) -> list:
+        """주어진 계획표로 이 교정이 보낼 skip 번호(`_skip_for`의 본체 — 재현 계획의 폴백도 쓴다)."""
         ci = self._ci_of().get(id(c))
         absorbed = self._absorbed_occ(ci)
-        plan = getattr(self, "_occ_plan", None) or {}
         if ci is not None and ci in plan:
-            # 보정 좌표계로 번역 — survivors[j]가 검수 패널의 등장 번호다.
+            # 보정 좌표계로 번역 — survivors[j]가 검수 패널의 등장 번호다(None = 앞 교정이
+            #   만든 매치라 패널에 없는 자리).
             surv = plan[ci]["survivors"]
             skip = set(plan[ci]["skip"])
-            skip |= {j for j, k in enumerate(surv) if k in absorbed}
+            skip |= {j for j, k in enumerate(surv) if k is not None and k in absorbed}
             return sorted(skip)
         return sorted(set(c.get("skip_occurrences") or []) | absorbed)
 
@@ -799,12 +1000,13 @@ class ApplyWorker(QThread):
                 consumed_cnt += 1
                 continue
 
-        # S4: 부분 반영 감지 — '수락한 등장 수'와 '실제 치환 수' 대조 (치명 오류 안전망).
+        # S4: 반영 수 대조 — '수락한 등장 수'와 '실제 치환 수' (치명 오류 안전망).
         #   검수 패널이 계산한 본문 실등장 수(occurrences)에서 skip(부분 거절·제외)을 뺀
         #   기대 치환 수보다 실제 치환(replaced)이 적으면, 수락한 교정 일부가 문서에
         #   반영되지 않은 것이다(보이지 않는 조판 문자·찾기 누락 등). 과거엔 replaced≥1이면
         #   '적용 성공'으로만 집계돼 **조용히 누락**됐다(사용자 보고 2026-07-03 — 신뢰성
         #   치명). 이제 부족분을 실패 항목으로 표출해 편집자가 해당 위치를 확인할 수 있다.
+        #   ★**많아도** 실패다(2026-10-17) — 수락하지 않은 자리까지 바뀌었다는 뜻이다(아래).
         # ⚠ 기대 치환 수는 **보정 후 좌표계**로 센다 — 긴 교정에 먹혀 사라진 등장까지
         #   기대치에 넣으면 정상 실행이 '부분 반영'으로 오탐된다(`_plan_occurrences`).
         plan = getattr(self, "_occ_plan", None) or {}
@@ -823,15 +1025,32 @@ class ApplyWorker(QThread):
             exp = occ_n - skip_n
             if exp > 0:
                 expected_by_key[(c["original"], self._corrected_of(c))] = exp
-        partial_samples, partial_cnt = [], 0
+        partial_samples, partial_cnt, over_cnt = [], 0, 0
         for d in detail:
             if not d.get("applied"):
                 continue
             exp = expected_by_key.get((d.get("original", ""), d.get("corrected", "")))
             got = d.get("replaced", 0)
-            if exp is None or got >= exp:
+            if exp is None or got == exp:
                 continue
             orig = d.get("original", "")
+            if got > exp:
+                # ★초과 반영(2026-10-17) — 수락한 자리보다 **많이** 바뀌었다. 예전엔 got < exp만
+                #   봐서, 앞 교정이 만든 글자까지 바뀐 실행(실기 128곳 불일치)도 '실패 0'으로
+                #   나갔다(감사 2026-10-16). 재현 계획(`_plan_by_replay`)이 브리지와 같은 매치를
+                #   보는 한 생기지 않는다 — 생겼다면 한/글이 재현과 다른 자리를 찾았다는 뜻이고
+                #   어느 자리가 더 바뀌었는지는 모르므로 사람이 확인해야 한다.
+                over_cnt += 1
+                d["partial"] = True
+                d["error"] = (f"⚠ 초과 반영 — 수락 {exp}항목보다 많은 {got}항목이 치환됨 "
+                              "(다른 자리가 함께 바뀌었을 수 있음 — 해당 원문 수동 확인 필요)")
+                if len(partial_samples) < 10:
+                    partial_samples.append({
+                        "original":  (d.get("original")  or "")[:60],
+                        "corrected": (d.get("corrected") or "")[:60],
+                        "error":     d["error"],
+                    })
+                continue
             # 긴 성공 교정이 이 원문을 포함하면 부족분은 그 교정이 함께 처리한 것(정상)
             if orig and any(orig in a and orig != a for a in applied_originals):
                 continue
@@ -848,8 +1067,12 @@ class ApplyWorker(QThread):
         if partial_cnt:
             log(f"  ⚠ 부분 반영 {partial_cnt}건 — 수락한 등장 수보다 적게 치환됨 "
                 "(실패 항목에 표시, 해당 원문 위치 확인 필요)")
+        if over_cnt:
+            log(f"  ⚠ 초과 반영 {over_cnt}건 — 수락한 등장 수보다 많이 치환됨 "
+                "(실패 항목에 표시, 해당 원문 위치 확인 필요)")
 
-        return consumed_cnt, partial_cnt, partial_samples
+        # 둘 다 '수락한 만큼 정확히 바뀌지 않았다'는 실패로 센다(결과 dict의 partial·failed).
+        return consumed_cnt, partial_cnt + over_cnt, partial_samples
 
     # ══════════════════════════════════════════════════════
     # ▌결과물 모드별 실행
@@ -1195,8 +1418,10 @@ class ApplyWorker(QThread):
             #   먹혀 사라진 등장이 빠진 순서). 검수 패널의 번호(k)로 조회하려면 되돌려야
             #   한다 — 안 하면 정오표가 엉뚱한 등장을 '실패'로 적는다.
             #   `pages_by_original`(치환 전 스냅숏)은 패널 좌표계 그대로이므로 k를 쓴다.
+            #   ⚠ 재현 계획의 survivors에는 None(앞 교정이 만든 매치 — 패널에 없는 자리)이 섞인다.
             surv = (occ_plan.get(ci) or {}).get("survivors")
-            bridge_of = {k: j for j, k in enumerate(surv)} if surv else None
+            bridge_of = ({k: j for j, k in enumerate(surv) if k is not None}
+                         if surv else None)
             unfound_k = set()
 
             occs = by_ci.get(ci)
@@ -1374,11 +1599,14 @@ class ApplyWorker(QThread):
         bridge_of, unfound = {}, set()
         i = 0
         for k in expected_ks:
-            pk = located[k] if 0 <= k < len(located) else None
+            # ⚠ k가 None이면 재현 계획이 예상한 '앞 교정이 만든 매치'다 — 패널 자리가 없어 쪽을
+            #   모르므로 순서대로 짝짓기만 한다(정오표 행은 생기지 않는다).
+            pk = located[k] if isinstance(k, int) and 0 <= k < len(located) else None
             pb = occ_pages[i].get("page") if i < len(occ_pages) else None
             # 쪽을 모르는 쪽이 있으면 순서대로 짝짓는다(최선 추정).
             if i < len(occ_pages) and (pk is None or pb is None or pk == pb):
-                bridge_of[k] = occ_pages[i].get("i", i)
+                if k is not None:
+                    bridge_of[k] = occ_pages[i].get("i", i)
                 i += 1
             else:
                 unfound.add(k)

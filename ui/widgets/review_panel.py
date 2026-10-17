@@ -2053,6 +2053,11 @@ class ReviewPanel(QWidget):
                     f"‘{self._short_orig(occ['c'])}’ 반복 {len(others) + 1}항목을 ‘{lbl}’ 선택으로 "
                     f"일괄 처리했습니다.")
         self._derive(ci)
+        # ★겹침 합성을 다시 계산한다(2026-10-17). 여기서 이 교정 하나만 파생하고 끝내던
+        #   동안엔, 안쪽 카드('리플렛'→'리플릿')를 전부 거절해도 바깥 카드가 '리플릿 등'으로
+        #   남았다 — 적용은 카드 값을 그대로 쓰므로 **거절한 교정이 문서에 들어갔다**
+        #   (표적 시험 35건 중 7건). 겹침 쌍은 캐시돼 있어 1ms 미만이다(등장 1,900곳 실측).
+        self._compose_overlaps()
         # 전파로 상태가 바뀐 카드만 리스타일(미로드 카드는 생성 시 반영).
         self._restyle_dirty()
         self._scroll_to(card.property("occ_id"))
@@ -2077,6 +2082,9 @@ class ReviewPanel(QWidget):
         for o in self._occ:
             if o["c"] is data:
                 o.pop("_stem_done", None)
+        # 안쪽 카드 값을 고쳤으면 그것을 품은 바깥 카드의 합성 값도 따라가야 한다
+        #   (_set_status의 합성 재계산 주석 — 적용은 카드 값을 그대로 쓴다).
+        self._compose_overlaps()
         self._refresh_preview(defer=True)
         self._emit_counts()   # '직접수정' 집계 칩 즉시 갱신
 
