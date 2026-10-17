@@ -293,6 +293,17 @@ def noun_josa_split(text: str, eojeol: str, max_occurrences: int = 4):
         '탱이 한 마리'의 '탱이'=NNG 단일 → 매기 교정 보존). 반면 '하는 말이,'는
         말/NNG+이/JKS, '차란 무엇인가'는 차/NNG+란/JX로 갈려 보류된다.
       · 불규칙 결합('과잘'=과자/NNG+ᆯ/JKO)은 표면 경계가 어긋나므로 판정 보류(카드 유지).
+      · ★ 어절 전체가 kiwi **사전의 고유명사(NNP) 하나**로 읽히면, 그 읽기를 막고 다시 읽은
+        차선 읽기도 본다(2026-10-17 감사 — '출생 **월이** ‘99월’로'의 '월이'를 kiwi가 인명
+        '월이/NNP'로 읽어 방언 '월이→다리' 카드가 났다. 이 문맥에서 인명 읽기를 막으면
+        월/NNG+이/JKS다). 인명이면 규범표기 대상이 아니고, 인명이 아니면 체언+조사라 어느
+        쪽이든 카드가 틀린다. 단 차선 읽기는 **kiwi가 아는 일반 체언 하나 + 조사**일 때만
+        증거로 삼는다: 고유명사('흥보가'→흥보/NNP+가 — 흥부가 카드는 어느 읽기로도 맞다)나
+        미등록어 추정·글자 단위 쪼개기('량강도'→량/NNG+강/NNG+도)는 kiwi가 아무 말이나
+        붙잡은 것이라 카드를 유지한다.
+        사전에 없는 고유명사 추정(멀웨어·리플렛 등 oov NNP)은 막아도 읽기가 바뀌지 않으므로
+        다시 읽지 않는다. 실측: 20원고 규범표기 카드 76장 중 '월이' 1장만 빠지고(엣지→에지
+        등 NNP로 읽히는 정당 카드 6장 유지), 중의성 정문 27,807문장은 발화 변화 0.
 
     ⚠ 조사 딸린 표면('찌게를')은 명사 사용 신호이므로 **호출 측이 가드 대상에서 제외**할 것.
     ⚠ 반환된 체언이 실제 등재 표제어인지 확인도 호출 측 몫
@@ -319,22 +330,49 @@ def noun_josa_split(text: str, eojeol: str, max_occurrences: int = 4):
         except Exception:
             continue
         span = [t for t in tokens if pos <= t.start < pos + len(eojeol)]
-        if len(span) < 2:
-            continue
-        j = len(span)                       # 끝에서부터 조사 런을 떼어 낸다
-        while j > 0 and span[j - 1].tag.startswith("J"):
-            j -= 1
-        if j == 0 or j == len(span):        # 조사가 없거나 전부 조사 → 해당 없음
-            continue
-        if any(t.tag.split("-")[0] not in _NOMINAL for t in span[:j]):
-            continue
-        prev, first_j = span[j - 1], span[j]
-        if first_j.start != prev.start + prev.len:   # 불규칙 결합 → 보류
-            continue
-        base = eojeol[:first_j.start - pos]
-        if base and len(base) < len(eojeol):
+        base = _noun_josa_base(span, pos, eojeol)
+        if base is None and len(span) == 1 and span[0].tag == "NNP" \
+                and not getattr(span[0], "oov", False) \
+                and span[0].start == pos and span[0].len == len(eojeol):
+            try:
+                alt = kiwi.analyze(window, blocklist=[f"{span[0].form}/NNP"])[0][0]
+            except Exception:
+                continue
+            alt_span = [t for t in alt if pos <= t.start < pos + len(eojeol)]
+            base = _noun_josa_base(alt_span, pos, eojeol, common_only=True)
+        if base:
             return base
     return None
+
+
+def _noun_josa_base(span, pos: int, eojeol: str, common_only: bool = False):
+    """스팬 토큰이 [체언 런 + 조사 런]이면 체언 표면형, 아니면 None(noun_josa_split 전용).
+
+    `common_only`면 체언 런이 **kiwi가 아는 일반 체언 형태소 하나**일 때만 인정한다 —
+    고유명사 읽기를 막고 다시 읽은 차선 읽기를 증거로 쓸 때의 기준이다. 고유명사(NNP)·
+    미등록어 추정(oov)은 물론, 1음절 체언 여럿으로 쪼갠 읽기도 받지 않는다: 모르는 낱말을
+    글자 단위로 자른 것이라('량강도' 문맥 읽기 = 량/NNG+강/NNG+도/JX) 체언의 증거가 아니다.
+    """
+    if len(span) < 2:
+        return None
+    j = len(span)                       # 끝에서부터 조사 런을 떼어 낸다
+    while j > 0 and span[j - 1].tag.startswith("J"):
+        j -= 1
+    if j == 0 or j == len(span):        # 조사가 없거나 전부 조사 → 해당 없음
+        return None
+    if common_only and j != 1:
+        return None
+    for t in span[:j]:
+        tag = t.tag.split("-")[0]
+        if tag not in _NOMINAL:
+            return None
+        if common_only and (tag == "NNP" or getattr(t, "oov", False)):
+            return None
+    prev, first_j = span[j - 1], span[j]
+    if first_j.start != prev.start + prev.len:   # 불규칙 결합 → 보류
+        return None
+    base = eojeol[:first_j.start - pos]
+    return base if base and len(base) < len(eojeol) else None
 
 
 # ══════════════════════════════════════════════════════════════════════════
