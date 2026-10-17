@@ -902,13 +902,18 @@ class MainWindow(QMainWindow):
         """사내 용어 큐레이션 패널(관리자) 열기."""
         try:
             from ui.widgets.curator_panel import CuratorPanel
-            if getattr(self, "_curator_panel", None) is not None:
+            panel = getattr(self, "_curator_panel", None)
+            if panel is not None:
+                # 떠 있는 창만 앞으로 가져온다. 숨겨졌거나(닫힘) 이미 삭제된 창이면
+                # 새로 만든다 — 숨은 창을 raise_해도 화면엔 아무것도 안 뜬다.
                 try:
-                    self._curator_panel.raise_()
-                    self._curator_panel.activateWindow()
-                    return
+                    if panel.isVisible():
+                        panel.raise_()
+                        panel.activateWindow()
+                        return
                 except Exception:
-                    self._curator_panel = None
+                    pass
+                self._curator_panel = None
             self._curator_panel = CuratorPanel(self)
             self._curator_panel.finished.connect(lambda *_: setattr(self, "_curator_panel", None))
             self._curator_panel.show()

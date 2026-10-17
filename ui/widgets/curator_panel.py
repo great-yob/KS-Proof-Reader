@@ -34,6 +34,9 @@ class CuratorPanel(QDialog):
         super().__init__(parent)
         self.setWindowTitle("사내 용어 큐레이션")
         self.setModal(False)
+        # 닫을 때마다 새로 만들므로(열 때 최신 후보 재집계) 닫힌 창은 지운다 —
+        # 안 지우면 MainWindow 자식으로 숨은 채 쌓인다.
+        self.setAttribute(Qt.WA_DeleteOnClose)
         self.resize(760, 660)
         self._candidates = []
         self._workers = []
@@ -284,8 +287,17 @@ class CuratorPanel(QDialog):
     def _prune(self):
         self._workers = [x for x in self._workers if x.isRunning()]
 
-    def closeEvent(self, event):
+    def done(self, r):
+        # ⚠ 정리는 closeEvent가 아니라 done()에서 한다. closeEvent를 덮어 super를 부르지
+        #   않으면 QDialog가 reject()→finished를 내지 않아, MainWindow가 숨겨진 창을
+        #   계속 붙들고 재클릭 때 그 창을 raise_만 했다(두 번째 클릭부터 창이 안 뜸).
+        #   X 버튼(closeEvent→reject)·Esc(reject) 모두 여기로 모인다.
         for w in self._workers:
+            try:
+                w.done.disconnect()
+                w.failed.disconnect()
+            except Exception:
+                pass
             try:
                 if w.isRunning():
                     w.wait(2000)
@@ -294,4 +306,4 @@ class CuratorPanel(QDialog):
             except Exception:
                 pass
         self._workers = []
-        event.accept()
+        super().done(r)
