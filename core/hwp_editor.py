@@ -132,9 +132,9 @@ class HwpEditor:
         #   보내면 '어느 단계에서 멈췄는지'가 화면 캡처만으로 드러난다(브리지 로그는
         #   activity_panel._DROP이 화면에서 감추므로 이 경로가 유일하다).
         self._last_worker_line = ""
-        # 메모 재색인이 만드는 중간 저장본(아래 `_reindex_document`). 끝나면 지운다.
+        # 메모 세션 오염 복구가 만드는 중간 저장본(`_reopen_document`). 마지막 close가 지운다.
         self._stage_file = None
-        self._reindexing = False
+        self._reopening = False
         # ★문서에 정의된 **글자 스타일**의 글자모양 지문(`core/hwp_styles.py`).
         #   교정 표시 빨강이 글자 스타일을 해제하는 것을 막기 위해 apply에 실어 보낸다.
         #   None = 아직 안 읽음, [] = 읽을 수 없음(그 경우 예전 동작 그대로).
@@ -143,12 +143,12 @@ class HwpEditor:
     def open(self):
         """32비트 서브프로세스를 시작하고 HWP 파일을 엽니다."""
         cmd = _bridge_command()
-        # 재개(재색인) 시에도 drain 스레드가 돌아야 한다 — close가 세워 둔 정지
-        #   플래그를 내려 두지 않으면 새 스레드가 첫 루프에서 바로 끝난다.
+        # 같은 편집기를 닫았다 다시 열 때도 drain 스레드가 돌아야 한다 — close가 세워 둔
+        #   정지 플래그를 내려 두지 않으면 새 스레드가 첫 루프에서 바로 끝난다.
         self._stderr_stop.clear()
         # ⚠ 앞 프로세스가 남긴 큐 내용도 버린다. EOF 센티널(None)이 남아 있으면 새
         #   프로세스의 첫 명령이 그것을 먼저 읽고 **'브리지 응답 없음(프로세스
-        #   종료됨)'**으로 실패한다(실측 2026-08-10: 첫 재색인만 실패했다).
+        #   종료됨)'**으로 실패한다(실측 2026-08-10: 옛 메모 재색인의 첫 재열기만 실패했다).
         for q in (self._stdout_queue, self._stderr_queue):
             while True:
                 try:
@@ -330,48 +330,89 @@ class HwpEditor:
             self.logger(f"  [글자 스타일] 원고 글자 스타일을 지키려고 빨강 글자 대신 "
                         f"형광펜으로 표시 {style_marked}곳")
         self.last_style_marked = style_marked
+        self._resolve_spots(detail_total)
         return stats_total, detail_total
 
+    @staticmethod
+    def _resolve_spots(detail: list) -> None:
+        """브리지가 남긴 치환 좌표 기록(`spots_raw`)을 **치환이 다 끝난 문서의 좌표**로 바꾼다.
+
+        결과는 각 항목의 `detail["spots"] = [[list, para, 시작, 길이], …]`(등장 번호 순)이고,
+        '교정본+메모'의 메모 단계가 찾기 없이 그 자리로 곧장 가는 근거다(`insert_memos`).
+        ★왜 좌표인가 — 빨간 글자로 자리를 고르면 **누가 고친 빨강인지**를 모른다. 짧은
+          교정문이 긴 교정문 속에 들어 있으면('취업 유지' ⊂ '취업 유지 후 이탈') 남의 자리를
+          제 것으로 세고, 같은 교정문을 내는 두 교정('성별 임금 격차'·'성별임금격차' →
+          '성별 임금격차')은 자리를 나눌 수 없다(실측 24만 자 원고: 앵커 충돌 30곳).
+        ★기록은 **치환 순서**대로 되짚는다 — 뒤 치환이 같은 문단 앞쪽을 늘리거나 줄이면
+          이미 기록된 자리가 그만큼 밀린다(빨강 교정문 '임금격차' 앞에서 '경제활동 참가'가
+          '경제활동참가'로 줄면 한 칸 당겨진다). detail 순서 = 브리지 처리 순서다(배치를
+          나눠도 HwpEditor가 전역 정렬한 순서 그대로 보낸다).
+        ⚠ 좌표를 확인하지 못한 치환(`dirty*`)이 있으면 그 문단(또는 스토리·문서 전체)의 기록을
+          믿지 않는다 — 그 항목은 `spots`가 없고, 메모 단계는 빨간 글자 찾기로 되돌아간다.
+          조용히 밀린 좌표에 메모가 붙는 것보다 낫다(메모 단계도 달기 전에 글자를 확인한다).
+        """
+        reg = {}            # (list, para) → [자리, …]
+        every = []
+        per_item = []
+        for d in detail:
+            mine = []
+            for ev in d.pop("spots_raw", None) or []:
+                tag = ev[0] if ev else "dirty_all"
+                if tag == "dirty_all":
+                    for sp in every:
+                        sp["ok"] = False
+                    mine.append(None)
+                elif tag == "dirty_list":
+                    for (lst, _p), group in reg.items():
+                        if lst == ev[1]:
+                            for sp in group:
+                                sp["ok"] = False
+                    mine.append(None)
+                elif tag == "dirty":
+                    for sp in reg.get((ev[1], ev[2]), ()):
+                        sp["ok"] = False
+                    mine.append(None)
+                else:
+                    lst, para, s0, a, b, i = ev
+                    for sp in reg.get((lst, para), ()):
+                        if sp["s"] >= s0 + a:
+                            sp["s"] += b - a            # 뒤쪽 — 길이 차만큼 밀린다
+                        elif sp["s"] + sp["n"] > s0:
+                            sp["ok"] = False            # 겹침 — 좌표를 믿을 수 없다
+                    sp = {"L": lst, "P": para, "s": s0, "n": b, "i": i, "ok": True}
+                    reg.setdefault((lst, para), []).append(sp)
+                    every.append(sp)
+                    mine.append(sp)
+            per_item.append(mine)
+        for d, mine in zip(detail, per_item):
+            if (mine and len(mine) == int(d.get("replaced") or 0)
+                    and all(sp is not None and sp["ok"] for sp in mine)):
+                d["spots"] = [[sp["L"], sp["P"], sp["s"], sp["n"]]
+                              for sp in sorted(mine, key=lambda x: x["i"])]
+
     # 메모는 등장 1곳당 0.08초(실측 2026-08-07 · 본문 20곳 1.5초)라 치환보다 무겁다.
-    #   배치를 작게 잡아 취소 반응성을 유지한다(브리지 명령 하나는 중단할 수 없다).
-    _MEMO_BATCH = 5
+    #   브리지 명령 하나는 중간에 끊을 수 없으므로 작게 나눠 취소 반응성을 지킨다.
+    _MEMO_SCAN_BATCH = 10       # 자리 찾기 — 항목 수
+    _MEMO_KEYS_BATCH = 200      # 서브스토리 정렬 키 — 자리 수
+    _MEMO_PLACE_BATCH = 40      # 메모 달기 — 자리 수(≈3초)
+    # 진행률에서 '자리 찾기'가 차지하는 몫(나머지는 메모 달기).
+    _MEMO_SCAN_SHARE = 0.35
+    # 메모 달기 중 세션 오염(브리지 `memo_place`의 poisoned)을 만나면 문서를 다시 여는 최대 횟수.
+    #   정상 원고에서는 0회다(실측 2026-10-17: 원고 7개·약 4,800곳에서 오염 0). 이미 메모가
+    #   많이 달린 원고는 자리 찾기(찾기 수천 회)만으로 세션이 오염되므로 첫 메모에서 한 번 연다.
+    _MEMO_MAX_REOPENS = 5
+    # 등장 수를 모를 때의 안전 상한 / 절대 상한 — 브리지(`HwpBridge._MEMO_*`)와 같은 값.
+    _MEMO_FALLBACK_OCC = 100
+    _MEMO_MAX_OCC = 5000
 
-    # ★이 항목 수마다 문서를 **저장→닫기→다시 열기**로 재색인한다(`_reindex_document`).
-    #   25는 실측으로 고른 값이다(아래 표). 더 잘게 자르면 열고 닫는 값이 커지고,
-    #   크게 잡으면 재색인 전에 실패가 다시 쌓인다.
-    _MEMO_REINDEX_ITEMS = 25
-    # ★★그리고 **메모 수**로도 끊는다 — 색인이 낡는 속도는 항목 수가 아니라 **그 사이
-    #   문서에 박은 메모 수**에 달렸다. 실측 2026-08-10(25항목 묶음 6개, 묶음별 메모 수 →
-    #   실패 수): 24곳→0 · 40곳→0 · 49곳→2 · 51곳→0 · 58곳→12 · 97곳→11.
-    #   **50곳 근처에서 급격히 나빠진다.** 등장이 36곳인 낱말 하나가 묶음 예산을 통째로
-    #   써 버리는 일이 잦아, 항목 수 기준만으로는 이 경계를 지킬 수 없다.
-    _MEMO_REINDEX_MEMOS = 40
+    def _reopen_document(self):
+        """메모 세션 오염 복구 — 지금까지 단 메모를 **중간 저장본**에 담아 닫고 다시 연다.
 
-    def _reindex_document(self, log=None):
-        """★한/글의 '찾기 색인'을 새로 만든다 — 저장 → 닫기 → 다시 열기.
-
-        ★왜 필요한가(실측 2026-08-10 · 실파일 고독사 · 152항목 · 등장 360곳):
-          메모 컨트롤은 문단 안에서 자리를 차지하는데, **같은 세션에서는 이후의
-          `RepeatFind`가 그 변화를 반영하지 못한다.** 그래서 이미 메모를 단 자리와
-          겹치거나 맞닿은 낱말을 찾으면, 찾기는 '옛 본문' 기준으로 매치를 돌려주고
-          그 자리에 메모를 열면 `InsertText`가 `RPC_E_SERVERFAULT`로 죽는다. 한 번
-          죽은 자리는 그 세션에서 **어떤 재시도로도 살아나지 않는다**(재열기·삭제 후
-          재시도·뒤쪽 좌표·대기·항목 끝 재시도 전부 실패, 102곳 중 1곳만 회복).
-          이등분으로 특정한 최소 재현: '키메세지'(36곳)에 메모를 단 뒤 '메세지를'
-          (‘키메세지를’ 속)을 달면 죽는다 — 같은 항목 집합에서 '키메세지'만 빼면 12/12 성공.
-          문서를 저장해 다시 열면 색인이 새로 만들어져 그 자리도 정상 동작한다.
-
-          실측(같은 원고 152항목 · 등장 360곳 · 메모 성공 자리 수 / 소요):
-            재색인 없음        116곳 / 68초   ← 사용자가 겪은 '메모 다량 유실'
-            25항목마다 재색인  302곳 / 68초   ← 현재 설계(저장본 빈 메모 0)
-          여는 값이 공짜는 아니지만, 죽을 자리에 쏟던 시간이 사라져 총 소요는 같다.
-          ⚠ 재색인해도 남는 30곳은 대부분 '이미 메모가 있는 자리와 겹쳐 찾기에서
-            사라진 등장'이라, 정오표에 '표시하지 못함'으로 남는다(조용히 사라지지 않는다).
-
-        ⚠ 중간 저장본은 **캐시 폴더**에 둔다. 원고 옆에 두면 사용자가 산출물로 오해하고,
-          읽기 전용 설치 폴더에서는 쓸 수도 없다.
-        ⚠ 재색인 사이의 `close()`는 중간 저장본을 지우면 안 된다(바로 다시 열 파일이다).
-          `_reindexing` 플래그가 그것을 가른다.
+        오염은 그 한/글 세션에만 붙어 있고 문서를 다시 열면 사라진다(브리지 메모 머리말
+        불변식④). 예전엔 이것을 25항목마다 **주기적으로** 했는데(옛 `_reindex_document`),
+        지금은 오염을 실제로 만났을 때만 한다 — 정상 원고에서는 한 번도 돌지 않는다.
+        ⚠ 중간 저장본은 **캐시 폴더**에 둔다(원고 옆이면 산출물로 오해, 설치 폴더는 읽기 전용).
+          마지막 `close()`가 지운다 — 다시 열 때의 close는 지우지 않는다(`_reopening`).
         """
         ext = os.path.splitext(self.file_path)[1] or ".hwp"
         try:
@@ -381,8 +422,7 @@ class HwpEditor:
             import tempfile
             stage_dir = tempfile.gettempdir()
         stage = os.path.join(stage_dir, "_ks_memo_stage" + ext)
-
-        self._reindexing = True
+        self._reopening = True
         try:
             self.save_as(stage)
             self.close()
@@ -390,9 +430,7 @@ class HwpEditor:
             self._stage_file = stage
             self.open()
         finally:
-            self._reindexing = False
-        if log:
-            log("  [메모] 문서 재색인 — 이어서 답니다")
+            self._reopening = False
 
     def insert_memos(self, corrections: list, progress_cb=None,
                      stop_event: threading.Event = None,
@@ -401,87 +439,260 @@ class HwpEditor:
 
         ⚠ `mark_anchor`(앵커 글자색)는 기본 **꺼짐** — 사용자 지정 2026-08-07.
 
-        `corrections`는 dict 목록이며 `memo_text`(메모 본문)와 `occ_total`(그 낱말의
-        총 등장 수)을 추가로 담는다. 반환 스키마는 `apply_corrections`와 같다
-        (stats, detail) — 정오표 조립 코드를 공유하기 위함이다.
+        `corrections`는 dict 목록이며 `memo_text`(메모 본문)·`occ_total`·`doc_occ`(등장 수)·
+        `skip_occurrences`(표시용 skip)를 담는다. '교정본+메모'는 `red_only`·`anchor_of`와,
+        치환 단계가 확인한 자리 좌표 `spots`(`_resolve_spots`)를 함께 싣는다.
+        반환 스키마는 `apply_corrections`와 같다(stats, detail) — 정오표 조립 코드를 공유한다.
 
-        ★**정렬은 apply와 정반대인 '짧은 원문 우선'이다.** apply의 '긴 원문 우선'은
-          치환이 서로를 오염시키지 않게 하는 장치인데, 메모는 글자를 바꾸지 않으므로
-          그 이유가 없다. 대신 정반대의 이유가 생긴다 — **메모 본문이 원문을 인용하기
-          때문**이다. 긴 '고려해야한다'에 메모를 먼저 달면 그 본문에 '해야한다'가 새로
-          생기고, 다음 항목의 찾기가 **자기 메모 안의 글자를 원고의 등장으로 오인**해
-          그 자리에 메모를 달려다 실패한다(실측 2026-08-08: '해야한다' 단독 14/14 성공 /
-          중첩 3항목과 함께면 실패, 실패 자리의 스토리가 앞서 만든 메모의 서브스토리).
-          짧은 것부터 달면 이미 달린 메모의 원문은 항상 **더 짧으므로** 뒤에 오는 긴
-          원문을 품을 수 없다 — 이 부류가 원리적으로 사라진다.
-          A/B 실측(05.hwp · 22항목 · 정오표 37행): 긴 원문 우선 = 메모 31곳·교정본과
-          6행 차이(그 6건이 사용자가 보고한 미반영 항목과 일치) / **짧은 원문 우선 =
-          메모 32곳·3행 차이**. 되돌리려면 이 측정을 먼저 다시 할 것.
-        ⚠ 항목 순서는 **등장 인덱스에 영향을 주지 않는다** — 브리지 memo는 항목마다
-          문서 처음부터 다시 훑으므로(MoveDocBegin) 좌표계는 apply/locate와 그대로 같다.
+        ★★2단계다 — **자리를 전부 찾은 뒤에야 메모를 단다**(브리지 메모 머리말 불변식④·⑤).
+          ① 자리 정하기: `spots`가 있으면 그대로, 없으면 `memo_scan`(찾기만)
+          ② 자리 다툼 해소: 빨간 매치가 다른 교정의 자리와 겹치면 버린다
+          ③ 정렬: 서브스토리는 `memo_keys`로 본문 기준 위치를 얻어 **문서 순**으로
+          ④ 달기: `memo_place`가 **문서 뒤쪽부터** 좌표로 단다(찾기 0회)
+          예전엔 항목마다 문서를 훑으며 그 자리에 바로 달았는데, 메모가 박힌 문서에서
+          찾기를 많이 돌리면 세션이 오염돼 그 뒤 메모가 전부 죽었다. 그걸 25항목마다
+          저장·닫기·다시 열기(재색인)로 씻었다 — 실측(24만 자 원고 '교정본+메모', 같은 결정):
+            예전   메모 291곳 · 못 함 331곳 · 339초(재색인 10회)
+            2단계  메모 609곳 · 못 함  13곳 · 157초(남은 13곳은 메모를 거부하는 캡션·머리말류)
+          ⚠ 메모를 단 뒤에 찾기를 다시 하는 경로(실패 자리 재스윕 등)를 넣지 말 것 — 오염이 돌아온다.
+        ⚠ 항목 순서는 등장 번호에 영향을 주지 않는다 — 찾기는 항목마다 문서 처음부터이고
+          메모가 아직 하나도 없으므로 좌표계는 apply/locate와 같다.
         """
-        corr_data = [c for c in corrections if isinstance(c, dict)]
-        # ⚠ **'진짜 오탈자를 먼저' 정렬은 실측으로 기각됐다**(2026-08-10). 뒤로 갈수록
-        #   실패가 는다는 관찰에서 나온 발상이었으나, 실제로는 실패가 **자리에 붙어 있어**
-        #   순서를 바꿔도 같은 항목이 그대로 실패했고 총량만 나빠졌다
-        #   (312/335 → 305/336). 재시도하지 말 것.
-        corr_data.sort(key=lambda c: len(c.get("original") or ""))
+        items = [c for c in corrections if isinstance(c, dict)]
+        total = len(items)
 
-        stats_total  = {"memo": 0, "blocked": 0, "fail": 0}
-        detail_total = []
-        total = len(corr_data)
-        done  = 0
-        # ★재색인 경계(`_reindex_document`의 실측 근거 참조). 마지막 묶음 뒤에는 안 한다.
-        next_reindex = self._MEMO_REINDEX_ITEMS
-        memos_since  = 0            # 마지막 재색인 이후 실제로 단 메모 수
+        def report(frac):
+            if progress_cb is not None and total:
+                progress_cb(min(max(frac, 0.0), 1.0) * total, total)
 
-        for i in range(0, total, self._MEMO_BATCH):
-            if stop_event is not None and stop_event.is_set():
+        def stopped():
+            return stop_event is not None and stop_event.is_set()
+
+        # ── ① 자리 후보 ─────────────────────────────────────────────
+        plans = [{"spots": [], "skipped": [], "error": ""} for _ in items]
+        need_scan = []
+        for k, it in enumerate(items):
+            fixed = it.get("spots")
+            if fixed:
+                plans[k]["spots"] = [{"i": j, "pos": list(p[:4]), "page": None}
+                                     for j, p in enumerate(fixed)]
+            else:
+                need_scan.append(k)
+
+        def cap_of(it):
+            cap = (int(it.get("doc_occ") or 0) or int(it.get("occ_total") or 0)
+                   or self._MEMO_FALLBACK_OCC)
+            return min(cap, self._MEMO_MAX_OCC)
+
+        # ★치환이 **새로 만든** 글자 — '교정본+메모'에서 원문 앵커(검수 필요 카드)가 다른 교정의
+        #   결과 속에서 새로 생길 수 있다('설치 대학'→'설치대학'이 '설치대학'을 하나 더 만든다).
+        #   그 카드의 등장 수(doc_occ)는 **치환 전** 문서 기준이라, 생긴 자리를 등장으로 세면
+        #   진짜 뒤쪽 등장에 닿지 못한다(실측 hwpx 원고: 검수 카드 2건이 그렇게 '표시 못 함').
+        #   치환 좌표가 있는 자리 중 교정문에는 앵커가 있고 원문에는 없는 곳 = 생긴 자리.
+        created = {}            # (list, para) → [(시작, 끝, 교정문, 원문), …]
+        for k, it in enumerate(items):
+            if it.get("spots") and it.get("red_only"):
+                for p in it["spots"]:
+                    created.setdefault((p[0], p[1]), []).append(
+                        (p[2], p[2] + p[3], it.get("original") or "", it.get("anchor_of") or ""))
+
+        def made_here(pos, anchor):
+            s0, e0 = pos[2], pos[2] + pos[3]
+            return any(not (e0 <= a or s0 >= b2) and anchor in corr and anchor not in orig
+                       for a, b2, corr, orig in created.get((pos[0], pos[1]), ()))
+
+        def extra_for(anchor):
+            return sum(1 for group in created.values() for _a, _b, corr, orig in group
+                       if anchor in corr and anchor not in orig)
+
+        scanned = {}
+        for b in range(0, len(need_scan), self._MEMO_SCAN_BATCH):
+            if stopped():
+                return {"memo": 0, "blocked": 0, "fail": 0}, []
+            ks = need_scan[b:b + self._MEMO_SCAN_BATCH]
+            req = []
+            for k in ks:
+                it = items[k]
+                cap = cap_of(it)
+                req.append({
+                    "original":  it.get("original", ""),
+                    "need":      cap,
+                    # ★빨간 매치는 **전부** 받는다 — 남의 자리를 걸러 낸 뒤에 cap을 채운다(②).
+                    #   원문 앵커는 치환이 새로 만든 자리만큼 더 받는다(위 `created`).
+                    "limit":     (self._MEMO_MAX_OCC if it.get("red_only")
+                                  else min(cap + extra_for(it.get("original") or ""),
+                                           self._MEMO_MAX_OCC)),
+                    "red_only":  bool(it.get("red_only")),
+                    "pen_paras": it.get("pen_paras") or [],
+                })
+            done0 = b
+
+            def scan_cb(pct, _t, _done=done0, _n=len(ks)):
+                frac = (_done + _n * min(max(pct, 0), 100) / 100.0) / max(1, len(need_scan))
+                report(frac * self._MEMO_SCAN_SHARE)
+
+            result = self._send_cmd({"cmd": "memo_scan", "items": req},
+                                    progress_cb=scan_cb, total=total)
+            if not result.get("ok"):
+                raise RuntimeError(f"메모 자리 찾기 실패: {result.get('error')}")
+            for k, r in zip(ks, result.get("scan") or []):
+                scanned[k] = r
+        report(self._MEMO_SCAN_SHARE)
+
+        # ── ② 등장 번호 · 부분 거절 · 자리 다툼 ────────────────────────
+        #   claimed: 이미 주인이 정해진 구간 — (list, para) → [(시작, 끝), …]
+        claimed = {}
+
+        def claim(pos):
+            claimed.setdefault((pos[0], pos[1]), []).append((pos[2], pos[2] + pos[3]))
+
+        def taken(pos):
+            s, e = pos[2], pos[2] + pos[3]
+            return any(not (e <= a or s >= b2)
+                       for a, b2 in claimed.get((pos[0], pos[1]), ()))
+
+        for pl in plans:
+            for sp in pl["spots"]:
+                claim(sp["pos"])
+        # 빨간 찾기 항목 — **긴 앵커부터** 자리를 차지한다. 짧은 앵커가 긴 교정문 속에서
+        #   잡힌 빨강은 그 긴 교정의 자리다('취업 유지' ⊂ '취업 유지 후 이탈').
+        red_ks = sorted((k for k in need_scan if items[k].get("red_only")),
+                        key=lambda k: -len(items[k].get("original") or ""))
+        for k in red_ks:
+            r = scanned.get(k) or {}
+            plans[k]["error"] = r.get("error", "")
+            cap = cap_of(items[k])
+            for m in r.get("matches") or []:
+                if len(plans[k]["spots"]) >= cap:
+                    break
+                pos = [m[0], m[1], m[2], m[3]]
+                if taken(pos):
+                    continue
+                claim(pos)
+                plans[k]["spots"].append({"i": len(plans[k]["spots"]), "pos": pos,
+                                          "page": m[4]})
+        # 원문 앵커 항목(메모 모드·검수 필요 카드) — 찾기 순번이 곧 등장 번호다.
+        for k in need_scan:
+            if items[k].get("red_only"):
+                continue
+            r = scanned.get(k) or {}
+            plans[k]["error"] = r.get("error", "")
+            skip = set(items[k].get("skip_occurrences") or [])
+            anchor = items[k].get("original") or ""
+            real = [m for m in (r.get("matches") or [])
+                    if not made_here(m[:4], anchor)]        # 치환이 만든 자리는 등장이 아니다
+            for i, m in enumerate(real[:cap_of(items[k])]):
+                if i in skip:          # 부분 거절 — 메모도 달지 않는다
+                    plans[k]["skipped"].append({"i": i, "page": m[4], "ok": False})
+                else:
+                    plans[k]["spots"].append({"i": i, "pos": [m[0], m[1], m[2], m[3]],
+                                              "page": m[4]})
+
+        # ── ③ 문서 순 정렬 키 ────────────────────────────────────────
+        flat = [(k, sp) for k, pl in enumerate(plans) for sp in pl["spots"]]
+        subs = [sp for _k, sp in flat if sp["pos"][0] != 0]
+        for b in range(0, len(subs), self._MEMO_KEYS_BATCH):
+            chunk = subs[b:b + self._MEMO_KEYS_BATCH]
+            result = self._send_cmd({"cmd": "memo_keys",
+                                     "points": [sp["pos"][:3] for sp in chunk]})
+            if not result.get("ok"):
+                raise RuntimeError(f"메모 자리 정렬 실패: {result.get('error')}")
+            for sp, key in zip(chunk, result.get("keys") or []):
+                sp["body"] = key
+        _FAR = 10 ** 9          # 본문까지 못 빠져나온 스토리 — 맨 먼저 처리(머리말 등)
+
+        def order(entry):
+            pos = entry[1]["pos"]
+            if pos[0] == 0:
+                return (pos[1], pos[2], 0, pos[1], pos[2])
+            body = entry[1].get("body") or [_FAR, 0]
+            return (body[0], body[1], pos[0], pos[1], pos[2])
+
+        # ── ④ 문서 뒤쪽부터 단다 ─────────────────────────────────────
+        flat.sort(key=order, reverse=True)
+        b = 0
+        reopens = 0
+        while b < len(flat):
+            if stopped():
                 break
-            due = (i >= next_reindex
-                   or memos_since >= self._MEMO_REINDEX_MEMOS)
-            if due and i < total:
-                next_reindex = i + self._MEMO_REINDEX_ITEMS
-                memos_since = 0
-                try:
-                    self._reindex_document(self.logger)
-                except Exception as exc:
-                    # 재색인은 품질 장치이지 필수 경로가 아니다 — 실패하면 그대로 잇는다
-                    #   (그 뒤로는 실패가 늘겠지만, 지금까지 단 메모는 살아 있다).
-                    if self.logger:
-                        self.logger(f"  [메모] 문서 재색인 실패 — 그대로 진행: {exc}")
-            batch = corr_data[i:i + self._MEMO_BATCH]
+            chunk = flat[b:b + self._MEMO_PLACE_BATCH]
+            done0 = b
 
-            batch_cb = None
-            if progress_cb is not None:
-                def batch_cb(pct, _t, _done=done, _blen=len(batch)):
-                    frac = min(max(pct, 0), 100) / 100.0
-                    progress_cb(_done + _blen * frac, total)
+            def place_cb(pct, _t, _done=done0, _n=len(chunk)):
+                frac = (_done + _n * min(max(pct, 0), 100) / 100.0) / max(1, len(flat))
+                report(self._MEMO_SCAN_SHARE + frac * (1 - self._MEMO_SCAN_SHARE))
 
             result = self._send_cmd({
-                "cmd": "memo",
-                "corrections": batch,
+                "cmd": "memo_place",
+                "spots": [{"pos": sp["pos"], "anchor": items[k].get("original", ""),
+                           "memo_text": items[k].get("memo_text", ""),
+                           "color": items[k].get("color", 255)} for k, sp in chunk],
                 "mark_anchor": bool(mark_anchor),
-            }, progress_cb=batch_cb, total=total)
-
+            }, progress_cb=place_cb, total=total)
             if not result.get("ok"):
                 raise RuntimeError(f"메모 달기 실패: {result.get('error')}")
+            placed = result.get("placed") or []
+            for (_k, sp), r in zip(chunk, placed):
+                sp["result"] = r
+            b += max(1, len(placed)) if placed else len(chunk)
+            if result.get("poisoned"):
+                # ★세션 오염 — 문서를 다시 열고 나머지를 잇는다. 뒤쪽부터 달고 있으므로 남은
+                #   자리(전부 앞쪽)의 좌표는 그대로다. 오염된 그 자리는 실패로 남긴다.
+                #   ⚠ 횟수를 묶는다 — 자리 자체가 메모를 죽이는 원고(메모 본문 속 자리 등)에서
+                #     열고 닫기만 되풀이하지 않게. 다 쓰면 남은 자리도 그대로 시도한다.
+                if reopens >= self._MEMO_MAX_REOPENS:
+                    continue
+                reopens += 1
+                if self.logger:
+                    self.logger(f"  [메모] 한/글 세션 오류 — 문서를 다시 열고 이어서 답니다 "
+                                f"({reopens}회)")
+                self._reopen_document()
+        report(1.0)
 
-            for k, v in (result.get("stats") or {}).items():
-                stats_total[k] = stats_total.get(k, 0) + v
-            batch_detail = result.get("detail") or []
-            detail_total.extend(batch_detail)
-            memos_since += sum(d.get("memoed", 0) for d in batch_detail)
-            done += len(batch)
-            if progress_cb is not None:
-                progress_cb(done, total)
-
-        # ⚠ **못 단 자리를 재색인 뒤 다시 도는 스윕을 넣지 말 것**(실측 2026-08-10:
-        #   35곳 재시도 → 회복 0곳, 재색인 한 번 값 ~10초만 더 든다). 재색인은 색인을
-        #   되살리지만 그 자리는 **되살리지 못한다** — 남은 실패는 이미 메모가 달린
-        #   앵커와 겹쳐 문서 재열기 뒤에는 아예 찾기에서 사라지는 등장들이고, 등장
-        #   인덱스로 다시 겨눌 수도 없다(가리키던 자리가 없어져 번호가 밀린다).
-        #   이 자리들은 정오표에 '표시하지 못함' 사유로 남는 것이 정직한 결말이다.
+        # ── ⑤ 결과 — apply와 같은 스키마(정오표 조립 공유) ─────────────
+        stats_total = {"memo": 0, "blocked": 0, "fail": 0}
+        detail_total = []
+        for it, pl in zip(items, plans):
+            occ_pages = list(pl["skipped"])
+            inserted = blocked = 0
+            err_msg = pl["error"]
+            for sp in pl["spots"]:
+                r = sp.get("result")
+                if r is None:          # 취소로 못 간 자리
+                    continue
+                page = r.get("page") if r.get("page") is not None else sp.get("page")
+                if r.get("ok"):
+                    inserted += 1
+                    occ_pages.append({"i": sp["i"], "page": page, "ok": True})
+                else:
+                    blocked += 1
+                    occ_pages.append({"i": sp["i"], "page": page, "ok": False,
+                                      "blocked": True, "note": r.get("note", "")})
+                    err_msg = err_msg or r.get("note", "")
+            occ_pages.sort(key=lambda e: e.get("i", 0))
+            if inserted:
+                stats_total["memo"] += 1
+            elif blocked:
+                stats_total["blocked"] += 1
+            else:
+                stats_total["fail"] += 1
+            detail_total.append({
+                # ★'교정본+메모'는 앵커가 교정문이라 `original`이 교정문이다. 정오표는
+                #   **원문 기준**으로 맞물리므로 원래 문자열을 돌려준다(anchor_of).
+                "original":  it.get("anchor_of") or it.get("original", ""),
+                "corrected": it.get("corrected", ""),
+                "reason":    it.get("reason", ""),
+                "source":    it.get("source", "dict"),
+                "color":     it.get("color", 255),
+                "applied":   inserted > 0,
+                "replaced":  inserted,
+                "occ_pages": occ_pages,
+                "memoed":    inserted,
+                "blocked":   blocked,
+                "error":     err_msg or ("" if inserted else
+                                         "메모를 달 수 있는 등장을 찾지 못했습니다"),
+                "path":      "InsertFieldMemo",
+            })
         return stats_total, detail_total
 
     def export_pdf(self, output_path: str) -> str:
@@ -587,9 +798,8 @@ class HwpEditor:
             setattr(self, th_attr, None)
         self._proc = None
 
-        # 재색인 중간 저장본 정리 — 재색인 **사이의** close에서는 지우지 않는다
-        #   (바로 다시 열 파일이다).
-        if self._stage_file and not self._reindexing:
+        # 메모 복구용 중간 저장본 정리 — 다시 여는 **사이의** close에서는 지우지 않는다.
+        if self._stage_file and not self._reopening:
             try:
                 os.remove(self._stage_file)
             except OSError:

@@ -1042,12 +1042,14 @@ class MainWindow(QMainWindow):
         #     별개의 파일이 되어 사용자가 어느 쪽을 써야 할지 알 수 없게 된다.
         src = self._file_path
         if mode == "hwp_memo":
-            done_hwp, done_rows = self._corrected_hwp()
+            done_hwp, done_rows, done_spots = self._corrected_hwp()
             if done_hwp and os.path.exists(done_hwp):
                 src = done_hwp
                 opts["source_is_corrected"] = True
                 # 치환 결과의 정본 = 그 교정본을 만든 실행의 정오표 행(ApplyWorker 주석).
                 opts["base_errata_rows"] = done_rows
+                # 그 실행이 치환한 자리의 좌표 — 메모를 빨간 글자 찾기 없이 그 자리에 단다.
+                opts["base_spots"] = done_spots
                 # 산출 이름은 **원본 기준**으로 짓는다 — 교정본을 입력으로 받았다고
                 #   `…_교정본_교정본(메모).hwp`가 되면 안 된다.
                 base, ext = os.path.splitext(self._file_path)
@@ -1088,7 +1090,8 @@ class MainWindow(QMainWindow):
         self._extra_worker.start()
 
     def _corrected_hwp(self) -> tuple:
-        """이번 결과에서 **교정본**(치환만 한 `_교정본.hwp`)의 (경로, 정오표 행) — 없으면 ("", []).
+        """이번 결과에서 **교정본**(치환만 한 `_교정본.hwp`)의 (경로, 정오표 행, 치환 자리 좌표)
+        — 없으면 ("", [], {}).
 
         ★`result["hwp_path"]`를 그대로 쓰면 안 된다(2026-10-16 감사 실측). 그 칸은
           '1차 실행이 만든 한글 파일'이라 1차가 **메모본**이면 `_메모본.hwp`가 들어 있다.
@@ -1100,11 +1103,13 @@ class MainWindow(QMainWindow):
         """
         r = self._result or {}
         if r.get("output_mode") == "hwp" and r.get("hwp_path"):
-            return r["hwp_path"], list(r.get("errata_rows") or [])
+            return (r["hwp_path"], list(r.get("errata_rows") or []),
+                    dict(r.get("apply_spots") or {}))
         for e in (r.get("extra_outputs") or []):
             if e.get("mode") == "hwp" and e.get("path"):
-                return e["path"], list(e.get("errata_rows") or [])
-        return "", []
+                return (e["path"], list(e.get("errata_rows") or []),
+                        dict(e.get("apply_spots") or {}))
+        return "", [], {}
 
     def _extra_errata_path(self, mode: str) -> str:
         """추가 실행이 쓸 정오표 경로 — **언제나** 모드 이름을 붙인다.
@@ -1147,6 +1152,8 @@ class MainWindow(QMainWindow):
             "annotated":    result.get("annotated", 0),
             "pdf_missing":  result.get("pdf_missing", 0),
             "errata_rows":  result.get("errata_rows") or [],
+            # 이 실행이 교정본을 만들었다면 그 치환 자리 좌표('교정본에 메모 추가'용).
+            "apply_spots":  result.get("apply_spots") or {},
         }
         extras = list(self._result.get("extra_outputs") or [])
         extras = [e for e in extras if e.get("mode") != mode]   # 같은 모드 재실행은 갱신

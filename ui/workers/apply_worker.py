@@ -345,15 +345,19 @@ class ApplyWorker(QThread):
                         #   메모 단계가 한 번만 한다(중간 저장본을 남기지 않는다).
                         replaced_by = {d.get("original", ""): int(d.get("replaced", 0))
                                        for d in detail if d.get("applied")}
-                        # ★형광펜으로 표시한 자리의 문단 좌표 — 그 자리는 빨갛지 않아
-                        #   메모 단계의 빨강 필터에 걸러진다. 이것이 유일한 단서다.
+                        # ★치환한 자리의 **최종 좌표**(`HwpEditor._resolve_spots`) — 메모
+                        #   단계가 찾기 없이 그 자리로 곧장 간다. 빨강·형광펜 어느 쪽으로
+                        #   표시했든 같고, 누가 고친 자리인지도 정확하다.
+                        spots_by = {d.get("original", ""): d.get("spots")
+                                    for d in detail if d.get("applied") and d.get("spots")}
+                        # 형광펜 자리의 문단 좌표 — 좌표를 확인하지 못한 항목이 빨간 글자
+                        #   찾기로 되돌아갈 때만 쓰인다(빨강 필터가 형광펜을 못 읽는다).
                         pen_paras_by = {d.get("original", ""): (d.get("pen_paras") or [])
                                         for d in detail if d.get("applied")}
                         stats2, detail2, out_hwp = self._run_memo(
                             editor, annot_targets, log, pages_by_original,
                             anchor_corrected=True, replaced_by=replaced_by,
-                            pen_paras_by=pen_paras_by,
-                            reindex_first=True,
+                            pen_paras_by=pen_paras_by, spots_by=spots_by,
                             out_path=self._hwp_out_path("_교정본(메모)"))
                         memo_detail = detail2
                         if self._stop.is_set():
@@ -371,9 +375,12 @@ class ApplyWorker(QThread):
                     # ★'교정본에 메모 추가' — 입력이 이미 교정본이라 치환은 없다.
                     #   앵커는 교정문이고, 우리가 고친 자리는 빨갛게 칠해져 있으므로
                     #   그 색으로 자리를 가린다(브리지 `_match_is_red`).
+                    #   그 교정본을 만든 실행이 넘겨준 자리 좌표가 있으면(`base_spots`) 빨간
+                    #   글자를 다시 찾지 않고 곧장 간다 — 저장본이라 좌표가 그대로다.
                     stats, memo_detail, out_hwp = self._run_memo(
                         editor, annot_targets, log, pages_by_original,
                         anchor_corrected=True,
+                        spots_by=self.options.get("base_spots") or {},
                         out_path=self._hwp_out_path("_교정본(메모)"))
                     detail = memo_detail
                     if self._stop.is_set():
@@ -573,6 +580,13 @@ class ApplyWorker(QThread):
             # 완료 화면의 '추가 산출물'용 — 이 실행에서 뜬 쪽 번호 스냅숏.
             #   다음 실행에 known_pages로 되돌려 주면 한/글을 다시 뒤지지 않는다.
             "pages_by_original": pages_by_original,
+            # 완료 화면의 '교정본에 메모 추가'용 — 이 실행이 치환한 자리의 최종 좌표
+            #   (`HwpEditor._resolve_spots`). 저장한 교정본의 좌표 그대로라, 그 위에 메모를
+            #   달 때 빨간 글자를 다시 찾지 않고 곧장 간다(`base_spots`).
+            "apply_spots": ({d.get("original", ""): d["spots"] for d in detail
+                             if d.get("applied") and d.get("spots")}
+                            if mode in self.MODIFY_MODES and not self.source_is_corrected
+                            else {}),
         })
 
     # ══════════════════════════════════════════════════════
@@ -1098,34 +1112,30 @@ class ApplyWorker(QThread):
     def _run_memo(self, editor, targets: list, log,
                   pages_by_original: dict = None, *,
                   anchor_corrected: bool = False, replaced_by: dict = None,
-                  pen_paras_by: dict = None,
-                  out_path: str = "", reindex_first: bool = False) -> tuple:
+                  pen_paras_by: dict = None, spots_by: dict = None,
+                  out_path: str = "") -> tuple:
         """메모 모드 — 각 자리에 한/글 메모를 단다.
 
         ★`anchor_corrected`는 '교정본+메모'(output_mode="hwp_memo") 전용이다. 그 모드는
           **치환이 끝난 문서**에 메모를 달므로 앵커가 원문이 아니라 **교정문**이어야 한다
           — 원문은 이미 문서에 없다. 대신 교정문은 원래부터 그 표기였던 자리에도 있으므로
-          브리지가 **빨간 글자색**으로 우리가 고친 자리만 고른다(`_match_is_red`).
+          **치환 단계가 확인한 자리 좌표**(`spots_by` — `HwpEditor._resolve_spots`)로 곧장
+          간다. 좌표가 없는 항목(좌표를 확인하지 못한 치환 · 결과 화면의 '교정본에 메모
+          추가')만 **빨간 글자색**으로 우리가 고친 자리를 고른다(브리지 `_match_is_red`).
           `skip_occurrences`도 넘기지 않는다 — 거절·제외는 치환 단계가 이미 반영했고,
           문서에 남은 빨간 자리가 곧 '반영된 자리'다.
 
         ★`pages_by_original`(치환 전 문서에서 실제로 찾은 등장)을 함께 넘긴다 —
-          브리지가 등장 상한을 그 수로 잡아 교정본·PDF와 **같은 자리 집합**을 돈다
-          (hwp_bridge_worker.memo의 occ_cap 주석).
+          등장 상한을 그 수로 잡아 교정본·PDF와 **같은 자리 집합**을 돈다
+          (`HwpEditor.insert_memos`의 cap — 예전 브리지 memo의 occ_cap 주석과 같은 근거).
 
         ⚠ hwpx direct 백엔드에는 `insert_memos`가 없다(XML만 만지는 백엔드라 메모
           컨트롤을 만들 수 없다). 조용히 넘어가면 '메모본이라는데 메모가 없는 파일'이
           나오므로 명시적으로 알리고 정오표만 남긴다.
         """
-        # ★치환 **직후**의 문서는 찾기 색인이 낡아 있다(메모 컨트롤이 색인을 낡게 하는
-        #   것과 같은 부류 — hwp_editor._reindex_document 헤더). 결합 모드는 방금 수백
-        #   곳을 바꿨으므로 첫 묶음 전에 한 번 새로 만든다. 실패해도 그대로 잇는다.
-        if reindex_first:
-            try:
-                editor._reindex_document(log)
-            except Exception as exc:
-                log(f"  [메모] 문서 재색인 실패 — 그대로 진행: {exc}")
-
+        # ⚠ 예전엔 결합 모드가 메모 전에 문서를 저장·닫기·다시 열기(재색인)했다. 메모가
+        #   반쯤 죽던 진짜 원인은 '메모 달린 문서에서의 대량 찾기'였고(브리지 메모 머리말
+        #   불변식④), 지금은 자리를 다 찾은 뒤에 메모를 달아 재색인이 필요 없다.
         inserter = getattr(editor, "insert_memos", None)
         if inserter is None:
             log("  [메모] 이 백엔드는 메모를 달 수 없습니다 — 정오표만 생성합니다")
@@ -1136,6 +1146,7 @@ class ApplyWorker(QThread):
         located = pages_by_original or {}
         replaced_by = replaced_by or {}
         pen_paras_by = pen_paras_by or {}
+        spots_by = spots_by or {}
         memo_items = []
         for c in targets:
             orig, corr = c["original"], self._corrected_of(c)
@@ -1145,6 +1156,9 @@ class ApplyWorker(QThread):
                 # 실제로 치환된 자리 수 = 상한. 치환 결과를 모르는 추가 실행에서는
                 #   '표시 대상 등장 수'(등장 − 표시용 skip)로 어림한다.
                 n = replaced_by.get(orig)
+                if n is None and spots_by.get(orig):
+                    # 추가 실행인데 교정본을 만든 실행의 자리 좌표가 있다 — 그 수가 곧 치환 수.
+                    n = len(spots_by[orig])
                 if n is None:
                     # 추가 실행 — 치환 결과가 없으므로 '표시 대상 등장 수'로 어림한다.
                     #   ⚠ 0이면 브리지가 안전 상한(_MEMO_FALLBACK_OCC)까지 훑어 엉뚱한 자리를
@@ -1166,6 +1180,10 @@ class ApplyWorker(QThread):
                     # ★빨강이 아니라 **형광펜**으로 표시한 자리(원고 글자 스타일 보존).
                     #   문단 좌표로만 알아볼 수 있어 그대로 실어 보낸다.
                     "pen_paras": pen_paras_by.get(orig) or [],
+                    # ★치환 단계가 확인한 자리 좌표 — 있으면 찾기 없이 이 자리에 단다.
+                    #   ⚠ 개수가 치환 수와 다르면 쓰지 않는다(빨간 글자 찾기로 되돌아간다).
+                    "spots":     (spots_by.get(orig)
+                                  if len(spots_by.get(orig) or ()) == n else None),
                     # 정오표·집계가 원문 기준으로 맞물리도록 원래 문자열을 함께 싣는다.
                     "anchor_of": orig,
                 })
@@ -1202,8 +1220,8 @@ class ApplyWorker(QThread):
         log(f"  [메모] 메모 {n_memo}곳 · 본문 글자 변경 없음")
         if n_blocked:
             # ⚠ 조용히 사라지면 안 된다. 사유는 두 갈래이고 정오표에 각각 적힌다 —
-            #   머리말·꼬리말 스토리는 한/글이 메모를 아예 거부하고, 이미 메모가 달린
-            #   앵커와 겹치는 자리는 `InsertText`가 죽는다(hwp_editor._reindex_document).
+            #   머리말·꼬리말 스토리는 한/글이 메모를 아예 거부하고, 두 교정이 겹쳐 한
+            #   자리를 다투면 뒤의 것이 자리 확인에서 걸러진다(브리지 `memo_place`).
             #   ⚠ 여기서 '정오표에 사유 기록'이라고 하지 않는다 — 결합 모드는 정오표를 끌
             #     수 있다. 기록 여부는 정오표를 만든 뒤 `표시하지 못한 자리` 줄이 말한다.
             log(f"  [메모] 메모를 달지 못한 자리 {n_blocked}곳")

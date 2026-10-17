@@ -21,6 +21,7 @@ core/hwp_bridge_worker.py — 32비트 HWP COM 브리지 워커
 """
 
 import ctypes
+import html
 import json
 import os
 import re
@@ -1303,9 +1304,17 @@ class HwpBridge:
             #   ⚠ AllReplace 폴백 경로는 등장별 정보가 없어 이 목록이 빈 채로 남는다
             #     (호출부가 '등장별 근거 없음'으로 보고 항목 단위 결과로 폴백한다).
             occ_pages = []
-            # 형광펜으로 표시한 자리의 **문단 좌표** [[list, para], …] — '교정본+메모'
-            #   모드의 메모 단계가 이 자리를 찾아갈 유일한 단서다(아래 표시 분기 주석).
+            # 형광펜으로 표시한 자리의 **문단 좌표** [[list, para], …] — 아래 `spots_raw`가
+            #   없는 경로(결과 화면의 '교정본에 메모 추가')에서 메모 단계가 쓰는 보조 단서다.
             pen_paras = []
+            # ★치환한 자리의 **좌표 기록**(치환 순서대로) — '교정본+메모'의 메모 단계가 찾기
+            #   없이 그 자리로 곧장 가는 근거다(`memo_place` 머리말). 한 치환 = 한 줄:
+            #     [list, para, 시작, 원문 길이, 교정문 길이, 등장 번호]  — 좌표를 확인한 치환
+            #     ["dirty", list, para] / ["dirty_list", list] / ["dirty_all"] — 확인 못 한 치환
+            #   ⚠ 여기 적힌 시작 위치는 **그 순간의** 좌표다. 뒤이은 치환이 같은 문단 앞쪽을
+            #     늘리거나 줄이면 밀리므로, 최종 좌표는 호출 측이 이 기록을 순서대로 되짚어
+            #     계산한다(`HwpEditor._resolve_spots`). 브리지는 상태를 들고 있지 않는다.
+            spots_raw = []
             # corrected가 original을 부분문자열로 포함하면(괄호 추가류) 찾기-치환이 자기
             #   삽입분을 다시 잡아 무한 증식한다 → 1차 RepeatFind는 랩 감지로, 2차
             #   AllReplace는 폴백 금지로 차단한다. try 밖(폴백)에서도 참조하므로 여기서 정의.
@@ -1654,6 +1663,29 @@ class HwpBridge:
                                 except Exception:
                                     pass
 
+                            # 좌표 기록 — 삽입 직후 커서가 정확히 '시작 + 교정문 길이'에
+                            #   있어야 믿는다(매치가 조판 부호를 걸쳤거나 선택을 다시 세운
+                            #   경우를 거른다). 못 믿으면 그 문단의 기록을 무효로 돌린다 —
+                            #   뒤늦게 엉뚱한 자리에 메모가 붙는 것보다 찾기로 되돌아가는 편이
+                            #   낫다(호출 측 폴백).
+                            if (match_end is not None and "\r" not in corrected
+                                    and isinstance(ins_end, tuple) and len(ins_end) >= 3
+                                    and tuple(ins_end[:3]) == (
+                                        match_end[0], match_end[1],
+                                        match_end[2] - len(original) + len(corrected))):
+                                spots_raw.append([match_end[0], match_end[1],
+                                                  match_end[2] - len(original),
+                                                  len(original), len(corrected), count])
+                            elif "\r" in original or "\r" in corrected:
+                                # 문단이 생기거나 없어진다 — 그 스토리의 문단 번호가 전부 밀린다.
+                                spots_raw.append(["dirty_list", p[0]]
+                                                 if isinstance(p, tuple) and p
+                                                 else ["dirty_all"])
+                            elif isinstance(p, tuple) and len(p) >= 2:
+                                spots_raw.append(["dirty", p[0], p[1]])
+                            else:
+                                spots_raw.append(["dirty_all"])
+
                             replaced += 1
                             pass_replaced += 1
                             occ_pages.append({"i": count, "page": _pg, "ok": True,
@@ -1663,6 +1695,8 @@ class HwpBridge:
                                               "pen": bool(marked_with_pen)})
                         except Exception as e:
                             err_msg = f"교정/색상 적용 실패: {e}"
+                            # 치환이 반쯤 됐을 수 있다 — 좌표 기록을 믿지 않게 한다.
+                            spots_raw.append(["dirty_all"])
                             break
 
                         count += 1
@@ -1717,6 +1751,8 @@ class HwpBridge:
                         replaced = ar_result if isinstance(ar_result, int) and ar_result > 0 else 1
                         path_used = "AllReplace (텍스트만, 색상 없음)"
                         err_msg = "1차 실패 → AllReplace 폴백 (색상 미적용)"
+                        # 어디를 바꿨는지 모른다 — 지금까지의 좌표 기록을 전부 믿을 수 없다.
+                        spots_raw.append(["dirty_all"])
                 except Exception as exc:
                     if not err_msg:
                         err_msg = f"AllReplace 폴백 실패: {exc}"
@@ -1734,6 +1770,7 @@ class HwpBridge:
                     "replaced":  replaced,   # 본문에서 실제 치환된 등장 수
                     "occ_pages": occ_pages,  # 등장별 쪽 번호·치환 여부(정오표 행 근거)
                     "pen_paras": pen_paras,  # 형광펜으로 표시한 자리의 문단 좌표
+                    "spots_raw": spots_raw,  # 치환 자리 좌표 기록(HwpEditor._resolve_spots)
                 })
             else:
                 stats["fail"] += 1
@@ -1747,6 +1784,7 @@ class HwpBridge:
                     "path":      path_used,
                     "replaced":  0,
                     "occ_pages": occ_pages,
+                    "spots_raw": spots_raw,
                 })
 
             # 진행률 (stderr)
@@ -1762,7 +1800,7 @@ class HwpBridge:
                 "style_marked": self._style_marked}
 
     # ══════════════════════════════════════════════════════════
-    # ▌메모 달기 (결과물 축 output_mode="memo")
+    # ▌메모 달기 (결과물 축 output_mode="memo" · "hwp_memo")
     # ══════════════════════════════════════════════════════════
     #
     # ★실측으로 확정한 불변식 (2026-08-07, 한/글 2010 8.5.8.1677)
@@ -1775,39 +1813,37 @@ class HwpBridge:
     #   ③ **머리말·꼬리말 스토리에서는 거부된다**(실측: story 9 → False / story 0 → True).
     #      실패가 아니라 구조적 제약이므로 'blocked'로 따로 세어 정오표에 남긴다 —
     #      조용히 사라지면 안 된다.
-    #   ④ **등장이 소모되지 않는다.** 치환과 달리 메모는 원문을 그대로 두므로, apply의
-    #      재탐색 패스를 그대로 베끼면 **같은 자리에 메모가 두 번 붙는다.** 그래서 재탐색
-    #      패스는 이미 방문한 등장 수(visited)만큼을 **소비만** 하고 지나간다.
-    #   ⑤ ★메모 삽입 후 커서는 앵커 **앞**(메모 컨트롤 자리)으로 돌아온다. 그대로 두면
-    #      다음 RepeatFind가 **방금 메모를 단 그 낱말을 다시 잡아** 같은 자리에 메모를
-    #      또 단다(사용자 보고 2026-08-07: 한 자리에 메모 2개).
-    #      ⚠ 여기서 **메모 컨트롤은 위치 8칸을 차지한다**(_MEMO_CTRL_SPAN, 실측).
-    #      1칸으로 어림하면 커서가 앵커를 못 넘어 그대로 재발견된다 — 실측:
-    #      '기술동향'이 문단 9의 15~19에 있었는데 메모 삽입 후 23~27로 밀렸고,
-    #      SetPos(20)은 23으로 스냅돼 같은 낱말을 다시 잡았다.
-    #      ⚠⚠ 이 버그는 **개수만 보면 안 보인다** — occ_total 상한이 총량을 맞춰 주기
-    #      때문이다(검증은 '몇 개'가 아니라 '서로 다른 자리 몇 곳'으로 해야 한다).
-    #   ⑥ ★**메모 본문이 원문을 인용하므로 찾기가 자기 메모를 다시 잡는다.**
-    #      RepeatFind는 서브스토리까지 닿는데(각주·표에서 이미 아는 사실) 메모 본문도
-    #      서브스토리다. 메모에 "‘품질특성’ → ‘품질 특성’"이라고 적는 순간 그 안에
-    #      '품질특성'이 새로 생기므로, 다음 찾기가 그것을 **새 등장으로 오인**해 메모를
-    #      또 달고, 그 메모가 또 매치를 만든다 — apply의 self_matching(괄호 증식)과
-    #      똑같은 구조다. 실측(2026-08-07): 15등장짜리 낱말이 상한 100까지 폭주했고
-    #      본문 스캔이 35,997자 → 52,373자로 불었다. 막는 방법 두 겹:
-    #        (a) 우리가 만든 메모 서브스토리 id를 기억해 그 안의 매치는 **등장으로 세지
-    #            않고 건너뛴다**(등장 인덱스가 검수 패널과 어긋나면 부분 거절이 깨진다).
-    #            ⚠ 이 집합은 **문서 단위**로 누적해야 한다 — `memo` 명령은 항목 5개씩
-    #            여러 번 오므로(HwpEditor._MEMO_BATCH) 호출마다 비우면 앞 묶음이 만든
-    #            메모를 잊는다(memo() 본문 주석의 실측 사고).
-    #        (b) 파이프라인이 센 등장 수(occ_total)를 **상한**으로 쓴다. (a)가 놓치는
-    #            경로가 있어도 원고의 등장 수를 넘길 수는 없다.
-    #   ⑦ ★★**메모 컨트롤은 같은 세션의 '찾기'에 반영되지 않는다.** 이미 메모를 단 자리와
-    #      겹치거나 맞닿은 낱말을 찾으면 찾기는 **옛 본문 기준**으로 매치를 돌려주고, 그
-    #      자리에 메모를 열면 `InsertText`가 `RPC_E_SERVERFAULT`로 죽는다. 죽은 자리는
-    #      그 세션 안에서 회복되지 않는다(재열기·삭제 후 재시도·좌표 이동·대기 전부 실패).
-    #      → 해법은 이 파일이 아니라 호출 측에 있다: **문서를 저장했다 다시 열어 색인을
-    #        새로 만든다**(`HwpEditor._reindex_document`). 실측(실파일 고독사 152항목):
-    #        재색인 없음 116곳 → 25항목마다 재색인 **302곳**(빈 메모 0).
+    #
+    # ★★2단계 설계 — **자리를 전부 찾은 뒤에야 메모를 단다** (2026-10-17 · 실측 재설계)
+    #   memo_scan  → 메모 없이 각 항목의 자리 좌표를 찾기만 한다(문서 무변경)
+    #   memo_keys  → 서브스토리 자리의 '본문 기준 위치'(문서 순 정렬 키)
+    #   memo_place → 좌표로 곧장 가서 **문서 뒤쪽부터** 메모를 단다(찾기 0회)
+    #
+    #   ④ ★★**메모가 박힌 문서에서 '찾기'를 많이 돌리면 세션이 오염된다.** 그 뒤로는 어느
+    #      자리에 메모를 열어도 `InsertText`가 `RPC_E_SERVERFAULT`로 죽고, 문서를 닫았다 열
+    #      때까지 회복되지 않는다. 통제 실험(doc04 교정본, 2026-10-17):
+    #        메모 48곳 + 찾기 300회 → 정상 / 메모 0~5곳 + 찾기 2,000회 → 정상
+    #        메모 48곳 + 찾기 2,000회 → **이후 메모 전부 실패**(색 판독 유무와 무관)
+    #      그래서 예전 설계(항목마다 문서 처음부터 찾으며 그 자리에 바로 단다)는 메모가
+    #      쌓일수록 반드시 무너졌다. 특히 '교정본+메모'는 앵커가 흔한 교정문이라('자녀
+    #      출산'·'정책 효과') 빨갛지 않은 매치까지 수천 번 훑어 훨씬 빨리 무너졌다 —
+    #      doc04 실측 메모 291곳 · 못 함 331곳, 그중 234곳이 이 연쇄였다.
+    #      ⚠ 예전 기록은 이 현상을 '이미 메모를 단 자리와 겹친 낱말에서 찾기 색인이
+    #        낡는다'로 해석했고, 처방은 25항목마다 문서를 저장·닫기·다시 열기
+    #        (`_reindex_document`)였다. 겹침은 첫 실패를 부르는 한 경로였을 뿐, 그 뒤의
+    #        '전부 실패'는 세션 오염이었다 — 재색인은 오염을 주기적으로 씻어 낸 것이다.
+    #        이제 메모를 단 뒤에는 찾기를 하지 않으므로 재색인 자체가 필요 없다.
+    #   ⑤ ★**문서 뒤쪽부터 단다.** 메모 하나는 그 자리 문단의 위치를 밀고(앵커 시작 +8,
+    #      앵커 뒤 +16 — 필드 시작·끝 컨트롤), **그보다 뒤에 있는 모든 서브스토리의 list
+    #      id를 +2** 민다(실측: 본문 8번 문단에 메모 하나 → 뒤쪽 표 셀 26→28, 110→112).
+    #      뒤에서부터 달면 아직 안 단 자리(전부 앞쪽)는 어느 것도 움직이지 않는다.
+    #      ⚠ 그래서 정렬 키에 서브스토리의 **본문 기준 위치**가 필요하다(`memo_keys`).
+    #   ⑥ ★**달기 전에 그 자리를 확인한다** — 좌표로 선택한 뒤 끝 위치와 글자가 앵커와
+    #      같아야 단다. 어긋나면(좌표 계산이 틀렸거나 두 항목이 한 자리를 다툼) 메모를
+    #      달지 않고 '표시 못 함'으로 돌려준다. 엉뚱한 자리에 붙는 것보다 낫다.
+    #   ⑦ ★**메모 본문이 원문을 인용한다** — 메모를 다는 동안 찾기를 하지 않으므로 우리
+    #      메모가 다음 항목의 매치가 될 일은 없다(예전엔 그 매치를 거르느라 메모 스토리
+    #      id를 기억해야 했다 — `_memo_stories`는 이제 정보용이다).
 
     # ⚠ 예전엔 메모 본문 끝에 '· 이 낱말 N곳 중 k번째'를 붙였다. 사용자 지정으로
     #   **제거**했다(2026-08-10) — 반복 횟수는 정오표가 등장 1곳 = 1행으로 말하고,
@@ -1818,64 +1854,10 @@ class HwpBridge:
     _MEMO_FALLBACK_OCC = 100
     _MEMO_MAX_OCC = 5000
     _MEMO_MAX_PASSES = 4
-    # 메모 컨트롤 하나가 문단 위치에서 차지하는 칸 수(실측 2026-08-07, 한/글 2010).
-    #   삽입 전 15~19에 있던 4글자 낱말이 삽입 후 23~27로 밀렸다 → 8칸.
-    #   ⚠ 이 값이 틀리면 커서가 앵커를 못 넘어 **같은 자리에 메모가 겹쳐 달린다**.
-    #   그래서 값에만 의존하지 않고 아래 두 겹으로 방어한다(전진 검증 + 재발견 감지).
-    _MEMO_CTRL_SPAN = 8
     # 메모 본문 서식 (사용자 지정 2026-08-12) — 말풍선 안에서만 쓰인다.
     _MEMO_FONT = "맑은 고딕"
     _MEMO_FONT_SIZE = 800        # HWPUNIT(1pt = 100) → 8pt
     _MEMO_LINE_SPACING = 140     # %
-
-    def _advance_past_anchor(self, match_pos, original):
-        """메모를 단 직후, 커서를 **앵커 낱말 뒤**로 옮긴다. 반환: 재발견 감지용 좌표.
-
-        메모 삽입 후 커서는 앵커 앞(메모 컨트롤 자리)에 있고, 앵커는 컨트롤 크기만큼
-        뒤로 밀려 있다. 여기서 넘겨 두지 않으면 다음 RepeatFind가 **같은 낱말을 다시
-        잡아 메모를 겹쳐 단다**(사용자 보고 2026-08-07).
-
-        SetPos 한 번으로 끝내되(빠름), 실제로 넘어갔는지 GetPos로 **확인**하고 못 넘었으면
-        MoveRight로 한 칸씩 민다 — `_MEMO_CTRL_SPAN`이 버전에 따라 다르더라도 겹치지
-        않게 하기 위함이다.
-
-        반환: ((story, para), 밀려간 앵커 시작 위치) — 재발견 감지에 쓴다. 실패 시 None.
-        """
-        if not (isinstance(match_pos, tuple) and len(match_pos) >= 3):
-            return None
-        try:
-            p2 = self.hwp.GetPos()          # CloseEx 직후 = 메모 컨트롤 자리
-        except Exception:
-            return None
-        if not (isinstance(p2, tuple) and len(p2) >= 3):
-            return None
-
-        anchor_start = p2[2] + self._MEMO_CTRL_SPAN
-        target = anchor_start + len(original)
-        try:
-            self.hwp.SetPos(p2[0], p2[1], target)
-        except Exception:
-            pass
-        try:
-            now = self.hwp.GetPos()
-        except Exception:
-            now = None
-
-        # 검증 — 같은 문단 안에서 목표보다 앞에 있으면 아직 앵커를 못 넘은 것이다.
-        if (isinstance(now, tuple) and len(now) >= 3
-                and now[0] == p2[0] and now[1] == p2[1] and now[2] < target):
-            for _ in range(len(original) + self._MEMO_CTRL_SPAN):
-                try:
-                    self.hwp.HAction.Run("MoveRight")
-                except Exception:
-                    break
-                try:
-                    now = self.hwp.GetPos()
-                except Exception:
-                    break
-                if not (now[0] == p2[0] and now[1] == p2[1]) or now[2] >= target:
-                    break
-        return ((p2[0], p2[1]), anchor_start)
 
     def _apply_memo_style(self):
         """메모 편집 상태에서 **글자·문단 모양을 통일**한다(사용자 지정 2026-08-12).
@@ -1943,8 +1925,16 @@ class HwpBridge:
     #   `DeleteFieldMemo` 뒤 재열기, 매치 뒤쪽 좌표에서 재열기, 0.3초 대기, 항목을 끝낸
     #   뒤 재시도까지 전부 시험했고 회복률은 102곳 중 1곳이었다. 게다가 재열기는 **빈
     #   메모를 하나 더 남긴다**(실측: 302곳 성공 · 빈 메모 92개가 저장본에 실렸다).
-    #   원인은 이 자리가 아니라 문서 색인이며, 해법은 문서를 다시 여는 것이다 —
-    #   `HwpEditor._reindex_document` 참조.
+    #   원인은 이 자리가 아니라 **세션 오염**(메모 달린 문서에서의 대량 찾기)이며, 해법은
+    #   메모를 단 뒤에 찾기를 하지 않는 것이다 — 메모 머리말 불변식④(2단계 설계).
+
+    # 세션 오염의 지문 — `InsertText`가 이 HRESULT(RPC_E_SERVERFAULT)로 죽으면 그 세션의 뒤
+    #   메모는 전부 같은 식으로 죽는다(메모 머리말 불변식④).
+    _SESSION_FAULT = "-2147417851"
+
+    @classmethod
+    def _is_session_fault(cls, msg) -> bool:
+        return cls._SESSION_FAULT in str(msg or "")
 
     def _normalize_edit_state(self):
         """서브스토리·선택·편집 상태를 본문 기준으로 되돌린다(실패 뒤 재시도 준비)."""
@@ -1959,10 +1949,10 @@ class HwpBridge:
             pass
 
     def _insert_memo_here(self, body, anchor_color, original=""):
-        """찾기가 선택해 둔 **현재 자리**에 메모 하나를 단다. 반환 (성공, 사유).
+        """선택해 둔 **현재 자리**(앵커)에 메모 하나를 단다. 반환 (성공, 사유).
 
         성공하면 만들어진 메모 서브스토리 id를 `self._memo_stories`에 기록한다 —
-        그 안에서 잡히는 매치를 등장으로 세지 않기 위해서다(불변식⑥-a).
+        그 안에서 잡히는 매치를 등장으로 세지 않기 위한 방어다(메모 머리말 불변식⑦).
 
         원고 글자는 바뀌지 않는다 — 메모 본문은 필드의 서브스토리에 들어간다
         (OWPML `<hp:fieldBegin type="MEMO"><hp:subList>…`).
@@ -2012,9 +2002,9 @@ class HwpBridge:
                 pass
             return False, "메모 편집 상태로 진입하지 못했습니다 (본문 오염 방지로 건너뜀)"
 
-        # ★불변식⑥-a — 이 메모의 서브스토리 id를 기억해 둔다. 메모 본문이 원문을
-        #   인용하므로, 기억하지 않으면 다음 찾기가 이 메모 안의 글자를 '새 등장'으로
-        #   오인해 메모를 또 달고 무한 증식한다.
+        # 메모 머리말 불변식⑦ — 이 메모의 서브스토리 id를 기억해 둔다. 메모 본문이 원문을
+        #   인용하므로, 메모를 단 뒤 찾기를 하면 이 메모 안의 글자가 '새 등장'으로 잡힌다
+        #   (2단계 설계에선 그런 찾기가 없지만 방어로 남긴다).
         self._memo_stories.add(after[0])
 
         # ⚠ '이 낱말 N곳 중 k번째' 줄은 **넣지 않는다**(사용자 지정 2026-08-10).
@@ -2044,6 +2034,10 @@ class HwpBridge:
             pass
         self._memo_stories.discard(after[0])
         self._normalize_edit_state()
+        # ★세션 오염(메모 머리말 불변식④)이면 같은 세션의 어떤 재시도도 죽는다 — 곧장
+        #   돌려보내 호출 측이 문서를 다시 열게 한다(`memo_place`의 poisoned).
+        if self._is_session_fault(err):
+            return False, err
         # ★같은 자리에 다시 넣으면 **똑같이 실패한다**(실측: 비결정이 아니라 결정적).
         #   원인은 앞 항목이 박아 둔 **메모 컨트롤이 이 낱말의 시작 자리를 먹고 있는 것**
         #   이다 — 중첩 원문에서 특히 잦다('고려해야한다'에 메모를 달면 그 안의
@@ -2192,265 +2186,266 @@ class HwpBridge:
         except Exception:
             return True
 
-    def memo(self, corrections, mark_anchor=False):
-        """수락된 교정을 **한/글 메모**로 기록한다 (원고 무변경 — 글자도 서식도).
+    def memo_scan(self, items):
+        """메모 1단계 — 각 항목의 **자리 좌표만** 찾는다(메모 없음 · 문서 무변경).
 
-        ⚠ `mark_anchor`는 기본 **꺼짐**이다(사용자 지정 2026-08-07: 앵커 글자색을 바꾸지
-          말 것). 메모 모드의 약속은 원고를 손대지 않는 것이고 글자색도 원고의 서식이다.
+        items: [{"original": 앵커, "need": 꼭 필요한 수, "limit": 최대 수,
+                 "red_only", "pen_paras"}, …]
+        반환: {"scan": [{"matches": [[list, para, 시작, 길이, 쪽], …], "error": ""}, …]}
+              matches는 문서 순이다. 어느 매치를 쓸지(등장 번호·부분 거절·상한·자리 다툼)는
+              호출 측이 정한다(`HwpEditor.insert_memos`).
 
-        corrections: [{"original", "corrected", "memo_text", "occ_total",
-                       "skip_occurrences", "color", …}, …]
-        반환: {"stats": {...}, "detail": [...]}  — detail 스키마는 apply와 호환된다
-              (`replaced`/`occ_pages`를 그대로 쓰므로 정오표 조립 코드를 공유한다).
+        ★이 단계에서는 메모를 **하나도 달지 않는다** — 메모가 박힌 문서에서 찾기를 많이
+          돌리면 세션이 오염되기 때문이다(머리말 불변식④). 그래서 찾기는 전부 여기서
+          끝내고, 메모는 `memo_place`가 좌표로 단다.
+        ★'교정본+메모'의 빨간 매치(`red_only`)는 `limit`까지 **전부** 돌려준다. 짧은 앵커가
+          긴 교정문 속에 들어 있으면('취업 유지' ⊂ '취업 유지 후 이탈') 남의 빨간 자리도
+          빨갛게 잡히므로, 어느 자리가 누구 것인지는 모든 항목의 매치를 모은 뒤에야 가릴
+          수 있다(호출 측 자리 다툼 해소).
+        ⚠ 다중 패스는 apply·옛 memo와 같은 안전장치다 — 한/글 찾기가 문서 중간에서 조기
+          False를 돌려주는 일이 있어, 필요한 수에 못 미치면 처음부터 다시 훑되 이미 센
+          매치는 소비만 하고 지나간다.
         """
-        stats = {"memo": 0, "blocked": 0, "fail": 0}
-        detail = []
-        # 우리가 만든 메모 서브스토리 id — 항목이 바뀌어도, **호출이 바뀌어도** 유지한다.
-        #   앞 항목의 메모 본문에서 뒤 항목의 원문이 잡히는 교차 오염을 막는 유일한 근거다.
-        #
-        # ★⚠ 예전엔 여기서 `set()`으로 **초기화**했다. 그런데 `HwpEditor.insert_memos`는
-        #   항목을 5개씩 잘라 `memo` 명령을 여러 번 보내므로(_MEMO_BATCH), 그 초기화는
-        #   **앞 묶음이 만든 메모를 통째로 잊는 것**이었다. 그러면 뒤 묶음의 찾기가 앞
-        #   묶음 메모 본문 속 원문을 '원고의 등장'으로 오인해 **메모 안에 메모를 달려
-        #   든다.** 실측 2026-08-10(실파일 고독사): 실패 146건 중 26건이 앵커 story 0이
-        #   아닌 **서브스토리**였고, 그중 21건이 '메모 story = 앵커 story + 2' — 메모
-        #   안에서 메모를 연 자국이다.
-        #   ⚠ 다만 **이것만 고쳐서는 수치가 변하지 않았다**(고쳐도 116곳 그대로). 메모본이
-        #     반쪽만 나오던 주된 원인은 따로 있다 — 찾기 색인이 낡는 것이고, 해법은
-        #     `HwpEditor._reindex_document`다. 여기 것은 그와 별개인 교차 오염 방어다.
-        #   ⚠ 그래서 이 집합은 **문서 단위**다 — 새 문서를 열 때만 비운다(`open`).
         if getattr(self, "_memo_stories", None) is None:
             self._memo_stories = set()
+        out = []
+        total = len(items)
+        for idx, item in enumerate(items):
+            anchor = _clean((item.get("original") or "").replace("\n", "\r"))
+            need = max(0, int(item.get("need") or 0))
+            limit = min(max(need, int(item.get("limit") or 0)) or self._MEMO_FALLBACK_OCC,
+                        self._MEMO_MAX_OCC)
+            # ★'교정본+메모' — 앵커가 교정문이라 원래부터 그 표기였던 자리까지 찾힌다.
+            #   우리가 고친 자리는 빨갛게 칠해져 있으므로 그것만 받는다(_match_is_red).
+            red_only = bool(item.get("red_only"))
+            # ★형광펜으로 표시한 자리의 문단 좌표(apply가 돌려준 것) — 빨강 대신 형광펜을
+            #   쓴 자리는 `red_only`에 걸러지므로, 여기 적힌 문단에서 잡히면 우리 자리로 본다.
+            pen_paras = [tuple(x[:2]) for x in (item.get("pen_paras") or []) if len(x) >= 2]
+            pen_used = []
+            matches = []
+            err = ""
+            if anchor:
+                try:
+                    for _pass in range(self._MEMO_MAX_PASSES):
+                        for _ in range(3):
+                            try:
+                                if not self.hwp.HAction.Run("CloseEx"):
+                                    break
+                            except Exception:
+                                break
+                        self.hwp.HAction.Run("MoveDocBegin")
+                        try:
+                            self.hwp.SetMessageBoxMode(0x2FFF1)
+                        except Exception:
+                            pass
+                        pset = self.hwp.HParameterSet.HFindReplace
+                        self.hwp.HAction.GetDefault("FindDlg", pset.HSet)
+                        self.hwp.HAction.Execute("FindDlg", pset.HSet)
+                        pset.FindString    = anchor
+                        pset.IgnoreMessage = 1
+                        pset.Direction     = 0
+                        for prop, val in (
+                            ("WholeWordOnly", 0), ("CaseSensitive", 0), ("MatchCase", 0),
+                            ("FindRegExp", 0), ("UseWildCards", 0), ("SeveralWords", 0),
+                            ("AllWordForms", 0), ("HanjaFromHangul", 0), ("FindJaso", 0),
+                            ("IgnoreFindString", 0), ("IgnoreReplaceString", 1),
+                            ("AutoSpell", 0),
+                        ):
+                            try:
+                                setattr(pset, prop, val)
+                            except Exception:
+                                pass
 
+                        before = len(matches)
+                        reskip_left = before
+                        prev_pos = None
+                        finds = 0
+                        while len(matches) < limit:
+                            if not self.hwp.HAction.Execute("RepeatFind", pset.HSet):
+                                break
+                            # ⚠ 생존 신호는 **찾기 횟수**로 낸다. '교정본+메모'의 앵커는 흔한
+                            #   교정문이라 빨갛지 않은 매치를 수천 번 건너뛰는데, 받은 매치로만
+                            #   세면 그동안 출력이 끊겨 부모의 유휴 타임아웃(_send_cmd)이
+                            #   '한/글 행업'으로 오판한다.
+                            finds += 1
+                            if finds % 200 == 0:
+                                _send_progress(int(idx / max(1, total) * 100),
+                                               f"메모 자리 찾는 중… {idx + 1}/{total}")
+                            try:
+                                cur = self.hwp.GetPos()
+                            except Exception:
+                                cur = None
+                            if not (isinstance(cur, tuple) and len(cur) >= 3):
+                                break
+                            if cur == prev_pos:      # 같은 자리를 맴돈다
+                                break
+                            prev_pos = cur
+                            # 이번 세션에서 우리가 단 메모 본문 — 2단계 설계에선 생기지 않지만
+                            #   방어로 남긴다(원고의 등장이 아니다).
+                            if cur[0] in self._memo_stories:
+                                continue
+                            # ★빨강 필터 — 우리가 고치지 않은 자리는 **등장이 아니다**.
+                            if red_only and not self._match_is_red():
+                                if not self._consume_pen_para(pen_paras, pen_used):
+                                    continue
+                            if reskip_left > 0:     # 앞 패스에서 이미 센 매치
+                                reskip_left -= 1
+                                continue
+                            # 찾기 직후 커서 = 매치 **끝** → 시작은 앵커 길이만큼 앞이다.
+                            matches.append([cur[0], cur[1], cur[2] - len(anchor),
+                                            len(anchor), self._page_no()])
+                        if len(matches) >= need or len(matches) == before:
+                            break
+                except Exception as exc:
+                    err = f"메모 자리 찾기 실패: {exc}"
+            out.append({"matches": matches, "error": err})
+            if (idx + 1) % 5 == 0 or idx == total - 1:
+                _send_progress(int(((idx + 1) / max(1, total)) * 100),
+                               f"메모 자리 찾는 중… {idx + 1}/{total}")
         try:
             self.hwp.HAction.Run("MoveDocBegin")
         except Exception:
             pass
+        return {"scan": out}
 
-        # apply와 같은 '긴 원문 우선' 정렬 — 메모는 글자를 바꾸지 않아 오염 위험은 없지만,
-        #   등장 인덱스 좌표계를 apply/locate와 같게 유지해야 정오표가 맞물린다.
-        corrections = sorted(
-            corrections, key=lambda c: len(c.get("original") or ""), reverse=True
-        )
-        total = len(corrections)
+    def memo_keys(self, points):
+        """서브스토리 자리의 **본문 기준 위치** — 메모를 문서 뒤쪽부터 달기 위한 정렬 키.
 
-        for idx, item in enumerate(corrections):
-            original_user  = item["original"]
-            corrected_user = item.get("corrected", "")
-            original = _clean((original_user or "").replace("\n", "\r"))
-            body     = _clean((item.get("memo_text") or "")).replace("\n", "\r")
-            occ_total = int(item.get("occ_total") or 0)
-            skip_occ  = set(item.get("skip_occurrences") or [])
-            color     = item.get("color", 255)
-            # ★'교정본+메모' 모드 — 앵커가 교정문이라 원래부터 그 표기였던 자리까지
-            #   찾힌다. 우리가 고친 자리는 빨갛게 칠해져 있으므로 그것만 받는다
-            #   (_match_is_red 참조). 다른 모드에선 꺼져 있어 동작이 그대로다.
-            red_only  = bool(item.get("red_only"))
-            # ★형광펜으로 표시한 자리의 문단 좌표(apply가 돌려준 것). 그 자리는 원고의
-            #   글자 스타일을 지키려고 **빨강 대신 형광펜**을 썼으므로 `red_only`에
-            #   걸러진다 — 여기 적힌 문단에서 매치되면 '우리가 고친 자리'로 인정한다.
-            #   ⚠ 글자 위치가 아니라 **문단**만 쓴다: 뒤이은 치환이 글자 위치는 밀지만
-            #     문단 번호는 밀지 않는다(치환은 문단을 만들거나 없애지 않는다).
-            #   ⚠ 한 항목씩 **소비**한다 — 같은 문단에 두 곳이면 두 번만 인정한다.
-            pen_paras = [tuple(x[:2]) for x in (item.get("pen_paras") or []) if len(x) >= 2]
-            pen_used = []
-
-            if not original or not body:
-                continue
-
-            inserted = blocked = 0
-            err_msg = ""
-            occ_pages = []
-            visited = 0          # 이 원문에서 지금까지 '지나친' 등장 수(문서 순)
-            # ★불변식⑥-b — 원고의 등장 수를 넘길 수는 없다. occ_total을 모르면
-            #   (전자동 모드 등) 안전 상한으로 떨어진다.
-            #
-            # ★상한의 기준은 **doc_occ(치환 전 문서에서 locate가 실제로 센 등장 수)**가
-            #   먼저다. occ_total은 검수 패널이 **추출 텍스트**에서 센 수라 문서 찾기
-            #   결과와 어긋날 수 있고, 그 차이가 곧 산출물 간 불일치가 된다.
-            #   실측(2026-08-08 · 05.hwp): '지속가능항공유'가 추출 텍스트 5곳인데
-            #   문서 찾기로는 4곳 — 상한이 5라서 메모만 **한 곳을 더** 달았고,
-            #   교정본 3곳 · PDF 3곳 · 메모 4곳으로 세 산출물이 갈렸다
-            #   (사용자 보고: "반영된 항목이 다 다르다 — 신뢰성에 치명적").
-            #   doc_occ는 아무것도 바꾸지 않은 문서를 같은 RepeatFind로 센 값이라
-            #   메모가 만든 매치에 부풀 수도 없다 — occ_total보다 엄격히 낫다.
-            doc_occ = int(item.get("doc_occ") or 0)
-            occ_cap = doc_occ or occ_total or self._MEMO_FALLBACK_OCC
-            occ_cap = min(occ_cap, self._MEMO_MAX_OCC)
-
+        points: [[list, para, pos], …] → {"keys": [[본문 para, 본문 pos] | None, …]}
+        본문(list 0)은 자기 좌표 그대로다. 표 셀·글상자 같은 서브스토리는 `CloseEx`로
+        본문까지 빠져나와 그 컨트롤이 놓인 자리를 읽는다(중첩이면 여러 번).
+        ⚠ list id는 문서 순으로 매겨지고 메모 하나가 뒤쪽 id를 +2씩 민다(머리말 불변식⑤) —
+          그래서 '본문 어디에 붙은 서브스토리인가'를 알아야 뒤에서부터 달 수 있다.
+        ⚠ 본문까지 못 빠져나오면(머리말 등) None — 호출 측이 맨 앞(가장 먼저 처리)에 둔다.
+          그런 스토리는 대개 메모를 거부해 다른 자리를 밀지 않는다.
+        """
+        keys = []
+        for pt in points or []:
             try:
-                for _pass in range(self._MEMO_MAX_PASSES):
-                    # 앞 항목/앞 메모가 남긴 서브스토리 편집 상태 정규화(apply와 동일)
-                    for _ in range(3):
-                        try:
-                            if not self.hwp.HAction.Run("CloseEx"):
-                                break
-                        except Exception:
-                            break
-                    self.hwp.HAction.Run("MoveDocBegin")
+                L, P, s = int(pt[0]), int(pt[1]), int(pt[2])
+            except Exception:
+                keys.append(None)
+                continue
+            if L == 0:
+                keys.append([P, s])
+                continue
+            key = None
+            try:
+                self.hwp.SetPos(L, P, s)
+                for _ in range(8):
                     try:
-                        self.hwp.SetMessageBoxMode(0x2FFF1)
+                        self.hwp.HAction.Run("CloseEx")
                     except Exception:
-                        pass
-
-                    pset = self.hwp.HParameterSet.HFindReplace
-                    self.hwp.HAction.GetDefault("FindDlg", pset.HSet)
-                    self.hwp.HAction.Execute("FindDlg", pset.HSet)
-                    pset.FindString    = original
-                    pset.IgnoreMessage = 1
-                    pset.Direction     = 0
-                    for prop, val in (
-                        ("WholeWordOnly", 0), ("CaseSensitive", 0), ("MatchCase", 0),
-                        ("FindRegExp", 0), ("UseWildCards", 0), ("SeveralWords", 0),
-                        ("AllWordForms", 0), ("HanjaFromHangul", 0), ("FindJaso", 0),
-                        ("IgnoreFindString", 0), ("IgnoreReplaceString", 1),
-                        ("AutoSpell", 0),
-                    ):
-                        try:
-                            setattr(pset, prop, val)
-                        except Exception:
-                            pass
-
-                    # ★불변식④ — 이미 방문한 등장은 원문 그대로 남아 다시 잡힌다.
-                    #   문서 순서상 미방문 등장보다 항상 앞이므로 앞에서부터 소비만 한다.
-                    reskip_left = visited
-                    pass_done = 0
-                    prev_pos = None
-                    # 방금 메모를 단 앵커가 밀려 가 있는 자리 — 다음 매치가 여기면
-                    #   같은 등장을 다시 잡은 것이다(불변식⑤의 안전망).
-                    reanchor = None
-
-                    while visited < occ_cap:
-                        if not self.hwp.HAction.Execute("RepeatFind", pset.HSet):
-                            break
-                        try:
-                            cur = self.hwp.GetPos()
-                        except Exception:
-                            cur = None
-                        # ★불변식⑤ — 커서가 제자리면 같은 등장을 도는 것이다.
-                        if cur is not None and cur == prev_pos:
-                            break
-                        prev_pos = cur
-
-                        # ★불변식⑥-a — 우리가 만든 메모 본문 안에서 잡힌 매치는
-                        #   원고의 등장이 아니다. **visited를 늘리지 않고** 지나간다 —
-                        #   여기서 세면 등장 인덱스가 검수 패널과 어긋나 부분 거절이 깨진다.
-                        if (isinstance(cur, tuple) and cur
-                                and cur[0] in self._memo_stories):
-                            continue
-
-                        # ★불변식⑤ 안전망 — 방금 메모를 단 앵커를 다시 잡은 것이면
-                        #   등장이 아니다. 앵커는 메모 컨트롤만큼 뒤로 밀려 있으므로
-                        #   시작 위치가 정확히 예측된다(다음 '진짜' 등장은 그보다 최소
-                        #   낱말 길이만큼 뒤라, 인접 등장을 잘못 삼킬 일이 없다).
-                        #   ⚠ _MEMO_CTRL_SPAN 값이 틀려도 이 검사가 겹침을 막아 준다.
-                        if (reanchor is not None and isinstance(cur, tuple)
-                                and len(cur) >= 3
-                                and (cur[0], cur[1]) == reanchor[0]
-                                and cur[2] - len(original) <= reanchor[1]):
-                            self._advance_past_anchor(cur, original)
-                            continue
-
-                        # ★빨강 필터 — 우리가 고치지 않은 자리는 **등장이 아니다**.
-                        #   ⚠ `visited`를 늘리지 않는다(불변식⑥-a의 메모 본문 매치와
-                        #     같은 취급) — 여기서 세면 등장 인덱스가 밀려 상한이 먼저
-                        #     닿고 정작 고친 자리에 메모가 안 달린다.
-                        if red_only and not self._match_is_red():
-                            if not self._consume_pen_para(pen_paras, pen_used):
-                                continue
-
-                        if reskip_left > 0:
-                            reskip_left -= 1
-                            continue
-
-                        k  = visited
-                        pg = self._page_no()
-
-                        if k in skip_occ:      # 부분 거절 — 메모도 달지 않는다
-                            occ_pages.append({"i": k, "page": pg, "ok": False})
-                            visited += 1
-                            continue
-
-                        # ⚠ 진행률을 **등장마다** 보낸다. 항목 단위로만 보내면 등장이
-                        #   수십 곳인 낱말 하나에서 수십 초 동안 출력이 끊기고, 부모의
-                        #   유휴 타임아웃(_send_cmd)이 그걸 '한/글 행업'으로 오판해
-                        #   프로세스를 죽인다(실측: 96등장 낱말에서 120초 타임아웃).
-                        if visited % 5 == 0:
-                            _send_progress(
-                                int(((idx + visited / max(1, occ_total or 1))
-                                     / max(1, total)) * 100),
-                                f"메모 다는 중… {idx + 1}/{total} ({visited}곳)")
-
-                        ok, why = self._insert_memo_here(
-                            body, color if mark_anchor else None,
-                            original=original)
-                        if ok:
-                            inserted += 1
-                            pass_done += 1
-                            occ_pages.append({"i": k, "page": pg, "ok": True})
-                        else:
-                            blocked += 1
-                            occ_pages.append({"i": k, "page": pg, "ok": False,
-                                              "blocked": True, "note": why})
-                            if not err_msg:
-                                err_msg = why
-                        visited += 1
-
-                        # ★불변식⑤ — 앵커 **뒤**로 커서를 옮긴다.
-                        if ok:
-                            reanchor = self._advance_past_anchor(cur, original)
-                        elif isinstance(cur, tuple) and len(cur) >= 3:
-                            # 삽입이 없었으면 밀림도 없다 — 커서는 매치 끝 그대로 둔다.
-                            reanchor = None
-
-                    # 새로 단 메모가 없으면 더 볼 게 없다(정상 종료 또는 전부 차단).
-                    if pass_done == 0:
                         break
-            except Exception as exc:
-                err_msg = err_msg or f"메모 달기 실패: {exc}"
+                    q = self.hwp.GetPos()
+                    if isinstance(q, tuple) and len(q) >= 3 and q[0] == 0:
+                        key = [q[1], q[2]]
+                        break
+            except Exception:
+                key = None
+            keys.append(key)
+        try:
+            self.hwp.HAction.Run("MoveDocBegin")
+        except Exception:
+            pass
+        return {"keys": keys}
 
-            # ⚠ 상한에 걸려 멈춘 것은 '정상 종료'가 아니다 — 커서 전진이 실패해 같은
-            #   자리를 맴돌았을 때 총량만 맞춰 주는 것이 이 상한이라, 걸렸다는 사실
-            #   자체가 신호다. 조용히 넘어가면 겹쳐 달린 메모를 아무도 모른다.
-            if visited >= occ_cap and occ_total and inserted < occ_total:
-                _send_log(f"[메모] '{original}' 등장 상한 {occ_cap}에 도달 "
-                          f"— 자리 확인 필요")
+    def _selected_text(self):
+        """지금 선택 블록의 글자(못 읽으면 None) — 메모를 달기 전 자리 확인용.
 
-            if inserted > 0:
-                stats["memo"] += 1
-            elif blocked > 0:
-                stats["blocked"] += 1
-            else:
-                stats["fail"] += 1
+        ⚠ `GetTextFile("TEXT")`는 일부 기호를 **HTML 숫자 참조로** 돌려준다(실측 2026-10-17:
+          '≈' → '&#8776;', 목차 점선 '･' → '&#65381;'). 풀지 않으면 맞는 자리가 '글자가
+          다르다'로 걸러진다.
+        """
+        try:
+            t = self.hwp.GetTextFile("TEXT", "saveblock:true")
+        except Exception:
+            return None
+        if not isinstance(t, str):
+            return None
+        return _clean(html.unescape(t).replace("\r\n", "\r").replace("\n", "\r"))
 
-            detail.append({
-                # ★'교정본+메모'는 앵커가 교정문이라 `original`이 교정문이 된다. 정오표는
-                #   **원문 기준**으로 맞물리므로 원래 문자열을 함께 돌려준다(anchor_of).
-                "original":  item.get("anchor_of") or original_user,
-                "corrected": corrected_user,
-                "reason":    item.get("reason", ""),
-                "source":    item.get("source", "dict"),
-                "color":     color,
-                # apply와 키를 맞춘다 — 정오표 조립(_build_errata_rows)이 공유 코드다.
-                "applied":   inserted > 0,
-                "replaced":  inserted,
-                "occ_pages": occ_pages,
-                "memoed":    inserted,
-                "blocked":   blocked,
-                "error":     err_msg or ("" if inserted else
-                                         "메모를 달 수 있는 등장을 찾지 못했습니다"),
-                "path":      "InsertFieldMemo",
-            })
+    def memo_place(self, spots, mark_anchor=False):
+        """메모 2단계 — 좌표로 곧장 가서 메모를 단다(**찾기 0회**).
 
+        spots: [{"pos": [list, para, 시작, 길이], "anchor", "memo_text", "color"}, …]
+               ⚠ 호출 측이 **문서 뒤쪽부터** 정렬해 보낸다(머리말 불변식⑤).
+        반환: {"placed": [{"ok", "page", "blocked", "note"}, …], "poisoned": bool}
+              placed는 spots와 같은 순서이고, 세션 오염을 만나면 그 자리까지만 담겨 짧아진다.
+
+        ★자리 확인(불변식⑥) — 좌표로 앵커 길이만큼 선택한 뒤 ① 끝 위치가 계산대로이고
+          ② 선택 글자가 앵커와 같을 때만 단다. 어긋나면 달지 않는다.
+        ⚠ `mark_anchor`(앵커 글자색)는 기본 **꺼짐**이다(사용자 지정 2026-08-07: 앵커
+          글자색을 바꾸지 말 것). 메모 모드의 약속은 원고를 손대지 않는 것이다.
+        """
+        if getattr(self, "_memo_stories", None) is None:
+            self._memo_stories = set()
+        placed = []
+        poisoned = False
+        total = len(spots)
+        for idx, sp in enumerate(spots):
+            try:
+                L, P, s, n = (int(v) for v in sp["pos"][:4])
+            except Exception:
+                placed.append({"ok": False, "page": None, "blocked": True,
+                               "note": "메모 자리 좌표가 없습니다 (수동 확인 필요)"})
+                continue
+            anchor = _clean((sp.get("anchor") or "").replace("\n", "\r"))
+            body = _clean(sp.get("memo_text") or "").replace("\n", "\r")
+            self._normalize_edit_state()
+            now = None
+            try:
+                self.hwp.SetPos(L, P, s)
+                for _ in range(n):
+                    self.hwp.HAction.Run("MoveSelRight")
+                now = self.hwp.GetPos()
+            except Exception:
+                now = None
+            got = self._selected_text() if now is not None else None
+            # ⚠ 자동 글머리표 문단에서는 선택을 내보내면 **글머리표가 앞에 딸려 나온다** —
+            #   문단 어디를 골라도 그렇다(실측 hwpx: '◯ 주요내용'·'∙ 스마일'. 글머리표는
+            #   글자가 아니라 문단 속성이라 좌표에는 없다). 끝 위치가 시작 + 앵커 길이로
+            #   정확하면 고른 글자는 정확히 앵커 길이이므로, 내보낸 글이 앵커로 **끝나면**
+            #   고른 글자가 곧 앵커다(앞은 글머리표일 수밖에 없다).
+            text_ok = got is None or got == anchor or got.endswith(anchor)
+            if (not isinstance(now, tuple) or tuple(now[:3]) != (L, P, s + n)
+                    or not text_ok):
+                try:
+                    self.hwp.HAction.Run("Cancel")
+                except Exception:
+                    pass
+                if isinstance(now, tuple) and tuple(now[:3]) == (L, P, s) and L != 0:
+                    # 커서가 한 칸도 못 움직인다 — 찾기·치환은 닿지만 편집 커서는 못 드는
+                    #   스토리다(실측: 장 제목을 되풀이하는 머리말류). 메모도 달 수 없다.
+                    note = (f"이 자리에는 메모를 달 수 없습니다 (머리말·꼬리말 등 story {L})")
+                else:
+                    note = ("메모를 달 자리의 글자가 예상과 달라 달지 않았습니다 "
+                            "(겹치는 교정 등 — 수동 확인 필요)")
+                placed.append({"ok": False, "page": None, "blocked": True, "note": note})
+                continue
+            pg = self._page_no()
+            ok, why = self._insert_memo_here(
+                body, sp.get("color", 255) if mark_anchor else None, original=anchor)
+            try:
+                self.hwp.HAction.Run("Cancel")
+            except Exception:
+                pass
+            placed.append({"ok": bool(ok), "page": pg, "blocked": not ok, "note": why})
+            if not ok and self._is_session_fault(why):
+                # ★세션이 오염됐다 — 여기서 멈춘다. 이대로 이어 가면 남은 자리가 **전부**
+                #   같은 식으로 죽는다. 호출 측이 문서를 다시 열고 나머지를 보낸다
+                #   (`HwpEditor.insert_memos`). 뒤쪽부터 달고 있으므로 남은 자리 좌표는
+                #   그대로 유효하다.
+                poisoned = True
+                break
             if (idx + 1) % 5 == 0 or idx == total - 1:
                 _send_progress(int(((idx + 1) / max(1, total)) * 100),
                                f"메모 다는 중… {idx + 1}/{total}")
-
         try:
             self.hwp.HAction.Run("MoveDocBegin")
         except Exception:
             pass
-        return {"stats": stats, "detail": detail}
+        return {"placed": placed, "poisoned": poisoned}
 
     # ══════════════════════════════════════════════════════════
     # ▌PDF 내보내기 (결과물 축 output_mode="pdf")
@@ -2662,9 +2657,13 @@ def main():
             elif cmd == "apply":
                 result = bridge.apply(req["corrections"],
                                       char_styles=req.get("char_styles"))
-            elif cmd == "memo":
-                result = bridge.memo(req["corrections"],
-                                     mark_anchor=req.get("mark_anchor", True))
+            elif cmd == "memo_scan":
+                result = bridge.memo_scan(req["items"])
+            elif cmd == "memo_keys":
+                result = bridge.memo_keys(req["points"])
+            elif cmd == "memo_place":
+                result = bridge.memo_place(req["spots"],
+                                           mark_anchor=req.get("mark_anchor", False))
             elif cmd == "export_pdf":
                 result = bridge.export_pdf(req["output_path"])
             elif cmd == "verify":
