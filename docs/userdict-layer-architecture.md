@@ -8,6 +8,17 @@
 > 이 문서는 [proofreading-architecture.md](proofreading-architecture.md)의 **하위 설계도**이며,
 > [eomun-rule-layer-architecture.md](eomun-rule-layer-architecture.md)와 같은 자리(결정론 사전 레이어)에
 > 합류한다. 작성: 2026-06-22.
+>
+> ⚠ **현행 상태(2026-10-18 정리)** — DO-1~6 전 단계가 구현돼 **런타임에 가동 중**이다(아래 구현 로그의
+> '휴면'은 각 DO 시점의 상태다). 그 뒤 바뀐 것:
+> - 로그인은 '선택'이 아니라 **앱 실행 게이트**다(2026-08-05 — 메모리 login-gate-offline-grace).
+> - 신원·권한은 `employees` 직접 조회가 아니라 서버 함수 **`ksai_my_profile()`**이 판정한다(2026-10-16 계정 분리 —
+>   [config-and-accounts.md](config-and-accounts.md) '실행 게이트' 절). 큐레이터 여부도 그 세션 프로필(role)로 본다.
+> - 이벤트 **기여자**는 관리자 + `ksai_brain_contributors` 목록뿐이다 — 나머지 계정은 이벤트를 **기록부터 하지 않는다**
+>   (`auth.can_contribute()`). 스냅샷 수신은 전원.
+> - `userdict.db`는 스냅샷 버전이 가장 높은 후보(동기화 빌드본 `datapaths.userdict_runtime_path()` ↔ 데이터 패키지)를
+>   쓰고, `userdict.reload()`가 재시작 없이 갈아탄다.
+> - 로그에 나오는 `_start_curator_check`·`_curator_worker`·`_jwt_sub`·`lookup_pair`·`count_pending`은 이후 정리돼 없다.
 
 ---
 

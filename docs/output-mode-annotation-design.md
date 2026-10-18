@@ -2,7 +2,20 @@
 
 작성 2026-08-07 · 형제 문서: [proofreading-architecture.md](proofreading-architecture.md)
 
-> 현행 결과물 축은 두 값이다: **교정본 + 정오표** / **정오표만**(`options["errata_only"]`).
+> ⚠ **현행과 다른 절(2026-10-18 정리)** — 이 문서는 설계 당시 기록이다. 지금의 동작은 [output-and-apply.md](output-and-apply.md)
+> '결과물 축'·'메모 모드' 절이 정본이고, 아래 절들은 그 뒤에 바뀌었다:
+> - §3.1 결과물 값은 넷이 아니라 **다섯**이다(`hwp`·`hwp_memo`(빨간색+메모)·`errata`·`memo`·`pdf`). `errata_only`는
+>   'HWP 글자를 안 바꿨다'는 파생 bool일 뿐 — 분기는 `output_mode`로, 글자를 바꾸는 모드 집합은 `ApplyWorker.MODIFY_MODES`.
+> - §3.2의 `memoed_occ`·`annotated_occ`는 만들지 않았다 — 실제 결과 키는 `memoed`·`memo_blocked`·`annotated`·`pdf_missing`·`unmarked`.
+> - §3.5 브리지 `memo` 명령과 §3.6 (가)(다)(라)(찾으며 바로 다는 루프의 함정·`_MEMO_CTRL_SPAN`)는 **2026-10-17 2단계 설계로 대체**됐다
+>   — `memo_scan`(찾기만) → `memo_keys` → `memo_place`(좌표로 문서 뒤쪽부터, 찾기 0회). 메모가 박힌 문서에서 찾기를
+>   많이 하면 세션이 오염된다는 것이 진짜 원인이었다(메모리 memo-session-poison-two-phase).
+> - §3.8 원인③(메모는 짧은 원문부터)은 같은 2단계 설계로 무의미해졌고, 원인④(`skip_occurrences` 재번호)는
+>   2026-10-17부터 **브리지 찾기 순서를 재현하는 계획**(`ApplyWorker._plan_by_replay`)이 주 경로다(재번호는 폴백).
+> - §1.2의 함정(머리말 거부·`hwp.Run` no-op·story 검증·메모 본문이 스캔에 섞임)과 §2(PDF)·§3.7(결과물 추가)·
+>   §3.8 원인①②는 지금도 그대로다.
+
+> (작성 당시) 결과물 축은 두 값이었다: **교정본 + 정오표** / **정오표만**(`options["errata_only"]`).
 > 여기에 두 값을 더 붙일 수 있는지 실측으로 검토한다.
 > ③ 한/글 본문은 그대로 두고 **메모**로 "원문→교정문 + 사유" 달기
 > ④ **PDF로 변환한 뒤 PDF 주석**으로 같은 내용 달기

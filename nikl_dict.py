@@ -511,19 +511,6 @@ def _get_userdict():
         return None
 
 
-def is_valid_word(word: str, morph_mod=None) -> bool:
-    """word가 '등재 표제어' 또는 '등재어의 활용/복합형'이면 True.
-
-    1차: 직접 사전 조회(표면형/어간/접두). 2차: 형태소 기본형 복원 후 재조회.
-    """
-    if lookup_word(word)["exists"]:
-        return True
-    m = morph_mod if morph_mod is not None else _get_morph()
-    if m is not None and m.is_known_form(word, _exists_for_morph):
-        return True
-    return False
-
-
 def is_likely_typo(word: str) -> bool:
     """미등재 표면형 word가 '오타로 보이는가' — 사전 안전망 노이즈 필터.
 
@@ -750,22 +737,6 @@ class KoreanDictValidator:
                     # 외래어/전문어/표준어/신어/빈 register는 정상 처리 (의심 X)
 
         return suspicious
-
-    def extract_flags(self, text: str, stop_event=None) -> list:
-        """사전 전용 '검수 모드'용 — 미등재/비표준 어휘를 구조화해 반환.
-
-        [{"word": 어휘, "reason": 사유}] 형태. extract_suspicious_words가 만든
-        문자열("어휘 (사유)")을 분해해 (word, reason)로 돌려준다. 파싱 규칙을
-        포맷 정의부(여기) 옆에 두어 호출부가 문자열 형식에 의존하지 않게 한다.
-        """
-        flags = []
-        for s in self.extract_suspicious_words(text, stop_event=stop_event):
-            if " (" in s:
-                word, reason = s.split(" (", 1)
-                flags.append({"word": word.strip(), "reason": reason.rstrip(")").strip()})
-            else:
-                flags.append({"word": s.strip(), "reason": "표제어 확인 필요"})
-        return flags
 
     def validate(self, corrections: list, stop_event=None) -> list:
         """AI 교정 제안을 사전 기준으로 재검증.

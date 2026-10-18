@@ -1,7 +1,15 @@
 """
-setup_dict.py — 표준국어대사전 SQLite DB 구축
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-실행: python setup_dict.py
+setup_dict.py — 사전 DB(data/stdict.db) **처음부터** 구축 (부트스트랩 전용)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+실행: python setup_dict.py            (DB가 없을 때 — 미러에서 표준국어대사전+우리말샘)
+      python setup_dict.py --zip X    (수동 내려받은 표준국어대사전 ZIP으로)
+
+⚠ **기존 DB의 갱신용이 아니다.** 이 스크립트는 DB를 지우고 words/meta만 다시 만든다 —
+  norm_map(규범표기 페어)·meta 출처 기록이 사라지고, 우리말샘 반쪽도 공식 export가
+  아니라 낡은 미러 스냅샷으로 돌아간다. 평소 갱신은 반쪽별 전용 스크립트로 한다:
+  표준국어대사전 = update_stdict.py(CI 산출물 병합) · 우리말샘 = update_opendict.py
+  (공식 export 반영 + norm_map 재생성). 그래서 DB가 이미 있으면 --force 없이는 거부한다.
+  build_stdict_part.py(CI)는 이 모듈의 REPO_NIKL·stream_github만 가져다 쓴다.
 
 NIKL XML 구조:
   <item>
@@ -40,9 +48,6 @@ except ImportError:
 #     구형 stdict의 공백 391건을 전부 덮고 있었기 때문. 그래도 같은 저장소에서 최신을
 #     받는 편이 옳으므로 교체한다(추가 비용 없음).
 REPO_NIKL     = "spellcheck-ko/korean-dict-nikl"    # stdict/ + opendict/ + krdict/ 통합
-REPO_KRDICT   = "spellcheck-ko/korean-dict-nikl-krdict"   # (구) 단독 — 2019 정지
-REPO_OPENDICT = REPO_NIKL                                  # 하위 호환 별칭
-REPO_STDICT   = REPO_NIKL                                  # 하위 호환 별칭
 RAW_BASE      = "https://raw.githubusercontent.com"
 API_TREE    = "https://api.github.com/repos/{repo}/git/trees/master?recursive=1"
 HEADERS     = {"User-Agent": "KS-Proof Reader/1.0"}
@@ -136,7 +141,7 @@ def list_files(repo: str, folder: str = "") -> list:
 
     # 폴백: 알려진 범위로 직접 탐색 (GitHub API 실패 시에만)
     #   ⚠ 통합 저장소는 폴더별로 파일명 자릿수가 다르다(실측):
-    #     opendict/0050000.xml (7자리) · stdict/005000.xml (6자리) · krdict/001.xml (3자리)
+    #     opendict/0050000.xml (7자리) · stdict/005000.xml (6자리)
     found = []
     if folder == "opendict/":
         steps = range(50000, 1200000 + 50000, 50000)
@@ -144,12 +149,9 @@ def list_files(repo: str, folder: str = "") -> list:
     elif folder == "stdict/":
         steps = range(5000, 500000 + 5000, 5000)
         fmt = lambda n: f"{folder}{n:06d}.xml"
-    elif folder == "krdict/":
-        steps = range(1, 12)
-        fmt = lambda n: f"{folder}{n:03d}.xml"
     else:
-        steps = range(5000, 70000 + 5000, 5000)
-        fmt = lambda n: f"{n}.xml"
+        print(f"  [폴백 불가] 알 수 없는 폴더 '{folder}'")
+        return []
 
     for n in steps:
         fname = fmt(n)
@@ -267,10 +269,11 @@ def build_db(entries, db_path: Path, hint: int = 0) -> int:
 # ══ 진입점 ═══════════════════════════════════════════
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--krdict", action="store_true", help="한국어기초사전 (~6.5만)")
-    ap.add_argument("--zip",    help="수동 다운로드 ZIP 경로")
+    ap = argparse.ArgumentParser(description="사전 DB를 처음부터 구축(부트스트랩 전용)")
+    ap.add_argument("--zip",    help="수동 다운로드 ZIP 경로(표준국어대사전)")
     ap.add_argument("--check",  action="store_true", help="DB 상태 확인만")
+    ap.add_argument("--force",  action="store_true",
+                    help="기존 stdict.db를 지우고 다시 구축(norm_map·meta 출처·공식 export 반쪽 소실)")
     args = ap.parse_args()
 
     if args.check:
@@ -285,10 +288,16 @@ def main():
             print("DB 없음")
         return
 
+    # ⚠ 기존 DB 보호 — 이 스크립트는 갱신용이 아니다(모듈 독스트링).
+    if DB_PATH.exists() and not args.force:
+        print(f"  ✗ {DB_PATH} 가 이미 있습니다 — 처음부터 다시 만들면 norm_map(규범표기)·")
+        print("    meta 출처 기록·우리말샘 공식 export 반쪽이 사라집니다.")
+        print("    갱신은 update_stdict.py(표준국어대사전) / update_opendict.py(우리말샘)로 하세요.")
+        print("    정말 새로 만들려면 --force (그 뒤 update_opendict.py로 norm_map을 되살릴 것).")
+        sys.exit(1)
+
     print("=" * 50)
-    repo  = REPO_KRDICT if args.krdict else REPO_STDICT
-    label = "한국어기초사전" if args.krdict else "표준국어대사전"
-    print(f"  {label} SQLite DB 구축")
+    print("  표준국어대사전" + ("" if args.zip else " + 우리말샘") + " SQLite DB 구축")
     print("=" * 50)
 
     failures: list = []   # 다운로드/파싱 실패 파일 — 빌드 종료 후 명시 보고
@@ -298,9 +307,6 @@ def main():
             print(f"파일 없음: {zp}"); return
         print(f"  ZIP: {zp.name}")
         entries, hint = parse_zip(zp, source="stdict"), 0
-    elif args.krdict:
-        print("  (한국어기초사전, ~6.5만 어휘, 약 5분 소요)")
-        entries, hint = stream_github(REPO_KRDICT, source="krdict", failures=failures), 65_000
     else:
         import itertools
         print("  (표준국어대사전 + 우리말샘 전체 통합 구축, ~160만 어휘, 시간 다소 소요됨)")
@@ -312,7 +318,7 @@ def main():
         entries = itertools.chain(gen_stdict, gen_opendict)
         hint = 1_600_000
 
-    # 기존 DB 삭제 후 재구축
+    # 기존 DB 삭제 후 재구축(--force로 확인받은 경우만 여기까지 온다)
     if DB_PATH.exists():
         DB_PATH.unlink()
 
@@ -334,11 +340,13 @@ def main():
     if count == 0:
         print()
         print("  ⚠ 데이터 0개. 조치:")
-        print("    1) python setup_dict.py --krdict   (소규모 테스트)")
-        print("    2) stdict.korean.go.kr 에서 직접 다운로드 후:")
-        print("       python setup_dict.py --zip 파일명.zip")
+        print("    stdict.korean.go.kr 에서 직접 다운로드 후:")
+        print("       python setup_dict.py --zip 파일명.zip --force")
     else:
         print(f"  소요: {elapsed:.1f}분 | 저장: {DB_PATH}")
+        # 이 DB에는 아직 norm_map이 없다 — 없으면 규범표기 교정(컨텐츠→콘텐츠)이 오류 없이 전부 꺼진다.
+        print("  다음 단계: update_opendict.py(우리말샘 공식 export + norm_map 재생성)")
+        print("             → eval/ai_goldset/run_goldset.py 로 확인")
 
 if __name__ == "__main__":
     main()

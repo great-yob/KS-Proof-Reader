@@ -8,19 +8,22 @@ core/event_queue.py — 교정 결정 학습 이벤트 로컬 큐 (data/event_qu
 역할(DO-3):
   · build_events()      — 교정 목록(상태 포함) → 용어 단위 이벤트 dict 목록(순수 함수, DB 무관).
   · record()/record_corrections() — 이벤트를 data/event_queue.db에 적재(synced=0).
-  · pending()/mark_synced()/count_pending()/status() — DO-4(서버 push) 준비용 큐 조회.
+  · pending()/mark_synced()/status() — userdict_sync.push가 쓰는 큐 조회·전송 표시.
 
 프라이버시(설계 §2 확정):
   · **문맥 스니펫(context_before/after)·원문 문장은 저장하지 않는다.** 용어 단위만.
   · doc_type 등 비식별 거친 특징만 동반(현재 UI 미수집 → None 허용).
-  · org_id/user_id는 DO-4(Supabase Auth)에서 채운다. DO-3에선 빈 값(로컬 누적).
+  · org_id/user_id는 로컬에선 빈 값이다 — 전송 시 서버 기본값(auth.uid() 등)이 채운다
+    (userdict_sync.push 주석).
 
 규율:
   · GUI-agnostic — PySide6 import 금지(core/ 규칙).
   · graceful — kiwi/DB 부재·오류 시 정규화 생략·0 반환. **절대 예외를 올리지 않는다**
     (이벤트 기록은 교정 적용의 부수효과 — 실패해도 본 기능에 영향 0).
-  · 스레드 로컬 커넥션. event_queue.db는 **런타임 생성**(빌드 산출물 아님) — 쓰기 가능
-    위치(개발=레포 data/, 프로즌=exe 옆 data/)에 만든다. 멱등 스키마(IF NOT EXISTS).
+  · 스레드 로컬 커넥션. event_queue.db는 **런타임 생성**(빌드 산출물 아님) — 개발=레포
+    data/, 프로즌=EXE 옆 data/(사용자 전용 설치라 쓰기 가능). ⚠ CLAUDE.md의 '런타임 쓰기는
+    cache_dir()' 규칙의 예외로 남아 있다(auth의 .ks_session과 같음) — 옮기려면 기존 사용자
+    큐를 옮기는 이전 코드가 함께 필요하다. 멱등 스키마(IF NOT EXISTS).
 """
 
 import sqlite3
@@ -275,16 +278,6 @@ def mark_synced(event_ids) -> int:
         cur = c.execute(f"UPDATE events SET synced=1 WHERE event_id IN ({ph})", ids)
         c.commit()
         return cur.rowcount
-    except sqlite3.Error:
-        return 0
-
-
-def count_pending() -> int:
-    c = _conn()
-    if c is None:
-        return 0
-    try:
-        return c.execute("SELECT COUNT(*) FROM events WHERE synced=0").fetchone()[0]
     except sqlite3.Error:
         return 0
 

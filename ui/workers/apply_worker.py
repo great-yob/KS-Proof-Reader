@@ -354,7 +354,7 @@ class ApplyWorker(QThread):
                         #   찾기로 되돌아갈 때만 쓰인다(빨강 필터가 형광펜을 못 읽는다).
                         pen_paras_by = {d.get("original", ""): (d.get("pen_paras") or [])
                                         for d in detail if d.get("applied")}
-                        stats2, detail2, out_hwp = self._run_memo(
+                        _, detail2, out_hwp = self._run_memo(
                             editor, annot_targets, log, pages_by_original,
                             anchor_corrected=True, replaced_by=replaced_by,
                             pen_paras_by=pen_paras_by, spots_by=spots_by,
@@ -367,7 +367,7 @@ class ApplyWorker(QThread):
                         out_hwp = self._hwp_out_path("_교정본")
                         log(f"  저장 중: {os.path.basename(out_hwp)}")
                         editor.save_as(out_hwp)
-                        log(f"  ✓ 저장 완료")
+                        log("  ✓ 저장 완료")
                         self.progress.emit(85, "교정본 저장 완료")
 
                 elif (mode == "hwp_memo" and self.source_is_corrected

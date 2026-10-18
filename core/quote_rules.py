@@ -321,7 +321,7 @@ def find_reversed_quotes(text: str) -> list:
             if _kernel(original) != _kernel(corrected):
                 continue
             seen.add(original)
-            why = (f"따옴표 방향 오류 수정")
+            why = ("따옴표 방향 오류 수정")
             if josa:
                 why += f" (닫는 따옴표 뒤 조사 '{josa}'도 붙임)"
             out.append((original, corrected, why))

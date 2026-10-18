@@ -204,8 +204,13 @@ _HWP_FORMAT_BY_EXT = {
 }
 
 # 확장자별 선호 HWP 버전 ProgID 우선순위.
-# 같은 PC에 여러 한글 버전이 설치된 경우, 마지막 등록 버전이 기본 ProgID로 잡히지만
-# 버전별 ProgID(.X)는 별도로 호출 가능.
+# ⚠ 실측(2026-06-17)으로 이 목록의 전제는 대부분 무너졌다 — 남겨 둔 것은 동작에 해가
+#   없어서다(미등록 ProgID는 Dispatch가 즉시 실패해 다음 후보로 넘어간다):
+#   · 모든 한/글 버전이 **CLSID 하나를 공유**해 마지막에 등록된 버전만 COM으로 잡히고,
+#     개발 PC에는 버전별 ProgID(.8/.12)가 아예 없다 → 실제로는 늘 기본 ProgID로 떨어진다.
+#   · 'hwpx는 2022가 안정적'이라는 아래 주석은 틀렸다 — 한/글 2010도 hwpx를 COM으로
+#     완전히 처리한다(원인은 SetMessageBoxMode 값이었다 — open()의 0x2FFF1 주석).
+#   메모리 hwp-com-version-constraints · hwpx-2010-com-fix 참조.
 #
 # Hancom의 버전별 ProgID 명명 규칙: HWPFrame.HwpObject.<MajorVersion>
 #   HWP 2010 = 8.x  → HWPFrame.HwpObject.8

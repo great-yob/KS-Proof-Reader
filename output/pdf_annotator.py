@@ -215,7 +215,7 @@ def _align_occurrences(matches, occ_total, skip_occ, doc_occ=0):
     ★기준 수는 **`doc_occ`(한/글 문서에서 실제로 찾은 등장 수)를 먼저 본다.**
       `occ_total`(검수 패널이 추출 텍스트에서 센 수)과 다를 수 있고, 그때 옳은 쪽은
       `doc_occ`다 — `skip_occurrences`가 사는 좌표계가 **브리지 RepeatFind 순서**이고
-      locate가 바로 그 순서로 세기 때문이다(CLAUDE.md '등장 좌표계'). 실측
+      locate가 바로 그 순서로 세기 때문이다(docs/output-and-apply.md '세 산출물은 같은 자리를 표시한다'). 실측
       2026-08-08: '지속가능항공유'가 추출 텍스트 5곳 · 문서 찾기 4곳이라, occ_total로
       대조하면 멀쩡한 항목이 '정합 실패'로 떨어졌다.
 

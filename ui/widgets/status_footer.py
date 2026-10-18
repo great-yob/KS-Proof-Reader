@@ -14,7 +14,7 @@ ui/widgets/status_footer.py — 하단 영구 상태바
 """
 
 from PySide6.QtCore import Signal, QVariantAnimation, QEasingCurve
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QProgressBar, QWidget, QVBoxLayout
+from PySide6.QtWidgets import QFrame, QHBoxLayout
 
 from ui.widgets.components import label, IconButton
 from ui.styles.theme import restyle

@@ -56,7 +56,3 @@ class RunningPanel(QWidget):
 
     def set_title(self, text: str):
         self._title.setText(text)
-
-    def set_detail(self, text: str, tone: str = ""):
-        """상세(작은 텍스트) 행은 UI에서 제거됨 — 호출부 호환용 no-op.
-        세부 진행 메시지는 footer 진행바와 ActivityPanel 로그가 담당한다."""

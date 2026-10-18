@@ -7,9 +7,9 @@ ui/widgets/stepper_rail.py — 좌측 영구 파이프라인 스텝퍼
 이전 단계 진행상황을 한눈에 확인 가능 — 사용자 지적 ①을 해소한다.
 """
 
-from PySide6.QtCore import Qt, Signal, QPointF, QRectF
-from PySide6.QtWidgets import QFrame, QVBoxLayout, QHBoxLayout, QLabel, QGraphicsDropShadowEffect
-from PySide6.QtGui import QColor, QPainter, QPen, QLinearGradient, QFont, QFontMetrics
+from PySide6.QtCore import Qt, Signal, QPointF
+from PySide6.QtWidgets import QFrame, QVBoxLayout, QLabel
+from PySide6.QtGui import QColor, QPainter, QPen
 
 from ui.widgets.components import label
 from ui.styles.theme import restyle, current_mode, current_palette

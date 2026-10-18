@@ -391,8 +391,6 @@ _PROPORTIONAL = QTextBlockFormat.ProportionalHeight.value
 
 
 class ActivityPanel(QFrame):
-    EXPANDED_WIDTH = 300
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self._entries = []     # (time_str, level, msg) — **원문 그대로**

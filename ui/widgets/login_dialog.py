@@ -38,7 +38,6 @@ class LoginDialog(QDialog):
         self._restore_worker = None
         self.user = None            # 성공 시 user dict(게이트 호출측이 읽는다)
         self._mode = None           # "verified" | "offline"
-        self._grace_days = None     # offline일 때 잔여 유예 일수
         self._build_ui()
         self.refresh_theme()
         if gate:
@@ -125,7 +124,6 @@ class LoginDialog(QDialog):
         if res.get("ok"):
             self.user = res.get("user") or {}
             self._mode = res.get("mode") or "verified"
-            self._grace_days = res.get("grace_days_left")
             self.accept()
             return
         # 실패 — 로그인 폼으로. 사유를 그대로 알려야 사용자가 무엇을 해야 할지 안다.

@@ -210,8 +210,12 @@ def download(info: dict, progress: Optional[Callable[[int, int], None]] = None,
 # ▌설치
 # ══════════════════════════════════════════════════════
 
-def _discard_download(zip_path) -> None:
-    """`download()`가 만든 임시 폴더(ksproof-upd-*)를 지운다 — 설치가 끝나면 필요 없다.
+def discard_download(zip_path) -> None:
+    """`download()`가 만든 임시 폴더(ksproof-upd-*)를 지운다 — 설치가 끝났거나,
+    사용자가 설치를 미뤄(UpdateDialog '나중에'·창 닫기) 더는 쓰지 않을 때.
+
+    ⚠ 미룬 다운로드를 남겨 두면 안내가 뜰 때마다(실행당 1회) 앱 120MB·데이터 138MB가
+      %TEMP%에 한 벌씩 쌓인다 — 다음 실행은 어차피 새로 받는다.
 
     ⚠ **우리가 만든 폴더일 때만** 지운다(이름 접두사 + %TEMP% 바로 아래). 호출자가
       다른 곳의 zip을 넘겼다면 손대지 않는다 — 업데이터가 %TEMP%를 통째로 지운 사고
@@ -253,7 +257,7 @@ def install_data(zip_path: Path, logger: Optional[Callable[[str], None]] = None,
             with zipfile.ZipFile(zip_path) as z:
                 z.extractall(staging)
         finally:
-            _discard_download(zip_path)      # 풀었으면 zip은 필요 없다(131MB)
+            discard_download(zip_path)      # 풀었으면 zip은 필요 없다
         # 최소 무결성 — stdict.db가 있고 열리는가.
         db = staging / "stdict.db"
         if not db.exists():
@@ -418,7 +422,7 @@ def install_app(zip_path: Path, logger: Optional[Callable[[str], None]] = None,
             with zipfile.ZipFile(zip_path) as z:
                 z.extractall(staging)
         finally:
-            _discard_download(zip_path)      # 풀었으면 zip은 필요 없다(93MB)
+            discard_download(zip_path)      # 풀었으면 zip은 필요 없다
         exe = dst / f"{Path(sys.executable).name}"
         if not (staging / exe.name).exists():
             log("  ✗ 앱 패키지에 실행 파일이 없습니다 — 설치 취소")

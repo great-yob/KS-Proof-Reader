@@ -30,10 +30,10 @@ from PySide6.QtWidgets import (
 )
 
 from ui.widgets.components import (
-    label, sub_label, divider, chip, badge, IconButton,
+    label, sub_label, divider, IconButton,
     AnimatedGradientBorder, soft_breakable as _soft_breakable
 )
-from ui.styles.theme import current_palette, restyle, local_qss, LIGHT
+from ui.styles.theme import current_palette, local_qss, LIGHT
 from ui.styles.fonts import SERIF_FAMILY
 # 사용자 첨부 사전 카드 식별자 — 이 패널에서 딱 한 가지가 달라진다: **수락 상태로
 #   등장하되 그것을 '반복 일괄 처리'로 취급하지 않는다**(_build_occurrences 참조).
@@ -671,7 +671,6 @@ class ReviewPanel(QWidget):
         self._options = {}
         self._full_text = ""
         self._note_ranges = []     # 각주 구간(표시 구분용 — 오프셋은 불변)
-        self._active_ci = None
         # 등장 식별자 — 카드/미리보기 앵커는 **등장의 목록 인덱스가 아니라 uid**로 묶는다.
         #   인덱스로 묶으면 역방향 교정 합류(_apply_flip)로 목록이 재정렬될 때마다 모든
         #   카드의 id가 어긋나 '전량 재생성' 말고는 정합을 맞출 방법이 없었다(성능 원인).
@@ -1849,7 +1848,7 @@ class ReviewPanel(QWidget):
         #   검수 필요(dict_flag)는 치환 후보가 없어 원본(original==corrected)을 그대로 채워
         #   두고, 사용자가 올바른 표기로 직접 수정하게 한다. 고치지 않고 적용하면
         #   corrected==original → HWP는 그대로 두고 정오표에만 '검수'로 기록된다
-        #   (apply_worker._flag_only / errata is_flag_review).
+        #   (apply_worker._flag_only / errata_generator의 `is_review and corrected == original`).
         corr_val = GrowingTextEdit(data.get("corrected", ""))
         if is_flag:
             corr_val.setPlaceholderText("올바른 표기로 직접 수정")
@@ -2857,19 +2856,6 @@ class ReviewPanel(QWidget):
             self._scroll_layout.insertWidget(self._scroll_layout.count() - 1, c)
             self._fam_cards.append(c)
 
-    def exit_consistency_mode(self):
-        """원래 '교정 제안' 그리드로 복귀."""
-        if not self._fam_mode:
-            return
-        self._fam_mode = False
-        self._families = []
-        self._fam_all = []
-        self._fam_cards = []
-        self._set_grid_title("교정 제안", self._CARD_STOPS)
-        self._show_chips(True)
-        self._rebuild_cards()
-        self._emit_counts()
-
     def consistency_pending_count(self) -> int:
         """**재검토가 실제로 할 일이 있는** 건수. 0이면 재검토 버튼을 띄우지 않는다.
 
@@ -2932,7 +2918,6 @@ class ReviewPanel(QWidget):
         ⚠ 가족 하나가 낱말 여러 개를 뒤집으므로 낱말마다 카드·미리보기를 다시 그리면
           프리즈가 된다 → `_batch_flip` 가드로 묶고 끝난 뒤 한 번만 재구성한다.
         """
-        from core import consistency_family as _cf
         # ⚠ 낱말 단위 합산은 core 단일 출처(plan) — 한 낱말이 두 축의 계열에 동시에 속하므로
         #   계열마다 그냥 실행하면 ① 같은 방향이면 두 번 뒤집혀 원위치가 되고 ② 반대 방향이면
         #   나중 계열이 앞의 것을 조용히 덮어쓰며 ③ 다른 축에서 멀쩡하던 계열이 갈린다.
@@ -3118,7 +3103,7 @@ class ReviewPanel(QWidget):
         # 지금 이 카드가 무슨 상태인지 **글자로** 말한다 — 색·아이콘만으로는 무엇을 골랐는지
         #   알 수 없다는 보고(2026-08-04).
         state = label("")
-        state.setStyleSheet(f"border: none; background: transparent; font-size: 12px;")
+        state.setStyleSheet("border: none; background: transparent; font-size: 12px;")
         cl.addWidget(state)
 
         # 방향 토글 — 통일 방향은 옳고 그름이 아니라 **편집 선택**이다. 어느 쪽이 문서 다수인지
@@ -3812,19 +3797,6 @@ class ReviewPanel(QWidget):
             return occ["status"] == "pending"
         return _display_category(occ["c"]) == flt
 
-    def _accept_all(self):
-        for o in self._occ:
-            if not o.get("shadowed"):
-                o["status"] = "accepted"
-                # 일괄 처리 = 자동 전파와 같은 취급 — 이후 개별 카드에서 반대
-                #   선택 시 확인 팝업을 거쳐 그 카드만 뒤집을 수 있다(_set_status).
-                o["auto"] = True
-                o["by_user"] = False
-        self._derive_all()
-        self._restyle_dirty()   # 상태만 바뀐다 — 목록 재구성 불필요(=수백 장 프리즈 회피)
-        self._refresh_preview(defer=True)
-        self._emit_counts()
-
     def _rebuild_cards(self):
         # 프리페치는 재구성 중 옛 목록을 건드리지 않게 먼저 세운다(끝에서 재시작).
         if hasattr(self, "_prefetch_timer"):
@@ -3866,17 +3838,6 @@ class ReviewPanel(QWidget):
         #   더 만든다고 달라지지 않는데(호출부가 이미 각자 emit한다), 칩 위젯을 매번
         #   파괴·재생성해 배치마다 헛비용이 붙었다.
         self._schedule_prefetch()
-
-    def _reject_all(self):
-        for o in self._occ:
-            if not o.get("shadowed"):
-                o["status"] = "rejected"
-                o["auto"] = True      # _accept_all과 동일 — 개별 반대는 확인 후 허용
-                o["by_user"] = False
-        self._derive_all()
-        self._restyle_dirty()   # _accept_all과 동일
-        self._refresh_preview(defer=True)
-        self._emit_counts()
 
     def refresh_theme(self):
         self._apply_search_theme()   # 형광펜 색은 _refresh_preview 안의 재검색이 갱신

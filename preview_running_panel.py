@@ -46,21 +46,6 @@ _WATCH_FILES = (
     "ui/widgets/running_panel.py",
 )
 
-# 파이프라인 시뮬레이션 단계 (진행률 문턱, 상세 메시지)
-_SIM_STAGES = [
-    (0,  "문서 텍스트 추출 중…"),
-    (10, "사전 스크리닝 — 의심어 추출 중…"),
-    (22, "형태소 분석으로 활용형 복원 중…"),
-    (30, "AI 교정 제안 요청 중… (1/4)"),
-    (45, "AI 교정 제안 요청 중… (2/4)"),
-    (58, "AI 교정 제안 요청 중… (3/4)"),
-    (70, "AI 교정 제안 요청 중… (4/4)"),
-    (82, "제안 병합·중복 제거 중…"),
-    (90, "사전 재검증(3차) 진행 중…"),
-    (97, "일관성 후처리 중…"),
-]
-
-
 class Preview(QWidget):
     def __init__(self):
         super().__init__()
@@ -72,8 +57,6 @@ class Preview(QWidget):
         self._progress = 34
         self._animating = True
         self._title = "교정 분석 중"
-        self._detail = "AI 교정 제안 요청 중… (2/4)"
-        self._tone = ""
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -168,7 +151,6 @@ class Preview(QWidget):
         if self._panel is None:   # 직전 리로드 실패로 패널 부재 — 다음 성공 시 재주입
             return
         self._panel.set_title(self._title)
-        self._panel.set_detail(self._detail, self._tone)
         self._panel.set_progress(self._progress)
         self._panel.set_animating(self._animating)
 
@@ -192,8 +174,6 @@ class Preview(QWidget):
         self._progress = 0
         self._animating = True
         self._title = "교정 분석 중"
-        self._detail = _SIM_STAGES[0][1]
-        self._tone = ""
         self._anim_btn.setText("⏸ 애니 정지")
         self._slider.blockSignals(True)
         self._slider.setValue(0)
@@ -208,20 +188,13 @@ class Preview(QWidget):
         self._slider.blockSignals(True)
         self._slider.setValue(self._progress)
         self._slider.blockSignals(False)
-        detail = next((m for th, m in reversed(_SIM_STAGES)
-                       if self._progress >= th), _SIM_STAGES[0][1])
         self._panel.set_progress(self._progress)
         if self._progress >= 100:
             self._sim.stop()
             self._animating = False
             self._title = "분석 완료"
-            self._detail = "아래 버튼을 눌러 교정 제안 검토를 시작하세요."
-            self._tone = "text_success"
             self._anim_btn.setText("▶ 애니 재생")
             self._apply_state()
-        elif detail != self._detail:
-            self._detail = detail
-            self._panel.set_detail(detail)
 
     def _toggle_theme(self):
         self._mode = "dark" if self._mode == "light" else "light"

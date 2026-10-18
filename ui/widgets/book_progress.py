@@ -1,5 +1,5 @@
 """
-ui/widgets/book_progress.py — 진행률 '책' 그래픽 (원형 ProgressRing 대체)
+ui/widgets/book_progress.py — 진행률 '책' 그래픽 (진행 화면 중앙)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 플랫 2D 픽토그램 — 사용자가 제공한 book-01.svg 실루엣을 그대로 이식.
 펼친 책: 좌/우 앞 페이지(front)가 스파인에서 만나고, 그 뒤로 살짝 큰
@@ -13,7 +13,7 @@ ui/widgets/book_progress.py — 진행률 '책' 그래픽 (원형 ProgressRing �
     오른쪽 페이지에도 일괄. 아래 큰 % 텍스트가 주인공.
   · 교정 마크 종류: 밑줄(ul) / 띄어쓰기 쐐기 ∨(v) / 체크 ✓(chk).
 
-리페인트 정책(ProgressRing과 동일 원칙):
+리페인트 정책:
   상시 타이머 금지 — set_animating(True)일 때만 16ms 타이머가 돌고,
   멈추면 마지막 위상에서 정지한다. 진행률 전환은 QVariantAnimation이 담당.
 """
@@ -120,7 +120,7 @@ def _svg_book_paths():
 
 
 class BookProgress(QWidget):
-    """book-01.svg 픽토그램 책 페이지 플립. API는 ProgressRing 호환 + set_animating."""
+    """book-01.svg 픽토그램 책 페이지 플립. set_progress(0~100) + set_animating."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -145,7 +145,6 @@ class BookProgress(QWidget):
         self._p_back_r = qt.map(br)
         self._p_front_l = qt.map(fl)
         self._p_front_r = qt.map(fr)
-        self._cx = cx
         self._spine_x = tx + s * _SVG_SPINE       # 앞 페이지 스파인(위젯 x)
         self._text_y = ty + s * _SVG_Y1 + 10      # % 텍스트 y
 

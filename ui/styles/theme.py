@@ -8,20 +8,11 @@ ui/styles/theme.py — 디자인 시스템 (뉴트럴 프로 · 라이트/다크
 직접 페인트/HTML 위젯(ToggleSwitch, 미리보기 QTextBrowser)만 paint 시점에
 current_palette()를 읽어 refresh_theme()로 갱신한다.
 
-  set_mode("light"|"dark") → COLORS 라이브 매핑 갱신
+  set_mode("light"|"dark") → 현재 모드 전환(current_palette()가 따라감)
   apply_theme(app, mode)   → QApplication에 글로벌 QSS 적용
 """
 
 from string import Template
-
-
-# ══════════════════════════════════════════════════════════════
-# ▌스케일 (간격 / 반경 / 타이포)
-# ══════════════════════════════════════════════════════════════
-
-SPACE  = {"xs": 4, "sm": 8, "md": 12, "lg": 16, "xl": 24, "xxl": 32}
-RADIUS = {"sm": 8, "md": 12, "lg": 16, "pill": 999}
-FONT   = {"xs": 11, "sm": 12, "md": 13, "lg": 15, "xl": 18, "xxl": 22}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -140,15 +131,11 @@ DARK = {
 
 
 # ══════════════════════════════════════════════════════════════
-# ▌현재 모드 상태 + 라이브 매핑(COLORS)
+# ▌현재 모드 상태
 # ══════════════════════════════════════════════════════════════
 
 _MODE = "light"
 PALETTES = {"light": LIGHT, "dark": DARK}
-
-# COLORS는 항상 "현재 팔레트"를 가리키는 라이브 dict.
-# 같은 dict 객체를 유지(.clear/.update)하므로 import 시점 참조가 깨지지 않는다.
-COLORS = dict(LIGHT)
 
 
 def current_mode() -> str:
@@ -160,11 +147,9 @@ def current_palette() -> dict:
 
 
 def set_mode(mode: str):
-    """현재 테마 모드 설정 + COLORS 라이브 매핑 갱신."""
+    """현재 테마 모드 설정 — 이후 current_palette()가 그 모드의 팔레트를 돌려준다."""
     global _MODE
     _MODE = "dark" if str(mode).lower() == "dark" else "light"
-    COLORS.clear()
-    COLORS.update(PALETTES[_MODE])
 
 
 # ══════════════════════════════════════════════════════════════

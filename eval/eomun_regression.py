@@ -7,14 +7,13 @@ eval/eomun_regression.py — 어문 규범 레이어 회귀 골드셋 하니스 
 파이프라인의 결정론 구간만 검사한다:
   · norm_map        (nikl_dict.batch_lookup_norm)           — 워커 [5.7]
   · eomun_pairs     (core.eomun_rules.batch_lookup_eomun_pair) — 워커 [5.8]
-  · KAGEC 검색      (core.eomun_rules.retrieve)               — DO-2(컨텍스트 회수)
+  (규칙을 AI 프롬프트에 주입하던 KAGEC 역할 A는 2026-06-22 제거 — 그 회수율을 재던 옛 C 항목도 삭제)
 
-검사 3종:
+검사 2종:
   A. 무변경 테스트(HARD GATE) — 시드 'correct' 예시 토큰 + 카논 위험어를 결정론 구간에
      통과시켜 **단 하나도 바뀌지 않음**을 검증. 하나라도 바뀌면 과교정 회귀 → exit 1.
   B. 결정론 재현율 — deterministic 규칙의 'incorrect' 토큰이 결정론 구간에서 교정되는 비율
      (eomun_pairs 또는 norm_map). "B는 norm_map에 양보" 설계가 실제로 커버하는지 확인.
-  C. 컨텍스트 재현율 — 모든 'incorrect' 토큰이 retrieve()로 회수되어 AI에 규범이 주입되는 비율.
 
 지표: precision / recall / F0.5(GEC는 정밀도 가중). A 위반 0이면 precision=1.0.
 
@@ -84,9 +83,9 @@ def run(verbose=False):
 
     # ── 검사 대상 토큰 수집 ──────────────────────────────────────────
     #   · 무변경: 'correct' 예시의 모든 한글 토큰(공백 분해) — 바뀌면 안 됨.
-    #   · 컨텍스트/결정론 재현: 규칙의 'triggers'(실제 인덱싱된 오류 표면형)를 계약으로 사용한다.
+    #   · 결정론 재현: 규칙의 'triggers'(실제 인덱싱된 오류 표면형)를 계약으로 사용한다.
     #     (incorrect 예시를 재토큰화하면 '않 가다'의 무고한 '가다'까지 잡혀 거짓 미스가 난다.)
-    no_change_tokens, det_bad, ctx_bad = [], [], []
+    no_change_tokens, det_bad = [], []
     for r in rows:
         for ex in r.get("examples", {}).get("correct", []):
             for t in re.findall(r"[가-힣]{2,}", ex):
@@ -95,13 +94,12 @@ def run(verbose=False):
             t = re.sub(r"[^가-힣]", "", t)
             if len(t) < 2:
                 continue
-            ctx_bad.append((t, r["rule_id"]))
             if r.get("deterministic"):
                 det_bad.append((t, r["rule_id"]))
     no_change_tokens = list(dict.fromkeys(no_change_tokens + CANON_NO_CHANGE))
 
     # 결정론 조회 테이블을 배치로 한 번에 (성능)
-    all_words = set(no_change_tokens) | {t for t, _ in ctx_bad}
+    all_words = set(no_change_tokens) | {t for t, _ in det_bad}
     bases = set(all_words)
     for w in list(all_words):
         b = strip_josa(w)
@@ -127,15 +125,6 @@ def run(verbose=False):
     det_hit = [(t, rid, det(t)) for t, rid in det_bad]
     det_corrected = [x for x in det_hit if x[2] is not None]
 
-    # ── C. 컨텍스트 재현율 (retrieve로 규칙 회수) ────────────────────
-    ctx_hit = 0
-    ctx_detail = []
-    for t, rid in ctx_bad:
-        cards = er.retrieve(t) if er.available() else []
-        found = any(c.rule_id == rid for c in cards)
-        ctx_hit += 1 if found else 0
-        ctx_detail.append((t, rid, found))
-
     # ── 지표 ────────────────────────────────────────────────────────
     tp = len(det_corrected)                 # 올바르게 바꾼 결정론 케이스
     fp = len(violations)                    # 바꾸면 안 되는데 바꿈(과교정)
@@ -151,8 +140,6 @@ def run(verbose=False):
         "over_correction_violations": len(violations),
         "deterministic_total": len(det_bad),
         "deterministic_corrected": tp,
-        "context_total": len(ctx_bad),
-        "context_retrieved": ctx_hit,
         "precision": round(precision, 4),
         "recall": round(recall, 4),
         "f0.5": round(f05, 4),
@@ -171,11 +158,6 @@ def run(verbose=False):
     if verbose:
         for t, rid, out in det_hit:
             print(f"     {'✔' if out else '·'} {t} → {out or '(변경 없음)'}  [{rid}]")
-    print(f"C. 컨텍스트 재현      : {ctx_hit}/{len(ctx_bad)}  (retrieve로 규칙 회수→AI 주입)")
-    if verbose:
-        for t, rid, found in ctx_detail:
-            if not found:
-                print(f"     · 미회수: {t} [{rid}]")
     print(f"지표: precision={precision:.3f}  recall={recall:.3f}  F0.5={f05:.3f}")
     print("━" * 64)
     print("판정:", "✅ PASS (과교정 0)" if result["pass"] else "❌ FAIL")

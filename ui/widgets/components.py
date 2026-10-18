@@ -160,10 +160,6 @@ def soft_breakable(s: str) -> str:
     return "".join(out)
 
 
-def heading(text: str, level: int = 1) -> QLabel:
-    return label(text, role="h1" if level == 1 else "h2")
-
-
 def title_label(text: str) -> QLabel:
     return label(text, role="title")
 
@@ -225,176 +221,11 @@ def divider(horizontal: bool = True) -> QFrame:
     return d
 
 # ══════════════════════════════════════════════════════════════
-# 원형 진행률 그래픽
+# 진행 화면 카드 — 회전 그라디언트 테두리 + 링 배경 + 글자 파티클
 # ══════════════════════════════════════════════════════════════
 
-from PySide6.QtCore import QRectF, QTimer, QVariantAnimation, QEasingCurve, Qt
-from PySide6.QtGui import QPainter, QPen, QColor, QConicalGradient, QBrush
-from ui.styles.theme import current_palette
+from PySide6.QtCore import QTimer
 import time
-
-class ProgressRing(QWidget):
-    def __init__(self, parent=None, size=80, stroke_width=6):
-        super().__init__(parent)
-        self.setFixedSize(size, size)
-        self._progress = 0.0
-        self._target_progress = 0
-        self._stroke_width = stroke_width
-
-        # 리페인트는 진행률 전환 애니메이션(_anim.valueChanged → update)만으로 충분하다.
-        #   ⚠ 과거의 상시 16ms(60fps) 타이머는 페인트에 시간 의존 요소가 없는데도
-        #   패널이 숨겨진 뒤까지 앱 수명 내내 돌았다 — 제거(저사양 CPU 낭비 방지).
-        self._anim = QVariantAnimation(self)
-        self._anim.setDuration(300)
-        self._anim.setEasingCurve(QEasingCurve.Linear)
-        self._anim.valueChanged.connect(self._on_anim_value)
-
-    def _on_anim_value(self, value: float):
-        self._progress = value
-        self.update()
-
-    def set_progress(self, value: int):
-        val = max(0, min(100, value))
-        if val == self._target_progress:
-            return
-        self._target_progress = val
-        self._anim.stop()
-        self._anim.setStartValue(self._progress)
-        self._anim.setEndValue(float(val))
-        self._anim.start()
-
-    def progress(self) -> int:
-        return self._target_progress
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-
-        pal = current_palette()
-        from ui.styles.theme import current_mode
-        is_dark = (current_mode() == "dark")
-        if is_dark:
-            track_color = QColor(255, 255, 255)
-            track_color.setAlpha(30)   # 다크 모드: 흰색 반투명
-        else:
-            track_color = QColor(0, 0, 0)
-            track_color.setAlpha(70)   # 라이트 모드: 검은색 반투명
-        progress_color = QColor(pal.get("success", "#157F3C"))
-        text_color = QColor(pal.get("text", "#1A1D23"))
-
-        rect = QRectF(
-            self._stroke_width / 2.0,
-            self._stroke_width / 2.0,
-            self.width() - self._stroke_width,
-            self.height() - self._stroke_width
-        )
-
-        pen_track = QPen(track_color)
-        pen_track.setWidth(self._stroke_width)
-        pen_track.setCapStyle(Qt.RoundCap)
-        painter.setPen(pen_track)
-        painter.drawArc(rect, 0, 360 * 16)
-
-        if self._progress > 0:
-            pen_progress = QPen(progress_color)
-            pen_progress.setWidth(self._stroke_width)
-            pen_progress.setCapStyle(Qt.RoundCap)
-            painter.setPen(pen_progress)
-            
-            start_angle = 90 * 16
-            span_angle = -int((self._progress / 100.0) * 360 * 16)
-            painter.drawArc(rect, start_angle, span_angle)
-
-        painter.setPen(text_color)
-        font = self.font()
-        font.setPixelSize(18)
-        font.setBold(True)
-        painter.setFont(font)
-        painter.drawText(self.rect(), Qt.AlignCenter, f"{int(self._progress)}%")
-
-# ══════════════════════════════════════════════════════════════
-# 애니메이션 오로라 배경 (Gemini Thinking 스타일) 및 그라데이션 테두리
-# ══════════════════════════════════════════════════════════════
-
-def draw_wavy_aurora(painter, w, h, phase, is_dark=True):
-    import math
-    from PySide6.QtGui import QPainterPath, QLinearGradient, QColor, QPainter
-    
-    # 다크모드 상단 번아웃(하얗게 타는 현상)을 방지하기 위해 Screen 모드 임시 해제
-    if is_dark:
-        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
-        base_alpha = 60
-    else:
-        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
-        base_alpha = 40
-    
-    # 확실한 다양성을 보여주는 5가지 화려한 네온 컬러 (노란색 추가)
-    base_colors = [
-        QColor(255, 64, 129),  # Neon Pink
-        QColor(0, 229, 255),   # Cyan Glow
-        QColor(255, 234, 0),   # Neon Yellow
-        QColor(213, 0, 249),   # Deep Purple/Magenta
-        QColor(29, 233, 182),  # Teal/Emerald
-    ]
-    
-    for i in range(5):
-        # 좁아진 폭에 맞춰 주파수를 대폭 낮춰 원뿔 넓이를 넓게(완만하게) 변경
-        freq = 0.25 + i * 0.2
-        speed = 1.2 + i * 0.2
-        
-        # 색상 간의 x축 좌표 차이를 넓게 벌리기 위한 오프셋
-        color_offset_x = i * 2.5
-        
-        # 색상 간의 y축 오프셋 차이를 주어 상하로 입체적인 층(Ribbon)을 형성
-        color_offset_y = (i - 2) * h * 0.08
-        
-        # 푸터 버튼의 '유기적인 액체' 느낌을 큰 화면에서도 그대로 살리려면
-        # 확산(spread) 거리를 화면 높이(h)에 비례하게 두면 안 됩니다. (큰 화면에선 레이어가 찢어짐)
-        # 최대 확산 거리를 절대 픽셀(35px)로 묶어주면 거대한 덩어리의 액체처럼 부드럽게 섞입니다.
-        blur_layers = 15
-        for j in range(blur_layers):
-            path = QPainterPath()
-            points = 80
-            
-            # -1.0 부터 +1.0 까지 정규화된 오프셋
-            normalized_offset = (j - (blur_layers - 1) / 2.0) / (blur_layers / 2.0)
-            
-            # 절대 픽셀 값(35px)으로 고정 확산시켜 층이 보이지 않고 부드러운 경계를 만듦
-            blur_spread_y = 35 * normalized_offset
-            
-            # 파동의 진폭
-            amp = h * 0.18
-            base_y = h * 0.25 + blur_spread_y + color_offset_y
-            
-            path.moveTo(0, -h)
-            
-            for x in range(points + 1):
-                px = w * (x / points)
-                val = math.sin((px / w) * freq * math.pi * 2 - phase * speed + color_offset_x)
-                val += 0.4 * math.sin((px / w) * freq * 1.7 * math.pi * 2 - phase * speed * 1.3 + color_offset_x * 1.5)
-                py = base_y + val * amp
-                path.lineTo(px, py)
-                
-            path.lineTo(w, -h)
-            path.closeSubpath()
-            
-            # 중심에 가까운 레이어일수록 불투명도를 높게
-            weight = 1.0 - abs(normalized_offset)
-            if weight < 0: weight = 0
-            
-            # 겹수가 15개로 약간 늘고 한 곳에 밀집되므로 투명도를 적절히 낮춤
-            adjusted_alpha = base_alpha * 0.35
-            c = QColor(base_colors[i])
-            c.setAlpha(int(adjusted_alpha * weight))
-            c_trans = QColor(c.red(), c.green(), c.blue(), 0)
-            
-            # 그라데이션 시작점을 위로 올려 자연스러운 페이드아웃 유도
-            grad = QLinearGradient(0, -h * 0.1, 0, base_y + amp)
-            grad.setColorAt(0, c)
-            grad.setColorAt(1, c_trans)
-            
-            painter.fillPath(path, grad)
-
 
 # ── 떠다니며 연결되는 글자 파티클(뉴런 스캔에서 이식) ──────────────
 import math as _math
@@ -532,8 +363,8 @@ class AnimatedGradientBorder(QWidget):
         else:
             painter.fillRect(inner_rect, QColor("#ffffff"))
 
-        # 4. 링 파티클 리플 배경 (오로라 대체 — 2026-07-16, draw_wavy_aurora는
-        #    롤백 대비 보존). 멈추면 마지막 위상에서 정지하는 관례는 동일.
+        # 4. 링 파티클 리플 배경(ui/widgets/ring_particles.py — 옛 오로라 배경 대체).
+        #    멈추면 마지막 위상에서 정지한다.
         if self._ring_bg is None:
             from ui.widgets.ring_particles import RingParticles
             self._ring_bg = RingParticles()
@@ -556,7 +387,7 @@ class AnimatedGradientBorder(QWidget):
         """카드 안을 떠다니는 글자 + 가까운 글자끼리 잇는 가는 선.
 
         painter는 이미 inner_path(둥근 사각형)로 클립돼 있어 모서리를 넘지 않는다.
-        위치 갱신은 애니메이션 중일 때만 — 멈추면 마지막 프레임에서 정지(오로라와 동일).
+        위치 갱신은 애니메이션 중일 때만 — 멈추면 마지막 프레임에서 정지(링 배경과 동일).
         """
         from PySide6.QtGui import QColor, QFont, QPen
         from PySide6.QtCore import QPointF
@@ -620,7 +451,7 @@ class AnimatedGradientBorder(QWidget):
 # ══════════════════════════════════════════════════════════════
 
 from PySide6.QtWidgets import QStackedWidget, QGraphicsOpacityEffect
-from PySide6.QtCore import QPropertyAnimation
+from PySide6.QtCore import QPropertyAnimation, QEasingCurve
 
 class FadingStackedWidget(QStackedWidget):
     def __init__(self, parent=None):
@@ -656,9 +487,8 @@ class FadingStackedWidget(QStackedWidget):
 # 스무스 스크롤 필터 (휠 모션 등)
 # ══════════════════════════════════════════════════════════════
 
-from PySide6.QtCore import QObject, QEvent, QPropertyAnimation, QEasingCurve
+from PySide6.QtCore import QObject, QEvent
 from PySide6.QtWidgets import QScrollBar
-from PySide6.QtGui import QWheelEvent
 
 class SmoothScrollFilter(QObject):
     """

@@ -52,13 +52,12 @@ class ProofreadingWorker(QThread):
     error       = Signal(str)         # 에러 메시지
     text_extracted = Signal(str)      # 추출된 원문 텍스트
     page_count_extracted = Signal(object)  # 문서 총 페이지 수(int) 또는 None
-    # ⚠ 두 목록은 **범위가 다르다. 서로 대체하지 말 것.**
+    # ⚠ 추출 단계의 두 목록은 **범위가 다르다. 서로 대체하지 말 것.**
     #   note_lines     = 컨트롤 텍스트 **전부**(각주·미주·글상자·표·목차·머리말).
-    #                    AI 앞덧붙임 가드 ⑱가 쓴다 — 넓을수록 보호가 두텁다.
+    #                    AI 앞덧붙임 가드 ⑱만 쓴다(워커 내부) — 넓을수록 보호가 두텁다.
     #   footnote_lines = 그중 **실제 각주·미주**만(`fn`/`en` ctrl로 확정). 미리보기
-    #                    `[각주]` 표지 전용 — note_lines로 그리면 조판부호가 붙은 모든
-    #                    항목에 표지가 달린다(사용자 보고 2026-07-30, 실측 1,719 vs 3).
-    note_lines_extracted = Signal(list)
+    #                    `[각주]` 표지 전용(이 시그널) — note_lines로 그리면 조판부호가
+    #                    붙은 모든 항목에 표지가 달린다(사용자 보고 2026-07-30, 실측 1,719 vs 3).
     footnote_lines_extracted = Signal(list)
 
     def __init__(self, file_path: str, options: dict, parent=None):
@@ -163,7 +162,6 @@ class ProofreadingWorker(QThread):
 
         self.text_extracted.emit(text)
         self.page_count_extracted.emit(page_count)
-        self.note_lines_extracted.emit(list(note_lines))
         self.footnote_lines_extracted.emit(list(footnote_lines))
         if note_lines:
             log(f"  각주·글상자 등 컨트롤 {len(note_lines)}줄 식별 — 본문 문장을 쪼갠"
@@ -530,7 +528,7 @@ class ProofreadingWorker(QThread):
         # [4] 정렬 및 병합
         self.step_changed.emit("merge", "교정 목록 정렬 및 중복 제거 중…")
         self._emit_pct(71, "교정 병합 중…")
-        merged = CorrectionMerger.merge([], ai_list)
+        merged = CorrectionMerger.merge(ai_list)
         log(f"  → 1차 확정 교정 항목: {len(merged)}건")
         # 생성(AI) 구간이 끝나고 검증(사전·결정론 규칙) 구간이 시작되는 경계.
         log("[사전+결정론규칙 검증 시작]")
@@ -1332,7 +1330,6 @@ class ProofreadingWorker(QThread):
                     #   따지기보다 저자가 더 자주 쓴 표기로 통일한다(예: '정책보고서'(다수)와
                     #   '정책 보고서'(소수) 혼재 → 소수형을 다수형으로). 복합명사 '분리'는 위
                     #   POS 백스톱에서 제외했고, 여기선 혼재만 다수결로 정리한다.
-                    consistency_n = 0
                     # 동률(1:1 등)도 검수 카드로 표출(사용자 정책 결정 2026-07-02) — 방향은
                     #   사전 기반 규범 기본값(등재 복합어=붙임 / 미등재=띄어쓰기 원칙).
                     _cons_exists = (lambda w: _nd.lookup_word(w)["exists"]) if _dict_ok else None
@@ -1388,7 +1385,6 @@ class ProofreadingWorker(QThread):
                                 minority, majority, n_min, n_maj),
                         ))
                         existing.add(minority)
-                        consistency_n += 1
                     # (복합명사 일관성 건수는 아래 '띄어쓰기 백스톱' 합계에 포함)
 
                 # 부호·영문 띄어쓰기(규칙 기반) — kiwi가 못 잡는 문장부호/스크립트

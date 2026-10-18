@@ -1,4 +1,3 @@
-import math
 from PySide6.QtCore import Qt, QVariantAnimation, QEasingCurve, Signal
 from PySide6.QtGui import QPainter, QColor, QPen, QPainterPath
 from PySide6.QtWidgets import QAbstractButton

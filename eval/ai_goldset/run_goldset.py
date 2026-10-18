@@ -1176,7 +1176,7 @@ def phase_g_junction():
     #   (c) 결합 방향 미탐 보완 금지 — '띄어 쓴 구를 붙임'은 만들지 않는다(⑩ 노이즈 클래스)
     doc5 = "학교밖청소년지원 학교밖청소년지원 학교 밖 청소년 지원 "
     cards5 = []
-    d5 = _jp.resolve(cards5, doc5)
+    _jp.resolve(cards5, doc5)
     inv.append(("결합 방향 보완 미생성",
                 all(" " not in c.original for c in cards5)))
     #   (d) 보완 카드의 원문은 반드시 문서에 실재(브리지 적용 가능성)
@@ -1733,14 +1733,14 @@ def phase_d_rules():
             f.update(status="accepted", choice=f["proposal"])
         if _cfam.plan(_a_fams, _a_fams)["undecided"]:
             fails += 1
-            print(f"  ✗ FAIL [D-7 공동 제안] 기본 제안대로 전부 수락했는데 낱말이 부딪힌다 "
-                  f"— 공동 풀이가 안 먹었다(그만큼 낱말 카드가 늘어난다)")
+            print("  ✗ FAIL [D-7 공동 제안] 기본 제안대로 전부 수락했는데 낱말이 부딪힌다 "
+                  "— 공동 풀이가 안 먹었다(그만큼 낱말 카드가 늘어난다)")
 
         n_fam += 1
         if (_cfam.family_label(_tail_f), _cfam.family_label(_lead_f)) != ("…정책", "지원…"):
             fails += 1
-            print(f"  ✗ FAIL [D-7 계열 라벨] 축 없이 키만 쓰면 '…지원'과 '지원…'이 화면에서 "
-                  f"구분되지 않는다")
+            print("  ✗ FAIL [D-7 계열 라벨] 축 없이 키만 쓰면 '…지원'과 '지원…'이 화면에서 "
+                  "구분되지 않는다")
 
         # ⓕ ★**멀쩡한 계열 깨뜨리기 금지**(불변식: 이 단계는 새 혼재를 만들지 않는다).
         #   실측(사용자 지적 파일): 가드 없이 두 축을 통일하면 **새로 갈린 계열 16건**이
@@ -1819,7 +1819,7 @@ def phase_e_ambiguity(save_baseline=False, limit=3000):
         return 0
 
     if not os.path.exists(bp):
-        print(f"  (베이스라인 없음 — `--save-ambig-baseline` 으로 먼저 기준선을 잡으세요)")
+        print("  (베이스라인 없음 — `--save-ambig-baseline` 으로 먼저 기준선을 잡으세요)")
         print(f"  현재 발화 총 {sum(counts.values()):,}건 / 정문 {n_sents:,}문장")
         return 0
 

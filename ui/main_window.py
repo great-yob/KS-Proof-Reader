@@ -1,7 +1,7 @@
 """
 ui/main_window.py — 단일 워크스페이스 셸
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-헤더 · 좌측 스텝퍼 레일 · 중앙 스테이지(QStackedWidget) · 우측 활동 로그 ·
+헤더 · 좌측 스텝퍼 레일 · 중앙 스테이지(FadingStackedWidget) · 우측 활동 로그 ·
 하단 상태바를 영구 배치한다. 중앙만 컨텍스트에 따라 교체되고, 레일/로그/
 푸터는 전 단계에 걸쳐 전역 상태를 반영한다(이전 단계 진행상황 · 누적 로그
 한눈에 확인 — 사용자 지적 ①② 해소).
@@ -22,7 +22,7 @@ from PySide6.QtCore import Qt, QUrl, QTimer
 from PySide6.QtGui import QCursor, QDesktopServices
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QStackedWidget, QMessageBox, QApplication, QAbstractButton, QSizePolicy,
+    QMessageBox, QApplication, QAbstractButton, QSizePolicy,
 )
 
 from ui.widgets.app_header import AppHeader
@@ -284,7 +284,6 @@ class MainWindow(QMainWindow):
 
     def _wire(self):
         self.header.theme_toggled.connect(self._toggle_theme)
-        self.header.new_file_requested.connect(self._reset)
         self.header.minimize_requested.connect(self.showMinimized)
         self.header.maximize_requested.connect(self._toggle_maximize)
         self.header.close_requested.connect(self.close)
@@ -448,7 +447,6 @@ class MainWindow(QMainWindow):
         self._consistency_logged = False
 
         self.running_panel.set_title("교정 분석 중")
-        self.running_panel.set_detail("잠시만 기다려주세요…")
         self.running_panel.set_animating(True)
         self._show_phase("running")
         self.rail.set_phase("analyze")
@@ -471,7 +469,6 @@ class MainWindow(QMainWindow):
         self.running_panel.set_progress(percent)
 
     def _on_step_changed(self, step_id: str, message: str):
-        self.running_panel.set_detail(message)
         self.footer.set_status(message)
 
     def _on_text_extracted(self, text: str):
@@ -481,8 +478,8 @@ class MainWindow(QMainWindow):
     def _on_footnote_lines(self, footnote_lines: list):
         """**실제 각주** 라인 인덱스 — 미리보기 `[각주]` 표지용(review_panel.load에 전달).
 
-        ⚠ 워커의 `note_lines_extracted`(컨트롤 텍스트 전부)를 여기에 연결하면 글상자·
-        표·목차까지 각주로 표시된다 — 그건 AI 가드용이고 표시용이 아니다.
+        ⚠ 워커 내부의 `note_lines`(컨트롤 텍스트 전부)로 그리면 글상자·표·목차까지
+        각주로 표시된다 — 그건 AI 가드용이라 화면으로는 내보내지 않는다.
         """
         self._footnote_lines = list(footnote_lines or [])
 
@@ -545,7 +542,6 @@ class MainWindow(QMainWindow):
             self.activity.log(f"  → 본문 {occ_total}곳에 해당 (반복 등장 포함)")
 
         self.running_panel.set_title("분석 완료")
-        self.running_panel.set_detail("아래 버튼을 눌러 교정 제안 검토를 시작하세요.", tone="text_success")
         self.running_panel.set_animating(False)
         self.footer.set_idle(f"분석 완료 · 교정 {detected}건")
         self.footer.set_primary("교정 검토 시작", variant="success_solid", visible=True, show_reset=True)
@@ -700,7 +696,6 @@ class MainWindow(QMainWindow):
             self._phase = "apply_running"
         else:
             self.running_panel.set_title("교정 적용 중")
-            self.running_panel.set_detail("HWP 파일에 적용하는 중…")
             self.running_panel.set_animating(True)
             self._show_phase("running")
 
@@ -1536,6 +1531,11 @@ class MainWindow(QMainWindow):
                 w.terminate()
                 w.wait(500)
             self._update_worker = None
+        # 업데이트 창을 닫은 뒤에도 소켓에 묶여 남은 다운로드(UpdateDialog.reject 참조) — 같은 관례.
+        #   창을 연 적이 없으면 모듈도 import돼 있지 않으니 끌어오지 않는다.
+        _ud = sys.modules.get("ui.widgets.update_dialog")
+        if _ud is not None:
+            _ud.stop_orphan_downloads()
         # 동기화 워커는 단명 — 잠시 대기 후 남아있으면 강제 종료(네트워크 블로킹 회피).
         for attr in ("_sync_workers",):
             for w in getattr(self, attr, []):

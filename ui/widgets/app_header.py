@@ -17,7 +17,6 @@ from ui.styles.theme import restyle
 
 class AppHeader(QFrame):
     theme_toggled      = Signal()
-    new_file_requested = Signal()
     minimize_requested = Signal()
     maximize_requested = Signal()
     close_requested    = Signal()

@@ -49,8 +49,7 @@ from PySide6.QtCore import (
 )
 
 from ui.widgets.components import IconLabel, IconButton
-from ui.styles.icons import (make_icon, icon_size, make_multi_icon,
-                             multi_icon_size)
+from ui.styles.icons import icon_size, make_multi_icon, multi_icon_size
 from ui.styles.theme import current_palette, current_mode, local_qss
 
 
@@ -71,11 +70,8 @@ _SOURCE_LABEL = {"dict": "사전검증", "ai_typo": "AI 오탈자", "ai_polish":
 #   표기를 바꿀 곳은 ui/widgets/activity_panel.py의 _RULES 한 곳뿐이다.
 # ══════════════════════════════════════════════════════════════
 
-# 메시 배경 전용 브랜드 하이라이트(장식 색 — 팔레트와 별개, 네이버 AI탭 레퍼런스 톤)
-_MESH_VIOLET = "#7C5CFF"
+# 바 차트 채움 그라디언트의 끝색(장식 색 — 팔레트와 별개)
 _MESH_CYAN = "#38BDF8"
-_MESH_PINK = "#FF5CA8"
-_MESH_BLUE = "#4F5DFF"
 
 # 완료 강조색 — success_solid 버튼 배경(라이트)과 동일(사용자 지정). 히어로 적용 카드의
 # 메인 수치 + 교정 적용률 게이지의 수락 아크/버블. 다크에서는 어두운 유리 배경 위에서
@@ -326,17 +322,12 @@ class GlassCard(QFrame):
 
     RADIUS = 20
 
-    def __init__(self, tint: str = "default", parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self._tint = tint          # "default" | "accent"(히어로 카드 워시)
         self._shine = 1.0          # 1.0 = 정적/종료 상태
         self._reveal = 1.0
         self._anim = None
         self._panel_ref = None
-
-    def set_tint(self, tint: str):
-        self._tint = tint
-        self.update()
 
     def start(self, delay: int = 0):
         self._shine = 0.0
@@ -623,7 +614,6 @@ class AnimatedNumberLabel(QLabel):
         self._color = color or current_palette()["text"]
         self._duration = duration
         self._anim = None
-        self._pop = None
         self._apply_style(1.0)
         # 최종 폭 + 팝 확대분(7%) 예약 — 전역 QSS와 같은 Pretendard 기준 측정.
         f = QFont(self.font())
@@ -1175,7 +1165,7 @@ class ResultPanel(QWidget):
 
     def _mesh_image(self) -> QImage:
         """유리 카드가 샘플링하는 '유리 뒤 배경' — 배경을 저해상도로 리샘플(=블러).
-        블러된 책 디테일이 프로스트 유리 너머로 은은히 비쳐 유리감을 살린다."""
+        블러된 오로라 배경이 프로스트 유리 너머로 은은히 비쳐 유리감을 살린다."""
         if self._mesh_cache is not None:
             return self._mesh_cache[1]
         bg = self._bg_image()
@@ -1205,25 +1195,6 @@ class ResultPanel(QWidget):
             g.setColorAt(0.0, c)
             c0 = QColor(c); c0.setAlpha(0)
             g.setColorAt(1.0, c0)
-            p.fillRect(0, 0, bw, bh, QBrush(g))
-
-        # ── 유틸: 대각선 오로라 커튼(리본) ─────────────
-        #    angle(라디안)으로 회전한 선형 그라디언트 — 길쭉한 빛의 띠.
-        #    pos(0~1)는 커튼의 수직 위치, width는 커튼 폭(0~1).
-        def curtain(color, angle, pos, width, alpha):
-            co = QColor(color)
-            # 그라디언트 시작/끝 — 회전된 축
-            dx = c_(angle) * bw
-            dy = s(angle) * bh
-            cx, cy = bw * 0.5, bh * pos
-            g = QLinearGradient(cx - dx, cy - dy, cx + dx, cy + dy)
-            c1 = QColor(co); c1.setAlpha(0)
-            c2 = QColor(co); c2.setAlpha(alpha)
-            c3 = QColor(co); c3.setAlpha(0)
-            hw = width * 0.5
-            g.setColorAt(max(0.0, 0.5 - hw), c1)
-            g.setColorAt(0.5, c2)
-            g.setColorAt(min(1.0, 0.5 + hw), c3)
             p.fillRect(0, 0, bw, bh, QBrush(g))
 
         if dark:
@@ -1519,9 +1490,13 @@ class ResultPanel(QWidget):
         self._anims.append((n, delay))
         return n
 
-    def _glass(self, tint: str = "default", shine_delay: int = 0) -> GlassCard:
-        """GlassCard 등록 — 메시/그림자 갱신 대상 + shine sweep 예약."""
-        g = GlassCard(tint)
+    def _glass(self, shine_delay: int = 0) -> GlassCard:
+        """GlassCard 등록 — 메시/그림자 갱신 대상 + shine sweep 예약.
+
+        ⚠ 모든 카드는 **완전히 같은 모양**으로 그린다(사용자 지시 2026-07-08) — 카드별
+          강조 워시(옛 tint="accent")는 다른 카드와 배경이 달라 보여 지웠다.
+        """
+        g = GlassCard()
         self._glass_cards.append(g)
         self._anims.append((g, shine_delay))
         return g
@@ -1952,21 +1927,9 @@ class ResultPanel(QWidget):
         left.addWidget(name)
 
         # 절약 시간 = 페이지 수 기반 수작업 예상(1인 8시간=100쪽) − 로그 시작~종료
-        # 실제 소요(occ*30초 같은 어림 가정 아님 — 실측 로그 기반).
+        # 실제 소요(occ*30초 같은 어림 가정 아님 — 실측 로그 기반). 헤더 우측 플립
+        # 시계(_SavedTimeClock)가 그린다.
         saved_hm = self._saved_time_hm()
-        if saved_hm:
-            sh, sm = saved_hm
-            if sh and sm:
-                saved_txt = f"약 {sh}시간 {sm}분"
-            elif sh:
-                saved_txt = f"약 {sh}시간"
-            elif sm:
-                saved_txt = f"약 {sm}분"
-            else:
-                saved_txt = ""
-        else:
-            saved_txt = ""
-        saved = f" · 수작업 대비 {saved_txt} 절약" if saved_txt else ""
         if errata_only:
             m = self._out_mode()
             if m == "memo":
@@ -1980,7 +1943,7 @@ class ResultPanel(QWidget):
         elif review_mode:
             detail = f"검수 완료 · 정오표 {flagged}건 기록 (HWP 미수정)"
         else:
-            detail = f"완료"
+            detail = "완료"
         ts = QLabel(f'<b style="color:{pal["text"]};">{html.escape(self._completed_at)}</b>'
                     f'<span style="color:{pal["text_sub"]};"> {html.escape(detail)}</span>')
         ts.setStyleSheet("font-size:14px; background:transparent; border:none;")
@@ -1999,8 +1962,8 @@ class ResultPanel(QWidget):
 
     # ── 파이프라인 히어로 ─────────────────────────
     def _stage_card(self, num: str, title: str, sub: str, *,
-                    tint: str = "default", shine_delay: int = 0):
-        f = self._glass(tint, shine_delay)
+                    shine_delay: int = 0):
+        f = self._glass(shine_delay)
         f.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         v = QVBoxLayout(f)
         v.setContentsMargins(28, 20, 28, 20)
@@ -2102,14 +2065,14 @@ class ResultPanel(QWidget):
         row.addWidget(self._rise(f2, self._T_CARD2), 1)
         row.addWidget(self._connector(self._T_CARD3))
 
-        # 03 적용(또는 정오표/메모/주석/검수) — 히어로 숫자(강조색 글래스)
+        # 03 적용(또는 정오표/메모/주석/검수) — 히어로 숫자
         if errata_only:
             # ⚠ '적용'이라 쓰지 않는다 — 이 세 모드는 문서 글자를 고치지 않았고,
             #   반영은 사람이 한다. 숫자는 '반영해야 할 건수'다.
             title, sub = self._OUT_CARD3.get(
                 self._out_mode(), self._OUT_CARD3["errata"])
             f3, v3 = self._stage_card("03", title, sub,
-                                      tint="accent", shine_delay=self._T_CARD3 + 560)
+                                      shine_delay=self._T_CARD3 + 560)
             v3.addLayout(self._unit_row(
                 self._num(to_apply, px=50, color=pal["accent"],
                           delay=self._T_CARD3 + 380, duration=1700), "건", unit_px=18))
@@ -2129,13 +2092,13 @@ class ResultPanel(QWidget):
             self._card_meta(v3, meta)
         elif review_mode:
             f3, v3 = self._stage_card("03", "검수", "정오표 기록 · HWP 미수정",
-                                      tint="accent", shine_delay=self._T_CARD3 + 560)
+                                      shine_delay=self._T_CARD3 + 560)
             v3.addLayout(self._unit_row(
                 self._num(flagged, px=50, color=pal["accent"],
                           delay=self._T_CARD3 + 380, duration=1700), "건", unit_px=18))
         else:
             f3, v3 = self._stage_card("03", "적용", "최종 교정 반영",
-                                      tint="accent", shine_delay=self._T_CARD3 + 560)
+                                      shine_delay=self._T_CARD3 + 560)
             v3.addLayout(self._unit_row(
                 self._num(applied, px=50, color=_success_color(),
                           delay=self._T_CARD3 + 380, duration=1700), "건", unit_px=18))
@@ -2163,7 +2126,7 @@ class ResultPanel(QWidget):
         """글래스 섹션 카드 등록 헬퍼. 반환: (frame, body_layout).
         hero_title=True면 아이콘 없이 파이프라인 히어로 카드(_stage_card)와
         동일한 제목 스타일(px=20, weight=800)을 쓴다(차트 카드 3장 전용)."""
-        frame = self._glass("default", shine_delay)
+        frame = self._glass(shine_delay)
         frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         lay = QVBoxLayout(frame)
         lay.setContentsMargins(28, 20, 28, 20)

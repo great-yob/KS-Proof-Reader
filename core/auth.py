@@ -488,18 +488,6 @@ def change_password(current_password: str, new_password: str) -> dict:
     return {"ok": False, "error": _error_text(status, js, "비밀번호를 변경하지 못했습니다.")}
 
 
-def must_change_password() -> bool:
-    """초기 비밀번호 계정이라 변경이 강제되는가(서버 프로필 기준)."""
-    u = current_user()
-    return bool(u) and bool(u.get("must_change_password"))
-
-
-def can_change_password() -> bool:
-    """앱에서 비밀번호를 바꿀 수 있는 계정인가(앱 전용 회원만 — 직원은 ks-works에서)."""
-    u = current_user()
-    return bool(u) and bool(u.get("can_change_password"))
-
-
 def can_contribute() -> bool:
     """공유 뇌 이벤트에 기여하는 계정인가(서버 프로필 brain_access).
 

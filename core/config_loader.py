@@ -1,14 +1,13 @@
 """
 core/config_loader.py — API 키 및 설정 로더
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-config.ini 읽기/쓰기, 암호화된 조직 키 복호화, 사용자 키 관리
+config.ini 읽기/쓰기, 암호화된 조직 키 복호화
 """
 
 import configparser
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
 
 def _get_base_dir() -> Path:
@@ -151,14 +150,6 @@ class ConfigLoader:
 
         return ""
 
-    def set_gemini_key(self, key: str):
-        """사용자가 직접 입력한 키를 config.ini에 저장"""
-        self._set("API", "GEMINI_API_KEY", key)
-
-    def has_valid_gemini_key(self) -> bool:
-        key = self.get_gemini_key()
-        return bool(key) and key != "YOUR_API_KEY_HERE"
-
     # ── NIKL 사전 API 키 (우리말샘 OpenAPI) ───────────
     #   로컬 stdict.db가 놓친 단어를 라이브 우리말샘으로 확인하는 캐싱 폴백에 사용.
     #   우선순위: 환경변수 NIKL_API_KEY → config.ini [API] NIKL_API_KEY → 빈 문자열.
@@ -213,7 +204,7 @@ class ConfigLoader:
             "password": pick("SUPABASE_PASSWORD", "PASSWORD"),
         }
 
-    # ── 서버/앱 설정 ──────────────────────────────────
+    # ── 앱 설정 ──────────────────────────────────────
 
     def _getint(self, section: str, key: str, fallback: int) -> int:
         """정수 설정 — 값이 숫자가 아니어도 예외 대신 기본값(손으로 고친 config.ini 대비)."""
@@ -221,9 +212,6 @@ class ConfigLoader:
             return self._cfg.getint(section, key, fallback=fallback)
         except ValueError:
             return fallback
-
-    def get_server_port(self) -> int:
-        return self._getint("SERVER", "PORT", 8765)
 
     def get_window_size(self) -> tuple:
         return self._getint("APP", "WIDTH", 1400), self._getint("APP", "HEIGHT", 860)

@@ -28,7 +28,6 @@
 
 import io
 import os
-import re
 import struct
 import zipfile
 import zlib

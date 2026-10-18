@@ -21,10 +21,13 @@ pypdfium2>=4.30.0
 pypdf>=5.0.0
 
 # ── 형태소 분석 (활용형→기본형 복원, 사전 검증 정밀화) ──
-# 순수 C++ · JVM 불필요 · Windows 휠 제공. 모델은 kiwipiepy_model로 자동 동봉(~88MB).
-# 미설치 시 앱은 동작하되 활용형 보정만 비활성(graceful).
-# 빌드(Nuitka/PyInstaller)는 kiwipiepy + kiwipiepy_model 데이터를 반드시 포함할 것.
-kiwipiepy>=0.20.0
+# 순수 C++ · JVM 불필요 · Windows 휠 제공. 모델 패키지 kiwipiepy_model이 의존성으로 함께 설치된다.
+# 미설치 시 앱은 동작하되 형태소 기반 보정(활용형 복원·띄어쓰기 백스톱·인명 가드)이 꺼진다.
+# ⚠ **버전 고정** — 모델은 라이브러리 마이너 버전에 묶여 있고(0.23.2 ↔ model 0.23.0), 배포본은
+#   모델을 PyInstaller에서 **빼서** 데이터 패키지(data/kiwipiepy_model)로 따로 싣는다.
+#   마이너가 바뀌면 build_dist.verify()가 빌드를 실패시키고 데이터 패키지도 다시 내야 한다.
+#   올릴 때는 run_goldset.py로 전후를 비교할 것(CLAUDE.md · 메모리 kiwi-model-split-and-crash-guard).
+kiwipiepy==0.23.2
 
 # ── API 키 암호화 (빌드 시) ──────────
 cryptography>=41.0.0
@@ -36,5 +39,6 @@ cryptography>=41.0.0
 
 # ── 빌드 도구 (개발 전용 — 배포본 빌드 PC에만 필요) ──
 # build_dist.py가 쓴다. 형제 프로젝트(KS-Works-Utility)도 파이썬 워커를 PyInstaller로 빌드한다.
+# ⚠ HWP 브리지(bridge32)는 **32비트 Python 3.11 + pywin32 + pyinstaller**로 따로 얼린다(CLAUDE.md).
 # pyinstaller>=6.0
 # Pillow>=10.0        # assets/icon.ico 생성용(1회성). 런타임 불필요.

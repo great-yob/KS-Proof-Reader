@@ -62,7 +62,7 @@ def head_of(orig: str, corr: str) -> str:
 
     ⚠ 이름의 '머리(head)'는 국어 복합명사의 **핵**, 즉 마지막 성분이라는 뜻이다.
       문자열 위치로는 **꼬리**다(`…모델`). `Correction.spacing_family[0]`이 이 값이라
-      이름을 유지한다 — 새 코드는 `key_of(o, c, TAIL)`을 쓸 것.
+      이름을 유지한다.
     """
     return _spaced_form(orig, corr).split(" ")[-1]
 
@@ -70,11 +70,6 @@ def head_of(orig: str, corr: str) -> str:
 def lead_of(orig: str, corr: str) -> str:
     """이 교정이 속한 **머리 계열** — 복합명사의 첫 성분('기술 개발' → '기술')."""
     return _spaced_form(orig, corr).split(" ")[0]
-
-
-def key_of(orig: str, corr: str, axis: str = TAIL) -> str:
-    """`axis` 계열의 키 낱말."""
-    return lead_of(orig, corr) if axis == LEAD else head_of(orig, corr)
 
 
 def family_label(family: dict) -> str:

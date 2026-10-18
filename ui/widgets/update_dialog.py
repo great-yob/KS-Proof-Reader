@@ -112,14 +112,42 @@ def _mb(n: int) -> str:
     return f"{n / (1024 * 1024):.1f}MB"
 
 
+# 창이 닫힌 뒤에도 소켓 읽기에 묶여 끝나지 않은 다운로드 워커(UpdateDialog.reject 참조).
+#   부모에서 떼어 여기서 붙들고 있다가, 끝나면 받아진 파일을 지우고 스스로 빠진다.
+_ORPHANS: set = set()
+
+
+def _discard_late(path):
+    """창이 닫힌 뒤에야 끝난 다운로드 — 설치할 사람이 없으니 지운다(취소·실패면 None)."""
+    if path:
+        from core import updater
+        updater.discard_download(path)
+
+
+def stop_orphan_downloads():
+    """앱 종료 직전(MainWindow.closeEvent) — 아직 묶여 있는 고아 다운로드를 강제 종료한다.
+
+    결과를 버려도 되는 순수 네트워크 대기라 업데이트 확인 워커와 같은 관례(짧게 기다린 뒤
+    terminate)를 쓴다. 이때만은 받다 만 ksproof-upd-* 폴더가 %TEMP%에 남을 수 있다.
+    """
+    for w in list(_ORPHANS):
+        try:
+            if w.isRunning() and not w.wait(300):
+                w.terminate()
+                w.wait(500)
+        except Exception:
+            pass
+    _ORPHANS.clear()
+
+
 class UpdateDialog(QDialog):
     """새 버전 안내 → 다운로드 → 설치 준비 완료까지의 한 창.
 
-    다운로드가 끝나면 `ready(channel, zip_path)`를 내보내고 창은 열린 채
-    '재시작' 확인 상태로 바뀐다. 사용자가 재시작을 누르면 `apply_requested`.
+    다운로드가 끝나면 창은 열린 채 '재시작' 확인 상태로 바뀐다. 사용자가 재시작을
+    누르면 `apply_requested`(설치는 MainWindow가 한다). ⚠ 그러지 않고 닫히면('나중에'·
+    Esc) 받은 zip을 지운다(`reject`) — 남겨 두면 미룰 때마다 %TEMP%에 한 벌씩 쌓인다.
     """
 
-    ready           = Signal(str, object)   # (channel, zip_path)
     apply_requested = Signal(str, object)   # (channel, zip_path)
 
     def __init__(self, parent, info: dict, channel: str = "app"):
@@ -248,7 +276,6 @@ class UpdateDialog(QDialog):
             return
 
         self._zip = path
-        self.ready.emit(self._channel, path)
         self._bar.setValue(100)
         self._bar.setVisible(False)
         if self._channel == "data":
@@ -271,7 +298,30 @@ class UpdateDialog(QDialog):
             self.move(geo.center() - self.rect().center())
 
     def reject(self):
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.request_stop()
-            self._worker.wait(3000)
+        w = self._worker
+        if w is not None and w.isRunning():
+            w.request_stop()
+            if not w.wait(3000):
+                # ⚠ 소켓 읽기에 묶여 아직 안 끝났다(다운로드 타임아웃 30초 — 회선이 멈추면 흔하다).
+                #   이 창은 곧 MainWindow가 deleteLater로 지우는데, 자식인 이 QThread가 **실행 중에
+                #   파괴**되면 앱 전체가 죽는다(실측 0xC0000409, 2026-10-18 — Esc로 닫을 때).
+                #   부모에서 떼어 끝날 때까지 살려 두고, 그 사이 다 받아진 파일은 지운다
+                #   (취소·실패로 끝나면 download()가 받다 만 폴더를 스스로 지운다).
+                for sig, slot in ((w.done, self._on_downloaded), (w.progress, self._on_progress)):
+                    try:
+                        sig.disconnect(slot)
+                    except (RuntimeError, TypeError):
+                        pass
+                w.setParent(None)
+                _ORPHANS.add(w)      # 끝나도 바로 놓지 않는다 — 놓는 순간이 워커 스레드 안이면
+                #   마지막 참조와 함께 '실행 중 파괴'가 재발한다. 앱 종료 때 한꺼번에 정리
+                #   (stop_orphan_downloads). 끝난 QThread 몇 개의 메모리는 무시할 수준이다.
+                w.done.connect(_discard_late)
+                self._worker = None
+        # 받아 놓고 설치하지 않은 패키지 — 적용(accept) 경로는 여기를 지나지 않으므로
+        #   _zip이 남아 있으면 곧 '미룬' 다운로드다. 다음 실행은 어차피 새로 받는다.
+        if self._zip is not None:
+            from core import updater
+            updater.discard_download(self._zip)
+            self._zip = None
         super().reject()

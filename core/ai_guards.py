@@ -1586,7 +1586,7 @@ def drop_word_substitution_paraphrase(corrections: list, exists_fn, logger=None)
 #   is_known_form=True → 저신뢰 강등을 escape한다('고지사=고+지사'와 동일한 형태소 복합어
 #   사각지대). → validate가 쓰는 is_known_form을 **우회**하고 **직접 표제어 조회(exists_fn)** 로만
 #   등재 방향 반전을 판정해 드롭한다. exists_fn은 반드시 lookup_word 계열 '직접 표제어' 조회여야
-#   한다(is_valid_word/is_known_form을 주면 교정문이 통과해 무력화됨 — 워커가 lookup_word를 넘김).
+#   한다(형태소 구제가 붙은 is_known_form 계열을 주면 교정문이 통과해 무력화됨 — 워커가 lookup_word를 넘김).
 def _is_destandardizing_variant(c, exists_fn) -> bool:
     """c가 '등재 표준형 → 미등재 근접변이'로 되돌리는 반(反)표준화 AI 교정인가?
 

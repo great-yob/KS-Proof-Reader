@@ -6,7 +6,7 @@ core — KS-Proof Reader 코어 엔진 패키지
 
 import os
 
-from .models import Correction, HL_DICT, HL_PNU, HL_TYPO, HL_POLISH, DOC_WARN_CHARS
+from .models import Correction, HL_DICT, HL_TYPO, HL_POLISH, DOC_WARN_CHARS
 from .config_loader import ConfigLoader
 from .gemini_checker import GeminiChecker
 from .correction_merger import CorrectionMerger
@@ -51,7 +51,7 @@ def HwpEditor(file_path: str, *args, **kwargs):
 
 __all__ = [
     "Correction",
-    "HL_DICT", "HL_PNU", "HL_TYPO", "HL_POLISH", "DOC_WARN_CHARS",
+    "HL_DICT", "HL_TYPO", "HL_POLISH", "DOC_WARN_CHARS",
     "ConfigLoader",
     "GeminiChecker",
     "CorrectionMerger",

@@ -226,11 +226,6 @@ class FilePanel(QFrame):
             return
 
         name = os.path.basename(file_path)
-        try:
-            size_mb = os.path.getsize(file_path) / 1_048_576
-            meta = f"{size_mb:.1f} MB"
-        except OSError:
-            meta = ""
         self._file_name_lbl.setText(soft_breakable(name))
         self._file_name_lbl.setToolTip(name)   # 복사용 원본(ZWSP 없는 이름)
         self._file_meta_lbl.setText("아래 버튼을 눌러 교정 분석을 시작하세요.")

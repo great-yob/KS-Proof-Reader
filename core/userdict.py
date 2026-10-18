@@ -4,8 +4,8 @@ core/userdict.py — 사용자 용어 뇌(공유 학습 사전) 런타임 로더
 설계도: docs/userdict-layer-architecture.md (형제: core/eomun_rules.py)
 
 역할:
-  P. 결정론 사용자 페어 — lookup_pair()/batch_lookup_pair()로 사내 비표준→표준 매핑 조회
-                          (nikl_dict.lookup_norm/batch_lookup_norm, eomun_rules.lookup_eomun_pair와
+  P. 결정론 사용자 페어 — batch_lookup_pair()로 사내 비표준→표준 매핑 조회(워커 [5.6]).
+                          (nikl_dict.batch_lookup_norm·eomun_rules.batch_lookup_eomun_pair와
                           동일 시그니처). 동형이의어 가드는 빌드타임(build_userdict_db.py)에서 적용.
   E. 조직 예외(무교정) — is_exception()/exception_set()으로 조직 승인 표기를 조회.
                           재검증②/안전망⑤/띄어쓰기 백스톱⑦에서 교정·플래그를 *억제*하는 데 쓴다.
@@ -13,7 +13,6 @@ core/userdict.py — 사용자 용어 뇌(공유 학습 사전) 런타임 로더
 규율:
   · GUI-agnostic — PySide6 import 금지(core/ 규칙).
   · graceful — userdict.db 미존재/오류 시 빈 결과·None·False(사전·kiwi와 동일 degradation).
-  · 휴면 — 이 모듈을 import해 호출하기 전까지 런타임에 아무 영향 없음(DO-1).
   · 스레드 로컬 커넥션(nikl_dict·eomun_rules와 동일 패턴).
 
 배포: 서버(Supabase) 스냅샷을 pull해 build_userdict_db.py가 data/userdict.db를 만든다(DO-4).
@@ -31,7 +30,7 @@ from typing import Optional
 
 
 # ══════════════════════════════════════════════════════
-# ▌DB 경로 결정 (eomun_rules._resolve_db_path와 동일 우선순위)
+# ▌DB 경로 결정 — 후보 중 스냅샷 버전이 가장 높은 파일(_resolve_db_path 독스트링)
 # ══════════════════════════════════════════════════════
 
 def _snapshot_ver_of(p: Path) -> int:
@@ -132,24 +131,8 @@ def _nfc(s: str) -> str:
 
 
 # ══════════════════════════════════════════════════════
-# ▌역할 P — 결정론 사용자 페어 (nikl_dict.lookup_norm과 동일 시그니처)
+# ▌역할 P — 결정론 사용자 페어 (nikl_dict.batch_lookup_norm과 동일 시그니처)
 # ══════════════════════════════════════════════════════
-
-def lookup_pair(word: str) -> Optional[str]:
-    """사내 비표준 표기의 표준형을 반환(없으면 None). 동형이의어 가드는 빌드타임 적용."""
-    c = _conn()
-    if c is None:
-        return None
-    clean = re.sub(r"[^가-힣]", "", word).strip()
-    if len(clean) < 2:
-        return None
-    try:
-        row = c.execute("SELECT norm FROM userdict_pairs WHERE nonstd=? LIMIT 1",
-                        (clean,)).fetchone()
-        return row[0] if row else None
-    except sqlite3.Error:
-        return None
-
 
 def batch_lookup_pair(words: set, chunk_size: int = 500) -> dict:
     """사내 비표준→표준 매핑 배치 조회. 반환: {nonstd: norm}. DB 없으면 {} (graceful)."""

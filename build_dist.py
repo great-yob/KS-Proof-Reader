@@ -73,6 +73,31 @@ _EXCLUDE_PATTERNS = (
 )
 
 
+# ★빌드 셸이 번들을 오염시키지 않게 — PyInstaller에 넘기는 PATH를 정리한다(2026-10-18 실측).
+#   PyInstaller는 바이너리 의존성(Qt TLS 플러그인이 찾는 `libssl-3-x64.dll` 등)을 PATH에서도
+#   찾는다. Git Bash에서 빌드하면 PATH 앞쪽의 Git `mingw64\bin`에서 Git의 OpenSSL을 집어
+#   `_internal/`에 넣었다(PowerShell에서 만든 v1.8.5 릴리스본엔 없다) — **같은 커밋이 셸에
+#   따라 다른 번들**이 된다. Git·MSYS 계열 경로를 빼고 돌린다(`Git\cmd`의 git.exe는 둔다).
+_FOREIGN_PATH_MARKERS = ("\\git\\mingw", "\\git\\usr\\", "\\git\\bin\\",
+                         "\\msys64\\", "\\mingw64\\bin\\")
+# 위 경로에서만 오는 DLL — `verify()`가 산출물에서 발견하면 빌드를 무효로 본다(규칙을
+#   피해 간 경로가 생겨도 조용히 실리지 않게).
+_FOREIGN_DLLS = ("libssl-3-x64.dll", "libcrypto-3-x64.dll", "msys-2.0.dll")
+
+
+def _build_env() -> dict:
+    """PyInstaller용 환경 — PATH에서 Git·MSYS 계열 경로를 뺀 사본."""
+    env = dict(os.environ)
+    keep, dropped = [], []
+    for p in env.get("PATH", "").split(os.pathsep):
+        n = os.path.normcase(os.path.normpath(p)) + "\\" if p else ""
+        (dropped if n and any(m in n for m in _FOREIGN_PATH_MARKERS) else keep).append(p)
+    env["PATH"] = os.pathsep.join(keep)
+    if dropped:
+        print(f"  · PATH에서 셸 전용 경로 {len(dropped)}개 제외(Git·MSYS — 번들 오염 방지)")
+    return env
+
+
 def _excluded(p: Path) -> bool:
     s = str(p).replace("\\", "/")
     return any(pat in s for pat in _EXCLUDE_PATTERNS)
@@ -271,7 +296,7 @@ def build_bridge32(skip: bool = False, clean: bool = False) -> bool:
         cmd.append("--clean")
     cmd.append(str(ROOT / "core" / "hwp_bridge_worker.py"))
 
-    rc = subprocess.call(cmd, cwd=str(ROOT))
+    rc = subprocess.call(cmd, cwd=str(ROOT), env=_build_env())
     if rc != 0 or not exe.is_file():
         print(f"  ✗ 32비트 브리지 빌드 실패 (exit {rc})")
         return False
@@ -431,9 +456,10 @@ def build(console: bool, clean: bool) -> int:
         "--exclude-module", "pdfplumber",
         # ⚠ torch/transformers 계열은 **제거된 KoGEC(NLLB GEC) 엔진의 잔재**다.
         #   (KoGEC는 2026-06-17 전면 제거 — CLAUDE.md 참조. 재도입 금지)
-        #   .venv64엔 아직 남아 있어 PyInstaller가 끌어오는데, 소스 어디서도 import하지
-        #   않는다. 빼면 배포본이 약 960MB → 520MB로 줄고 자동 업데이트 다운로드도 그만큼
-        #   가벼워진다. ⚠ 나중에 검증된 로컬 모델을 도입한다면 이 제외부터 풀 것.
+        #   예전엔 .venv64에 남아 PyInstaller가 끌어왔다(배포본 약 960MB → 제외 후 520MB).
+        #   2026-10-18 venv에서 패키지 자체를 지웠고(약 0.8GB) KoGEC 모델 캐시(7GB)도 삭제했다 —
+        #   이 제외는 누가 실험용으로 다시 깔아도 배포본이 다시 비대해지지 않게 하는 값싼
+        #   안전망으로 남긴다. ⚠ 나중에 검증된 로컬 모델을 도입한다면 이 제외부터 풀 것.
         "--exclude-module", "torch",
         "--exclude-module", "transformers",
         "--exclude-module", "tokenizers",
@@ -450,7 +476,7 @@ def build(console: bool, clean: bool) -> int:
     cmd.append(str(ROOT / "main.py"))
 
     print("  실행:", " ".join(cmd[:8]), "…")
-    return subprocess.call(cmd, cwd=str(ROOT))
+    return subprocess.call(cmd, cwd=str(ROOT), env=_build_env())
 
 
 # ══════════════════════════════════════════════════════
@@ -521,6 +547,18 @@ def verify(outdir: Path) -> bool:
             print(f"  ✗ 브리지가 {bits}비트입니다 — 한/글 COM은 32비트 전용입니다")
         else:
             print(f"  ✔ {BRIDGE_DIR_NAME}/{BRIDGE_EXE_NAME} (32비트)")
+
+    # 빌드 셸에서 끌려온 외부 DLL(Git·MSYS 계열) — `_build_env()`가 막는다. 여기 걸리면
+    #   그 규칙을 피해 간 PATH가 있다는 뜻이니 규칙을 넓힐 것.
+    foreign = [p for d in (outdir / "_internal", outdir / BRIDGE_DIR_NAME / "_internal")
+               if d.is_dir() for p in d.glob("*.dll") if p.name.lower() in _FOREIGN_DLLS]
+    if foreign:
+        ok = False
+        print("  ✗ 빌드 셸의 외부 DLL이 번들에 실림(Git·MSYS PATH 누수):")
+        for p in foreign:
+            print(f"      {p.relative_to(outdir)}")
+    else:
+        print("  ✔ 외부 셸 DLL 없음")
 
     # 번들 내부에 데이터가 중복으로 들어가지 않았는지(분리 배포가 무의미해짐)
     dup = outdir / "_internal" / "data" / "stdict.db"

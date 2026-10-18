@@ -172,7 +172,7 @@ def main():
         build_norm_map.build(export_dir=d)
     except Exception as e:
         print(f"  ✗ norm_map 재생성 실패: {e}")
-        print(f"  ⚠ 수동 복구:  .\\.venv64\\Scripts\\python.exe build_norm_map.py")
+        print("  ⚠ 수동 복구:  .\\.venv64\\Scripts\\python.exe build_norm_map.py")
     print("검증을 위해:  python nikl_dict.py  또는  아래 자동 검증")
 
     # ── 검증 ──
