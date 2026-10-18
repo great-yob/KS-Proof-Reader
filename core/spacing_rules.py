@@ -68,9 +68,17 @@ def _is_abbrev_dot(tok: str, i: int) -> bool:
     return not run.islower()
 
 
+# 한 음절씩 마침표로 끊은 **한글 머리글자 약칭**(“가.나.다” 꼴 — 실원고에선 지자체 사업명이었다).
+#   라틴 약어의 1글자 런 예외(U.S.A — _is_abbrev_dot ①)와 같은 판정을 한글에 적용한다.
+#   ⚠ **세 음절 이상 사슬일 때만**: 두 음절('것.그 다음')은 문장 끝 1음절 어절 뒤에 띄어쓰기가
+#     빠진 진짜 오류일 수 있다. 실측(2026-10-19): 이 꼴의 카드가 사용자에게 19회 거절됐다.
+_HANGUL_ABBREV_RE = re.compile(r"(?<![가-힣])[가-힣](?:\.[가-힣]){2,}(?![가-힣])")
+
+
 def _fix_token(tok: str) -> str:
     inserts = []   # 공백을 삽입할 위치(해당 인덱스 '앞')
     n = len(tok)
+    _ko_abbr = [(m.start(), m.end()) for m in _HANGUL_ABBREV_RE.finditer(tok)]
     for i in range(1, n - 1):
         c = tok[i]
         prev, nxt = tok[i - 1], tok[i + 1]
@@ -85,6 +93,9 @@ def _fix_token(tok: str) -> str:
                 continue
             # 약어(U.S.·etc.)·소수점 예외는 라틴 문맥에서만 — 한글 뒤 마침표는 문장부호다.
             if c == "." and prev.isascii() and _is_abbrev_dot(tok, i):
+                continue
+            # 단, 한 음절씩 끊은 한글 약칭 사슬('가.나.다') 안의 점은 문장부호가 아니다.
+            if c == "." and any(s < i < e for s, e in _ko_abbr):
                 continue
             inserts.append(i + 1)                    # 부호 '뒤'에 공백
             continue

@@ -19,10 +19,12 @@ from functools import lru_cache
 
 # 내용 형태소(어휘 의미를 갖는) 태그 — 조사(JK*)·어미(E*)·기호(S*) 등은 제외.
 #   V : 용언(동사 VV·형용사 VA·보조용언 VX, 불규칙 VV-I/VA-I 포함) → 기본형에 '다' 부착
-#   N : 체언(일반/고유/의존 명사) → 표면형이 곧 기본형
+#   N : 체언 → 표면형이 곧 기본형. 태그 집합은 아래 `_NOMINAL` **하나**다(XSN·XPN 포함).
 #   X : 어근(XR) → 표면형 사용
+#   ⚠ `_NOMINAL`을 여기 따로 정의하지 말 것 — 예전엔 5개 태그 정의가 여기 있었지만 아래 재정의에
+#     import 시점에 덮여 **어디서도 쓰이지 않았고**, analyze_bases·looks_like_typo는 실제로 줄곧
+#     7개 태그(아래)로 동작했다. 둘을 갈라 놓으면 동작이 조용히 바뀐다(2026-10-19 정리, 동작 무변경).
 _VERBAL = ("VV", "VA", "VX")
-_NOMINAL = ("NNG", "NNP", "NNB", "NR", "NP")
 
 _kiwi = None
 _kiwi_lock = threading.Lock()
@@ -356,6 +358,14 @@ def _noun_josa_base(span, pos: int, eojeol: str, common_only: bool = False):
     if len(span) < 2:
         return None
     j = len(span)                       # 끝에서부터 조사 런을 떼어 낸다
+    # ★서술격 조사 '이다'의 **종결형**도 조사 꼬리로 본다(학교문법상 '이다'는 서술격 조사다).
+    #   2026-10-19 실측: "중복 실행을 막는 고유 **키다.**"(키+이다 축약)를 규범표기 '키다→키우다'가
+    #   high 카드로 고쳤다 — kiwi는 키/NNG + 이/VCP(표면 0자) + 다/EF로 읽는데 조사(J*)만 보던
+    #   이 판정이 비켜 갔다. 'X다'꼴 norm_map 키(나리다→내리다·체다→체더…)가 같은 지뢰다.
+    #   ⚠ **종결어미(EF)일 때만** — 연결어미 '다'(EC)는 '비가 나리다 그쳤다'처럼 진짜 용언이고,
+    #     '체다 치즈'·'캔디다 감염'은 kiwi가 애초에 명사로 읽어 여기 오지 않는다(실측 9문맥 일치).
+    if len(span) >= 3 and span[-1].tag == "EF" and span[-2].tag == "VCP":
+        j = len(span) - 2
     while j > 0 and span[j - 1].tag.startswith("J"):
         j -= 1
     if j == 0 or j == len(span):        # 조사가 없거나 전부 조사 → 해당 없음
@@ -911,6 +921,19 @@ def find_spacing_suggestions(text: str, min_len: int = 2) -> list:
             pv = tokens[i - 1]
             if (pv.tag == "MM" and len(pv.form) == 1 and pv.form in _SURNAMES
                     and t.tag in ("NNG", "NNP") and len(t.form) == 1):
+                continue
+            # 어절 한가운데 관형사 가드 — **일반명사 바로 뒤**의 MM은 관형사가 아니다. 관형사는
+            #   낱말의 머리에 서는 품사라, 명사에 붙은 채 어절 안에 끼어 있다면 kiwi가 복합어 속
+            #   음절을 관형사로 오독한 것이다(2026-10-19 실측: '중윗값을'→'중윗 값을'(중/NNG+윗/MM)·
+            #   사업명 '희망두배'→'희망두 배'·'청소년한부모…'→'청소년한 부모…' — 사용자가
+            #   거절해 온 부류). 설령 띄어쓰기 오류라 해도('사업단각팀') 이 컷은 '사업단각 팀'만 만들어
+            #   여전히 틀린 문장을 제안한다.
+            #   ⚠ **사람 이름 + 직함은 걸지 않는다** — '성+이름'이 붙은 '…의원'·'…교수'는 kiwi가
+            #     이름 끝 음절을 MM으로 읽는데('최영석의원' = 최영/NNP+석/MM+의원) '최영석 의원'이
+            #     옳다(사용자도 수락해 온 카드). 앞이 고유명사(NNP)면 애초에 NNG 조건에서 빠지고,
+            #     이름을 NNG로 오독한 '조영석의원'(조영/NNG+석/MM)은 이름 꼴 검사로 뺀다.
+            if (pv.tag == "MM" and i >= 2 and tokens[i - 2].tag == "NNG"
+                    and not looks_like_korean_name(tokens[i - 2].form + pv.form)):
                 continue
             if pv.tag in ("MM", "NR"):
                 # 사전-명사 가드 — kiwi가 등재 명사를 관형사+의존명사로 오분석한 경우 스킵.

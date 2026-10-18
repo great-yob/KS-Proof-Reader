@@ -27,6 +27,35 @@ _PAREN_JOSA_RE = re.compile(
     r"([가-힣]+)[ ]?\(([^()]{0,60})\)(으로|로|은|는|이|가|을|를|과|와)(?=$|[^가-힣])"
 )
 
+# 괄호 안이 **번호·참조 라벨**이면 조사는 괄호 앞 체언이 아니라 그 라벨의 읽음에 호응한다.
+#   '식 (4)와'(라벨 낱말이 괄호 밖)와 '(식 1)과'·'(표 2)를'(라벨 낱말이 괄호 안)이 같은 부류다.
+#   ⚠ 2026-10-19 실측(20원고 코퍼스): 라벨 낱말이 괄호 **안**에 든 '하단의 (식 1)과 같다'를
+#     순수 숫자 판정이 놓쳐, 앞말 '하단의'(조사 '의'로 끝남)에 호응시킨 '하단의(식 1)와'가
+#     high 카드로 나갔다('식 일과'라 원문 '과'가 맞다). 공백 제거까지 겹친 오교정이다.
+_LABEL_INNER_RE = re.compile(
+    r"\s*(?:식|수식|표|그림|도표|도|부록|사진|예)?\s*\d[\d\s.,·\-]*")
+
+# 괄호 안 말을 **앞말에 이어 읽는** 관행이 있는 경우 — 조사를 그 읽음에 맞춰도 옳다.
+#   '고시(안)은'·'프로세스(안)을'은 '고시안은'·'프로세스안을'로 읽는 행정 문서의 표준 표기다
+#   (국립국어원 답변의 원칙: 괄호 안 말을 읽으면 그 말에, 읽지 않으면 앞말에 맞춘다).
+#   2026-10-19 실측: '(안)' 6건이 전부 '…(안)는/를'로 **틀린 쪽으로** 고쳐지는 high 카드였다.
+#   그래서 두 읽음 중 **어느 쪽에든** 맞으면 저자 표기로 두고, 둘 다 어긋날 때만 고친다
+#   ('계획(안)를'은 계획·안 모두 받침이 있어 여전히 '계획(안)을'로 교정된다).
+#   값은 괄호 안 글자 → 읽는 음절. 목록을 늘릴 땐 실문서 발화를 재측정할 것.
+_READ_THROUGH_INNER = {"안": "안", "案": "안"}
+
+
+def _paren_josa_form(syll: str, josa: str):
+    """음절 `syll` 뒤에 올 받침 호응 조사 형태(find_paren_josa 전용). 판정 불가면 None."""
+    jong = _jongseong(syll)
+    if jong is None:
+        return None
+    has_batchim = jong != 0
+    if josa in ("으로", "로"):
+        # 받침 없거나 ㄹ받침(8) → '로', 그 외 받침 → '으로'
+        return "로" if (not has_batchim or jong == 8) else "으로"
+    return _FORM[josa][0 if has_batchim else 1]
+
 
 def _jongseong(syll: str):
     """음절의 종성(받침) 인덱스. 한글 음절이 아니면 None. 0이면 받침 없음, 8이면 ㄹ받침."""
@@ -79,20 +108,20 @@ def find_paren_josa(text: str) -> list:
         #   저자의 '와'가 옳다. 호응 대상이 모호하고(번호를 읽어 넘기는지/건너뛰는지) 저자가
         #   대개 맞게 쓰므로 **건드리지 않는다**(과교정 방지, 사용자 보고). '식'과 '(' 사이
         #   공백도 라벨 표기의 의도된 간격이라 제거하지 않는다(이 분기에서 통째로 스킵되므로).
-        if re.fullmatch(r"\s*\d[\d\s.,·\-]*", inner):
+        #   라벨 낱말이 괄호 안에 든 '(식 1)과'도 같은 부류다(_LABEL_INNER_RE 주석).
+        if _LABEL_INNER_RE.fullmatch(inner):
             continue
-        jong = _jongseong(noun[-1])
-        if jong is None:
+        # ⚠ 괄호 안이 비었으면 건너뛴다 — 수식·기호 개체가 텍스트 추출에서 빠진 자리다
+        #   (2026-10-19 실측: 원고 '평균(μ)와 표준편차(σ)는'이 '평균()와 표준편차()는'으로
+        #   추출돼 '평균()과'로 고쳐졌다. 저자는 'μ[뮤]'에 맞춰 '와'를 썼다 — 읽는 말을 모른다).
+        if not inner.strip():
             continue
-        has_batchim = jong != 0
-
-        if josa in ("으로", "로"):
-            # 받침 없거나 ㄹ받침(8) → '로', 그 외 받침 → '으로'
-            correct = "로" if (not has_batchim or jong == 8) else "으로"
-        else:
-            correct = _FORM[josa][0 if has_batchim else 1]
-
-        if correct == josa:
+        correct = _paren_josa_form(noun[-1], josa)
+        if correct is None or correct == josa:
+            continue
+        # 괄호 안 말을 이어 읽는 관행('고시(안)은')이면 그 읽음에 맞은 조사도 옳다.
+        _read = _READ_THROUGH_INNER.get(inner.strip())
+        if _read and _paren_josa_form(_read, josa) == josa:
             continue
         original = m.group(0)
         corrected = f"{noun}({inner}){correct}"
@@ -126,6 +155,8 @@ def find_batchim_josa(text: str) -> list:
         kiwi = None
     if kiwi is None or not text:
         return []
+    # 줄(문단·표 칸)의 마지막 어절 — 아래 가드 ② 판정용.
+    line_final = {ln.split()[-1] for ln in text.split("\n") if ln.split()}
     out, seen = [], set()
     for w in text.split():
         if w in seen or len(re.sub(r"[^가-힣]", "", w)) < 2:
@@ -163,6 +194,29 @@ def find_batchim_josa(text: str) -> list:
             corr = _NOBATCHIM_FORM[f]
         else:
             continue
+        # ── 조사가 아니라 **낱말의 끝음절**인 자리 — 2026-10-19 코퍼스 실측(20원고) ──────────
+        #   이 규칙의 후보 19건이 정탐 9 · 오탐 10이었다(오탐도 전부 high 카드 — '정신건강관리과'→
+        #   '정신건강관리와' 같은 부서명 7건, 인용 저자명 '김소은'→'김소는' 꼴 2건, '진료과' 1건).
+        #   ⚠ 품사로는 못 가른다: 받침이 어긋난 조사는 문법에 맞지 않아 kiwi가 조사로 읽지 못하고
+        #     1글자 명사(NNG)로 둔다 — 진짜 오탈자 '항공유과'·'필요을'도, 부서명의 '과(課)'도
+        #     똑같이 NNG다. 오탐 10건은 전부 아래 ①~③ 중 하나였고 정탐 9건은 하나도 해당하지 않았다.
+        #   ① 앞 체언 + 이 글자가 **사전 표제어**다 → 조사가 아니라 낱말의 일부('복지과'·'진료과').
+        if _morph._is_headword(w[prev.start:last.start + 1]):
+            continue
+        #   ② '과'가 **줄 끝**에 온다 → 뒤에 이을 말이 없어 공동격·접속 조사가 성립하지 않는다.
+        #      표 칸의 부서명('보건복지부⏎⏎정신건강관리과⏎')이 전부 이 모양이었다. '과(課·科)'는
+        #      낱말 끝음절로 흔하지만 '와'는 아니므로 '과'에만 건다(줄 끝 오탈자 '…팀와'는 계속 교정).
+        if f == "과" and w in line_final:
+            continue
+        #   ③ 성씨(1글자 고유명사)로 시작하는 3음절 한글 런 → 인명의 끝 글자('(김소은 외'의 '은').
+        #      바로 앞 형태소만 보는 위의 NNP 가드는 kiwi가 '김/NNP 소/NNG 은/NNG'로 쪼개면 비켜 간다.
+        rs = last.start
+        while rs > 0 and "가" <= w[rs - 1] <= "힣":
+            rs -= 1
+        if last.start + 1 - rs == 3 and any(
+                t.start == rs and t.tag == "NNP" and t.form in _morph._SURNAMES
+                for t in toks):
+            continue
         fixed = w[:last.start] + corr + w[last.start + 1:]
         if fixed != w:
             out.append((w, fixed))
@@ -174,8 +228,8 @@ def find_batchim_josa(text: str) -> list:
 #   -backstop]] ⑩). 그래서 **단독 단어로는 절대 쓰이지 않는 조사만** 다룬다 —
 #   '을'·'를'(목적격)과 '으로'(부사격)는 그 자체로 명사·동사가 될 수 없어(은=銀, 가=邊 같은
 #   동형이의 위험 없음) 한 어절로 떨어져 있으면 100% 앞 체언에 붙어야 할 조사다.
-#   '으로'는 붙일 때 앞 체언 받침에 호응시킨다(세종 으로→세종으로 / 학교 으로→학교로 —
-#   받침 없거나 ㄹ받침이면 '로'). 글자 불변 또는 받침 결정론, 문법상 확정 → high.
+#   붙일 때 앞 체언 받침에 호응시킨다(세종 으로→세종으로 / 학교 으로→학교로 — 받침 없거나
+#   ㄹ받침이면 '로' / 정책 를→정책을). 글자 불변 또는 받침 결정론, 문법상 확정 → high.
 #   (사용자 보고 2026-07-03: '세종 으로' 미탐 — 30.hwp)
 _ORPHAN_JOSA = frozenset({"을", "를", "으로"})
 _QUOTE_CHARS = "\"'“”‘’"
@@ -185,7 +239,7 @@ def find_orphan_josa(text: str) -> list:
     """앞 체언과 떨어져 단독 토큰이 된 조사('수요 를'·'세종 으로')를 붙인 후보를 만든다.
 
     인접 두 어절 A B가 **정확히 공백 1칸**으로 나뉘고, B가 통째로 '을'/'를'/'으로'이며, A가
-    한글로 끝나면 'A B'→'AB'로 붙인다('으로'는 A 받침에 호응해 으로/로 선택). 메타언어
+    한글로 끝나면 'A B'→'AB'로 붙인다(조사는 A 받침에 호응 — 으로/로·을/를 선택). 메타언어
     인용(조사 '를'…)을 피하려 양옆에 따옴표가 붙은 경우는 제외한다.
     반환 [(original, joined), …] (등장 순, 중복 제거).
     """
@@ -211,8 +265,11 @@ def find_orphan_josa(text: str) -> list:
             if orig in seen:
                 continue
             seen.add(orig)
-            # '으로'는 앞 체언 받침에 호응(받침 없음·ㄹ받침 → '로') — reconcile_josa 재사용
-            joined = A + (reconcile_josa(A, B) if B == "으로" else B)
+            # 붙일 때 앞 체언 받침에 호응시킨다 — reconcile_josa 재사용.
+            #   '으로'(받침 없음·ㄹ받침 → '로')뿐 아니라 '을/를'도 같다: 예전엔 '을/를'을 그대로
+            #   붙여 '정책 를'이 '정책를'(받침 ㄱ — '정책을'이어야 함)로 **틀린 채 high 카드**가 됐다.
+            #   붙인 형태는 원문에 없어 받침 조사 규칙(find_batchim_josa)이 뒤에서 잡지도 못한다.
+            joined = A + reconcile_josa(A, B)
             out.append((orig, joined))
     return out
 

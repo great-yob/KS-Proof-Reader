@@ -99,6 +99,7 @@ KS-Proof Reader — Korean-language proofreading tool for HWP (한/글) document
 - ⚠ `AI_CHUNK_TYPO`를 재현율 레버로 쓰지 말 것. 청크 크기도, 경계도, 구조 고정 청커도 실측으로 폐쇄됐다 — **재시도 금지**. 튜닝 상수는 `core/models.py`에서만 바꾼다.
 - 모델 체인 `3.5-flash-lite` → `3.1-flash-lite` → `3.5-flash`(무료 RPD 순)는 사용 불가 · 한도 소진 · 일시 오류에서 다음 모델로 넘어간다. **일간 429만** 그 모델을 차단한다. 분당 429는 차단도 고정 해제도 없이 넘어간다(RPM을 RPD로 취급하던 옛 동작으로 되돌리지 말 것).
 - Case B(편집거리 1 낱말 치환)는 재도입 금지다.
+- 결정론 계층에서 문자열 `set`을 순회하며 카드를 만들지 말 것 — 순회 순서가 프로세스마다 바뀌는 해시를 따라가 같은 원고의 카드 **순서**가 실행마다 달라진다. 등장 순 `dict.fromkeys(...)`를 쓴다.
 - 이음매 충돌은 자동 해결이 원리적으로 불가능하다 → 계층(낱말 자신의 다수 > 이음매 > 규범)으로 처리한다. 불변식: `original`은 절대 고치지 않는다 · 글자는 바꾸지 않는다(공백만) · 미탐 회복은 **붙은 것을 띄우기만** 한다(띄운 구를 붙이기 금지).
 - ★**사용자 첨부 사전**([core/user_dict_file.py](core/user_dict_file.py), 엑셀 A열 원문 · B열 교정문)은 **모든 계층보다 위**에 있다. 첨부가 없으면(`udict is None`) 계층 전체가 잠들어 기존 동작이 한 글자도 달라지지 않는다. 조직 공유 사전인 [core/userdict.py](core/userdict.py)와는 다른 것이다.
   - 진짜 보증은 직렬화 직전의 **`[9.7]` 최종 관문**이다 — 계층마다 검사를 심지 말 것. 판정식은 `violates` 한 곳뿐이다.
@@ -175,3 +176,4 @@ KS-Proof Reader — Korean-language proofreading tool for HWP (한/글) document
 - `core/` is GUI-agnostic — never import `PySide6` from `core/`. UI threading lives in `ui/workers/`.
 - Long-running checkers accept a `threading.Event` named `stop_event` and a `logger` callable; honor both.
 - 자동 검증은 둘이다: **골드셋** `eval/ai_goldset/run_goldset.py`(교정 판단 · 결정론 · 22초)와 **적용 경로 E2E** `eval/e2e_apply/run_e2e.py`(실제 한/글 · 진짜 클릭 · 교정본 재추출을 기대 문서와 대조 · 약 80초 · 기준선은 원고 옆 `<원고>.e2e.json`). 둘 다 `/release`가 돌린다. 그 밖에는 앱(`.\.venv64\Scripts\python.exe main.py`)을 실제 `.hwp`/`.hwpx`로 돌려 확인한다. `core/` 모듈은 GUI 비의존이라 REPL에서 바로 돌릴 수 있다.
+- 결정론 규칙을 바꿀 때는 **실원고 코퍼스 하네스** `eval/corpus_harness/run_corpus.py`(run before/after → diff)로 카드 변화를 한 장씩 판정한다(릴리스 게이트 아님). 원고 캐시는 `교정샘플/.corpus/`에만 둔다.

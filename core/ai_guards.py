@@ -958,7 +958,9 @@ def drop_glossed_name_substitution(ai_list: list, document_text: str, logger=Non
 # reconcile_josa 재사용. **조사 한 글자 형태만** 고치고 격 선택(주격→목적격)은 AI 판단 존중.
 _CLOSE_TO_OPEN = {")": "(", "）": "（", "]": "[", "〕": "〔", "】": "【"}
 _SWAP_JOSA = frozenset({"이", "가", "을", "를", "은", "는", "과", "와", "로", "으로"})
-_LABEL_INNER_RE = re.compile(r"\s*\d[\d\s.,·\-]*")   # 순수 번호/라벨 (josa_rules ⑯과 동일)
+# 순수 번호/참조 라벨('(4)'·'(식 1)') — 결정론 규칙과 **같은 판정**이어야 하므로 그쪽을 단일
+#   출처로 쓴다(따로 적어 두면 한쪽만 고쳐져 어긋난다 — 2026-10-19 '(식 1)' 확장 때 실제로 갈렸다).
+from core.josa_rules import _LABEL_INNER_RE   # noqa: E402
 
 
 def _single_diff(o: str, cr: str):

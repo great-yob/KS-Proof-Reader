@@ -118,7 +118,32 @@ def _canonical_base_correction(canon: Correction) -> tuple[str, str]:
         cand = canon.corrected[:-len(josa_o)].rstrip()
         if len(cand.replace(" ", "")) >= 2:
             base_c = cand
+    elif not josa_o and base_c != canon.corrected and (
+            len(base_c) < len(base_o) or _is_headword(canon.corrected)):
+        # ★원문은 **통낱말**로 읽혔는데 교정형에서만 꼬리가 떨어졌다 — 조사를 더한 교정이
+        #   아니라 kiwi가 교정형을 **단독 분석에서 오독**한 것이다(2026-10-19 발견).
+        #   '배지'를 배/NNG + 이/VCP + 지/EC('배이지')로, '토폴로지'를 토폴로+이지로 읽어 어간이
+        #   '배'·'토폴로'로 잘렸고, AI가 맨 낱말 '뱃지'→'배지'를 내면 아래 Case A가 조사 변형
+        #   '뱃지를'을 **'배를'**(high 카드 — 글자 '지' 삭제)로, Case 4가 '뱃지만들기'를
+        #   '배만들기'로 만들었다. norm_map 1.28만 쌍 중 338쌍이 같은 모양이다.
+        #   판정 둘 중 하나면 교정형 전체를 어간으로 쓴다:
+        #     · 교정형 어간이 원문 어간보다 **짧아졌다**(맞춤법 교정은 낱말 길이를 거의 보존한다)
+        #     · 교정형 **전체가 사전 표제어**다('배지'·'토폴로지' — 꼬리가 낱말의 일부라는 증거)
+        #   ⚠ 조사를 덧붙인 교정('분야'→'분야를'·'케릭터'→'캐릭터를')은 둘 다 아니라서(어간
+        #     길이 유지·'분야를'은 표제어 아님) 지금처럼 조사를 뗀 어간으로 전파된다.
+        base_c = canon.corrected
     return base_o, base_c
+
+
+def _is_headword(word: str) -> bool:
+    """`word`가 사전의 정확 표제어인가(_canonical_base_correction 전용). 사전 미가용 시 False."""
+    nd = _load_dict_module()
+    if nd is None:
+        return False
+    try:
+        return bool(nd._is_exact_headword(word))
+    except Exception:
+        return False
 
 
 # 시각적으로 안 보이거나 정상 텍스트 흐름을 방해하는 코드포인트.
@@ -254,7 +279,10 @@ def enforce_consistency(corrections: list, document_text: str, logger=None) -> l
             base_canonical[base] = c
 
     # 2. 문서에서 모든 한글 어절 추출 (이미 NFC 정규화됨)
-    doc_words = set(re.findall(r"[가-힣]+", document_text))
+    #   ⚠ 등장 순 유일 dict(set 금지) — 아래 Case A·Case 4가 이걸 순회하며 카드를 덧붙이는데,
+    #   set 순회 순서는 프로세스마다 바뀌는 문자열 해시를 따라가 실행마다 카드 **순서**가
+    #   달라진다(내용은 같다 — 2026-10-19 실측, 워커 [5.7]과 같은 원인). dict라 `in`도 O(1).
+    doc_words = dict.fromkeys(re.findall(r"[가-힣]+", document_text))
 
     # 2.5 사전 표제어 가드 — 멀쩡한 등재어를 부분매칭 전파로 훼손하지 않게 차단.
     #     · 명사/표제어: _build_known_words (사전 정확 일치)

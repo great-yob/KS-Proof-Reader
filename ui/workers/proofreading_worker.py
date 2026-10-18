@@ -620,7 +620,11 @@ class ProofreadingWorker(QThread):
                 import nikl_dict as _nd
                 from core import eomun_rules as _er
                 from core.consistency_pass import _strip_josa
-                doc_eojeols = set(re.findall(r"[가-힣]+", text))
+                from core.josa_rules import reconcile_josa as _rj
+                # ⚠ 등장 순 유일 목록(set 금지) — set 순회 순서는 프로세스마다 바뀌는 문자열 해시를
+                #   따라가서, 같은 원고인데 실행마다 카드 **순서**가 달라졌다(2026-10-19 실측:
+                #   20원고 중 11개, 내용은 동일). [5.7]·[5.8]도 같은 이유로 같은 목록을 쓴다.
+                doc_eojeols = list(dict.fromkeys(re.findall(r"[가-힣]+", text)))
                 bases = set(doc_eojeols)
                 for w in doc_eojeols:
                     b = _strip_josa(w)
@@ -648,7 +652,8 @@ class ProofreadingWorker(QThread):
                                 log(f"      · 사내 용어 충돌 '{key}': 사내 '{norm}' vs "
                                     f"국가 표준 '{std}' → 국가 표준 우선")
                                 break
-                            josa = w[len(key):] if w.startswith(key) else ""
+                            # 받침이 바뀌면 뒤 조사도 호응시킨다([5.7]·[5.8]과 동일 — '스윕과'→'스위프와').
+                            josa = _rj(norm, w[len(key):]) if w.startswith(key) else ""
                             corrected = norm + josa
                             if w != corrected and w not in existing:
                                 info = _ud.pair_info(key) or {}
@@ -682,7 +687,7 @@ class ProofreadingWorker(QThread):
                 import nikl_dict as _nd
                 from core.consistency_pass import _strip_josa
                 from core.josa_rules import reconcile_josa as _rj
-                doc_eojeols = set(re.findall(r"[가-힣]+", text))
+                doc_eojeols = list(dict.fromkeys(re.findall(r"[가-힣]+", text)))   # 등장 순([5.6] 주석)
                 bases = set(doc_eojeols)
                 for w in doc_eojeols:
                     b = _strip_josa(w)
@@ -761,7 +766,7 @@ class ProofreadingWorker(QThread):
                 import nikl_dict as _nd
                 from core.consistency_pass import _strip_josa
                 from core.josa_rules import reconcile_josa as _rj
-                doc_eojeols = set(re.findall(r"[가-힣]+", text))
+                doc_eojeols = list(dict.fromkeys(re.findall(r"[가-힣]+", text)))   # 등장 순([5.6] 주석)
                 bases = set(doc_eojeols)
                 for w in doc_eojeols:
                     b = _strip_josa(w)
