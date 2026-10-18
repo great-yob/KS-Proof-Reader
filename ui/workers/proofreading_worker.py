@@ -1087,6 +1087,14 @@ class ProofreadingWorker(QThread):
             except Exception:
                 _hanja_gloss = frozenset()
             skipped_gloss = 0
+            # 원어를 병기한 음역('힝스턴(Hinxton)'·'첸쉐선(钱学森)')·'(주)'가 붙은 회사 이름도 뺀다(㉚).
+            #   번역('내각보(Cabinet Office)')과 한자어 본문('과교융합(科教融合)')은 계속 검사한다.
+            try:
+                import nikl_dict as _nd
+                _marked = ai_guards.author_marked_names(text, _nd.sino_korean_syllables())
+            except Exception:
+                _marked = frozenset()
+            skipped_marked = 0
             # 빈도 가드 — 문서에서 여러 번 반복되는 미등재어는 작가 의도 용어
             #   (외래어·전문용어·고유명사·브랜드명)일 확률이 압도적이다(사용자 보고
             #   #2: '바이오' 16회). 진짜 오탈자는 보통 1~2회에 그치고, 빈출어는 AI가
@@ -1129,6 +1137,10 @@ class ProofreadingWorker(QThread):
                 # 한자 병기 독음('漢字(한글)') → 저자가 단 음역이므로 카드 제외(㉙)
                 if _hanja_gloss and (clean in _hanja_gloss or _fbase in _hanja_gloss):
                     skipped_gloss += 1
+                    continue
+                # 원어 병기 음역·회사 이름 → 저자가 정체를 밝혀 둔 고유명사이므로 카드 제외(㉚)
+                if _marked and (clean in _marked or _fbase in _marked):
+                    skipped_marked += 1
                     continue
                 # 따옴표로 영문과 붙은 한글 오타(예: 캐나가"Say)는 혼합 토큰이라 필터가
                 #   통째로 제외했다 → **따옴표가 섞인 경우에만** 한글 런만 떼어 검사·표시한다.
@@ -1198,6 +1210,9 @@ class ProofreadingWorker(QThread):
             if skipped_gloss:
                 log(f"  → 한자 병기 독음 {skipped_gloss}건 검수 카드 제외 "
                     f"('漢字(한글)' 형태의 저자 음역)")
+            if skipped_marked:
+                log(f"  → 원어 병기 고유명사 {skipped_marked}건 검수 카드 제외 "
+                    f"(원어를 적어 둔 음역 · '(주)'가 붙은 회사 이름)")
             # ⚠ **나머지 억제 사유도 반드시 남긴다.** 집계만 하고 로그가 없으면 미등재어가
             #   어느 단계에서 사라졌는지 사후 추적이 불가능하다 — `재산관` 미탐
             #   (2026-07-31)이 정확히 이 구멍이었다. 스크리닝은 통과했는데 여기

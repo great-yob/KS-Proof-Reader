@@ -645,7 +645,8 @@ def looks_like_typo(word: str, exists_fn) -> bool:
         구조적 빈틈을 표기 패턴으로 메운다.
       · 주성분에 고유명사(NNP)가 있으면 오타 아님(False) — 인명·지명 탈락.
       · 길이 2+ 기본형이 **2개 이상 사전에 있으면** 정상 복합어로 보고 False
-        — 예: '지역사회보장협의체'(여러 등재 명사의 결합).
+        — 예: '지역사회보장협의체'(여러 등재 명사의 결합). 1순위 분석이 통째 NNG면
+        2·3순위의 빈틈없는 분절로 본다(본문 주석).
       · 그 외(미등재 단일 토큰 등)는 오타 가능성 → True
         — 예: '상담채녈'·'케릭터'·'애니메니션'은 분석 안 되는 단일 미등재어.
 
@@ -659,7 +660,8 @@ def looks_like_typo(word: str, exists_fn) -> bool:
     if kiwi is None or not word:
         return True
     try:
-        tokens = kiwi.analyze(word)[0][0]
+        cands = kiwi.analyze(word, top_n=3)
+        tokens = cands[0][0]
     except Exception:
         return True
     content = [t for t in tokens
@@ -671,7 +673,22 @@ def looks_like_typo(word: str, exists_fn) -> bool:
         base = (t.form + "다") if t.tag.startswith(_VERBAL) else t.form
         if len(base) >= 2 and exists_fn(base):
             known += 1
-    return known < 2
+    if known >= 2:
+        return False
+    # 정상 복합어는 1순위 분석에 없을 수 있다 — kiwi(0.23)는 미등재 복합어를 **통째 NNG 하나**로 읽는
+    #   쪽을 1순위로 둔다('지역사회보장협의체' 1순위 = 단일 NNG, 3순위 = 지역/사회/보장/협의체). 위의
+    #   판정만으로는 이 docstring의 예시조차 오타 의심이었다(2026-10-19 코퍼스: 안전망 카드 448장 중
+    #   74장이 이렇게 남은 정상 복합어·기관명). 그래서 2·3순위에서 **빈틈없는 분절**을 찾는다 —
+    #   조각이 전부 2음절+ 등재 명사이고(끝의 조사만 허용) 2개 이상일 때. ⚠ 1순위보다 엄격한 이유:
+    #   복합어 속 오타는 대개 1음절 조각을 남긴다('지역사회보장혐의체' → …/혐의/체 · '재산관' → 재산/관).
+    for toks, _score in cands[1:]:
+        body = list(toks)
+        while body and body[-1].tag.startswith("J"):
+            body.pop()
+        if len(body) >= 2 and all(t.tag in ("NNG", "NNP") and len(t.form) >= 2
+                                  and exists_fn(t.form) for t in body):
+            return False
+    return True
 
 
 # 관형어(다른 품사) 뒤에 와서 띄어 써야 하는 명사 태그.

@@ -22,6 +22,7 @@ GUI-agnostic (PySide6 미사용) — core/ 규칙. 전부 **억제 방향(과교
 """
 
 import re
+import unicodedata
 
 # ── ② 괄호 구조 ────────────────────────────────────────────
 # 묶음표(괄호) 짝. AI는 청크 경계의 부분 스팬을 '미완 괄호'로 오인해 닫아버리거나(안정성(열산화
@@ -1725,6 +1726,94 @@ def hanja_gloss_readings(document_text: str) -> frozenset:
     if not document_text:
         return frozenset()
     return frozenset(m.group(1) for m in _HANJA_GLOSS_RE.finditer(document_text))
+
+
+# ══════════════════════════════════════════════════════════
+# ▌㉚ 원어를 병기한 음역 · 법인 표지 = 저자가 정체를 밝혀 둔 고유명사
+# ══════════════════════════════════════════════════════════
+# 2026-10-19 코퍼스(20원고, AI 켬): 사전 안전망 카드 448장의 상당수가 외래 고유명사였다 —
+# '힝스턴(Hinxton)'·'나카소네 야스히로(Yasuhiro Nakasone)'·'첸쉐선(钱学森)'·'쓰촨대학 (四川大学)',
+# 그리고 판권면의 인쇄소 '…미디어(주)'(11원고). ㉙와 같은 이유로 **모양이 정체를 확정한다**: 바로 뒤에
+# 원어를 적어 둔 음역은 표제어를 확인할 어휘가 아니고, '(주)'·'㈜'가 붙은 말은 회사 이름이다.
+#
+# ⚠ 막는 건 **음역**(원어의 소리를 옮긴 것)뿐이다. 번역('내각보(Cabinet Office)' — 내각부의 오타로
+#   보인다)과 한자어 본문('과교융합(科教融合)', ㉙의 역방향)은 한국어 낱말이라 계속 검사한다. 가르는 법:
+#   · 라틴 원어 — 원어가 대문자로 시작하고(고유명사 모양), 괄호 바로 앞 한글 낱말의 첫소리가 원어
+#     낱말의 첫 글자와 맞을 때. '힝스턴'↔Hinxton(ㅎ·H)은 음역, '내각보'↔Cabinet·Office(ㄴ)는 번역.
+#     원어는 첫 쉼표 앞까지만 본다('(Legend, 현 레노보)'). 소문자 원어('오즈비(odds ratio)')는 일반
+#     용어라 외래어 표기를 확인할 가치가 있어 남긴다. 낱말 순서가 뒤집힌 인명('나카소네 야스히로
+#     (Yasuhiro Nakasone)')이 있어 자리를 맞추지 않고 원어 낱말 아무것과 대 본다.
+#   · 한자 원어 — 한글에 한자음이 아닌 음절(nikl_dict.sino_korean_syllables)이 2개 이상일 때(첸·쉐·
+#     젠·궈·촨). 하나뿐이면 남긴다 — 한자어의 오타('개혁개빵(改革開放)')이거나 비표준 음역
+#     ('훗가이도현(北海道)' — 표준 홋카이도)일 수 있다. (처음엔 '하나 + 음절 수가 한자와 다름'도 음역으로
+#     봤다가 AI 끈 코퍼스에서 '훗가이도현'을 잃어 뺐다 — 그 갈래가 거르던 잡음은 2장뿐이었다.)
+# ⚠ 수용한 손실: 원어가 붙은 비표준 음역은 함께 빠진다 — 코퍼스 1건 '스촨(四川)'(같은 원고에 '쓰촨대학').
+#   외래어 표기 판정은 이 카드의 몫이 아니다(카드는 '사전 미등재'만 말한다).
+_CHOSEONG = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
+# 라틴 첫 글자 → 음역에서 올 수 있는 한글 첫소리(외래어 표기법과 관용 음역을 넉넉히 — 가르려는 건
+#   소리를 옮겼는가 아닌가이지 표기가 맞는가가 아니다).
+_LATIN_ONSET = {
+    "a": "ㅇ", "e": "ㅇ", "i": "ㅇ", "o": "ㅇ", "u": "ㅇ", "y": "ㅇ", "w": "ㅇ",
+    "h": "ㅎㅇ", "b": "ㅂㅃ", "c": "ㅋㄲㅅㅆㅊ", "d": "ㄷㄸㅈ", "f": "ㅍㅎ", "g": "ㄱㄲㅈㅎ",
+    "j": "ㅈㅉㅇㅎ", "k": "ㅋㄱㄲ", "l": "ㄹ", "m": "ㅁ", "n": "ㄴ", "p": "ㅍㅃ",
+    "q": "ㅋㄲㅊ", "r": "ㄹ", "s": "ㅅㅆㅈㅊ", "t": "ㅌㄸㄷㅅㅊ", "v": "ㅂㅃ",
+    "x": "ㅅㅆㅈㅋㅎ", "z": "ㅈㅉㅊㅅ",
+}
+_LATIN_GLOSS_RE = re.compile(r"[(（]\s*([A-ZÀ-Þ][^()（）\n]{0,80}?)\s*[)）]")
+_LATIN_WORD_RE = re.compile(r"[A-Za-zÀ-ɏ][A-Za-zÀ-ɏ'’.\-]*")
+_HANJA_AFTER_RE = re.compile(r"([가-힣]{2,})[ ]?[(（]\s*[" + _HANJA_CH + r"]")
+_COMPANY_RE = re.compile(r"([가-힣]{2,})[ ]?(?:\(주\)|㈜)|(?:\(주\)|㈜)[ ]?([가-힣]{2,})")
+
+
+def _onset(syllable: str) -> str:
+    o = ord(syllable) - 0xAC00
+    return _CHOSEONG[o // 588] if 0 <= o < 11172 else ""
+
+
+def _hangul_words_before(text: str, end: int, limit: int = 4) -> list:
+    """`end` 바로 앞(공백 하나 허용)에서 홑 공백으로 이어진 한글 낱말을 최대 `limit`개, 앞→뒤 순으로."""
+    j = end - 1 if end > 0 and text[end - 1] == " " else end
+    words = []
+    while len(words) < limit:
+        k = j
+        while k > 0 and "가" <= text[k - 1] <= "힣":
+            k -= 1
+        if k == j:
+            break
+        words.insert(0, text[k:j])
+        if k >= 2 and text[k - 1] == " " and "가" <= text[k - 2] <= "힣":
+            j = k - 1
+        else:
+            break
+    return words
+
+
+def author_marked_names(document_text: str, sino_syllables=frozenset()) -> frozenset:
+    """원어를 병기한 음역·'(주)'가 붙은 회사 이름 — 워커 [6] 사전 안전망의 카드 억제 집합(㉚).
+
+    `sino_syllables`는 nikl_dict.sino_korean_syllables() — 비어 있으면 한자 원어 판정을 끈다
+    (빈 집합이면 모든 음절이 '한자음 아님'이 되어 한자어 본문까지 빠진다).
+    """
+    if not document_text:
+        return frozenset()
+    out = set()
+    for m in _LATIN_GLOSS_RE.finditer(document_text):
+        head = re.split(r"[,;:=/]", m.group(1))[0]
+        caps = [w for w in _LATIN_WORD_RE.findall(head) if w[0].isupper()]
+        onsets = "".join(_LATIN_ONSET.get(
+            unicodedata.normalize("NFKD", w[0])[0].lower(), "") for w in caps)
+        words = _hangul_words_before(document_text, m.start())
+        for w in (words[-len(caps):] if caps else ()):
+            if len(w) >= 2 and _onset(w[0]) in onsets:
+                out.add(w)
+    if sino_syllables:
+        for m in _HANJA_AFTER_RE.finditer(document_text):
+            w = m.group(1)
+            if sum(1 for ch in w if ch not in sino_syllables) >= 2:
+                out.add(w)
+    for m in _COMPANY_RE.finditer(document_text):
+        out.add(m.group(1) or m.group(2))
+    return frozenset(out)
 
 
 def drop_author_defined_abbrev_expansion(ai_list: list, document_text: str,

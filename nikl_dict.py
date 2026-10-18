@@ -432,6 +432,38 @@ def is_registered_compound_component(key: str, eojeols) -> bool:
     return False
 
 
+_SINO_MIN_COUNT = 5
+_sino_syllables = None
+
+
+def sino_korean_syllables() -> frozenset:
+    """한자음으로 쓰이는 한글 음절 집합 — 표준국어대사전 '한자어' 표제어에서 센다.
+
+    사전 안전망([6])이 '한글(漢字)'의 한글이 **한자음인지, 중국어·일본어 발음을 옮긴 음역인지**
+    가르는 데 쓴다(ai_guards.author_marked_names ㉚). '첸쉐선(钱学森)'의 첸·쉐는 어느 한자의
+    음도 아니다. 표제어 5개 이상에 나온 음절만 받는다 — 품사 표지가 어긋난 표제어 몇 개가
+    '둥'·'링' 같은 음절을 끌어들인다(실측: 5회 미만 33음절, 5회 이상 475음절).
+    DB가 없으면 빈 집합 — 호출 측은 빈 집합이면 판정을 끈다(모든 음절이 '한자음 아님'이 된다).
+    """
+    global _sino_syllables
+    if _sino_syllables is not None:
+        return _sino_syllables
+    conn = _get_conn()
+    if conn is None:
+        return frozenset()
+    try:
+        counts = {}
+        for (w,) in conn.execute(
+                "SELECT word FROM words WHERE word_type='한자어' AND source='stdict'"):
+            for ch in w:
+                if "가" <= ch <= "힣":
+                    counts[ch] = counts.get(ch, 0) + 1
+    except sqlite3.Error:
+        return frozenset()
+    _sino_syllables = frozenset(ch for ch, n in counts.items() if n >= _SINO_MIN_COUNT)
+    return _sino_syllables
+
+
 def db_status() -> dict:
     if not DB_PATH.exists():
         return {"available": False, "path": str(DB_PATH)}

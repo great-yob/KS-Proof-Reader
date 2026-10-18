@@ -532,9 +532,58 @@ def phase_a_doc_dict():
         fails += 1
         print("  ✗ FAIL [한자병기] 빈 문서 무회귀 실패")
 
+    # ── ㉚ 원어 병기 음역 · 법인 표지 — 워커 [6] 사전 안전망의 검수 카드 억제 집합 ────────
+    #   2026-10-19 코퍼스: 안전망 카드 448장의 상당수가 원어를 병기한 외래 고유명사·판권면 회사명.
+    #   ⚠ 막는 건 음역뿐 — 번역('내각보(Cabinet Office)', 내각부 오타 의심)·소문자 일반 용어·
+    #     한자어 본문('과교융합(科教融合)')·한 음절만 어긋난 한자어('개혁개빵(改革開放)')는 계속 검사.
+    mk_doc = ("영국 힝스턴(Hinxton)에 있다. 나카소네 야스히로(Yasuhiro Nakasone)가 제안했다. "
+              "내각보(Cabinet Office)가 발표했다. 오즈비(odds ratio)는 0.9다. 응답자수(n=992). "
+              "첸쉐선(钱学森)이 귀국했다. 과교융합(科教融合) 모형. 실험밭(试验田) 역할. "
+              "개혁개빵(改革開放) 이후. 훗가이도현(北海道)의 포스터. 발행: 가나다미디어(주) · "
+              "인쇄: ㈜라마바프린텍")
+    mk_lat = [
+        ("힝스턴", True),            # 라틴 원어 음역(ㅎ·H)
+        ("야스히로", True),          # ★낱말 순서가 뒤집힌 인명 — 자리를 맞추지 않는다
+        ("나카소네", True),
+        ("내각보", False),           # ★번역(ㄴ ↔ Cabinet·Office) — 한국어 낱말이라 계속 검사
+        ("오즈비", False),           # 소문자 원어 = 일반 용어
+        ("응답자수", False),         # 원어가 아니다(n=992)
+        ("가나다미디어", True),      # 회사 표지 '(주)' 뒤
+        ("라마바프린텍", True),      # 회사 표지 '㈜' 앞
+    ]
+    mk = ai_guards.author_marked_names(mk_doc)          # 음절 목록 없이 — 한자 판정은 꺼진다
+    for w, want in mk_lat:
+        if (w in mk) != want:
+            fails += 1
+            print(f"  ✗ FAIL [원어병기] {w!r} 기대={want} 실제={w in mk}")
+    if "첸쉐선" in mk:
+        fails += 1
+        print("  ✗ FAIL [원어병기] 한자음 목록 없이 한자 원어 판정이 켜졌다")
+    mk_han = []
+    try:
+        import nikl_dict as _nd
+        _sino = _nd.sino_korean_syllables()
+    except Exception:
+        _sino = frozenset()
+    if _sino:
+        mk = ai_guards.author_marked_names(mk_doc, _sino)
+        mk_han = [
+            ("첸쉐선", True),                # 한자음 밖 음절 둘(첸·쉐)
+            ("과교융합", False),             # ★한자어 본문 — ㉙ 역방향과 같은 이유로 계속 검사
+            ("실험밭", False),               # 번역(밭)
+            ("개혁개빵", False),             # ★한 음절만 어긋남 = 한자어 오타일 수 있다
+            ("훗가이도현", False),           # ★한 음절(훗)뿐 — 비표준 음역(홋카이도)은 계속 검사
+        ]
+        for w, want in mk_han:
+            if (w in mk) != want:
+                fails += 1
+                print(f"  ✗ FAIL [원어병기] {w!r} 기대={want} 실제={w in mk}")
+    else:
+        print("  (stdict.db 없음 — 원어병기 한자 판정 스킵)")
+
     n = (len(exp_cases) + len(hd_cases) + len(dm_cases) + len(ws_cases) + len(pj_cases)
          + len(gn_cases) + len(cv_cases) + len(fr_cases) + len(ts_cases)
-         + len(rvc_cases) + len(hg_cases) + 1 + 1 + 1)
+         + len(rvc_cases) + len(hg_cases) + len(mk_lat) + len(mk_han) + 1 + 1 + 1 + 1)
     print(f"  → {n - fails}/{n} 통과" + ("  ✅" if fails == 0 else "  ❌"))
     return fails
 
@@ -591,7 +640,33 @@ def phase_a_norm_guard():
         if got != exp:
             fails += 1
             print(f"  ✗ FAIL [온용어거부권] {word!r} 기대거부={exp} 실제={got}")
-    n = len(cases) + len(veto_cases)
+    # ── 사전 안전망 노이즈 필터(is_likely_typo → morph.looks_like_typo, kiwi+실 DB) ──
+    #   2026-10-19: kiwi(0.23)가 미등재 복합어를 통째 NNG로 1순위에 두어 '정상 복합어' 판정이 죽어
+    #   있었다(docstring 예시 '지역사회보장협의체'조차 오타 의심). 2·3순위의 빈틈없는 분절로 되살렸다.
+    #   ⚠ 복합어 속 오타는 1음절 조각을 남겨 계속 걸려야 한다(재산관 = 재산과 오타 · 혐의/체).
+    typo_cases = []
+    try:
+        from core import morph as _m
+        if _m.available():
+            typo_cases = [
+                ("지역사회보장협의체", False),   # ★docstring 예시 — 정상 복합어
+                ("시군구지역사회보장협의체", False),
+                ("육아종합지원센터", False),
+                ("지역사회보장혐의체", True),    # ★복합어 속 오타(협→혐) — 1음절 조각 '체'
+                ("재산관", True),                # ★'재산과' 오타 — 재산/관
+                ("상담채녈", True),
+                ("케릭터를", True),
+                ("워크플로우", True),            # 비표준 외래어 표기(워크플로)
+                ("테스크포스", True),            # 비표준 외래어 표기(태스크포스)
+            ]
+    except Exception:
+        typo_cases = []
+    for word, exp in typo_cases:
+        got = _nd.is_likely_typo(word)
+        if got != exp:
+            fails += 1
+            print(f"  ✗ FAIL [안전망필터] {word!r} 기대오타의심={exp} 실제={got}")
+    n = len(cases) + len(veto_cases) + len(typo_cases)
     print(f"  → {n - fails}/{n} 통과" + ("  ✅" if fails == 0 else "  ❌"))
     return fails
 
