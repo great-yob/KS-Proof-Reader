@@ -487,9 +487,14 @@ class GeminiChecker:
             #   ⚠ 날것 스팬이 아니라 **용어 base로 정규화**(_normalize_glossary_entry)해
             #     넣는다: 조사/괄호 변형을 한 base로 접고 인용·문장 조각은 제외해, 하류 청크
             #     프롬프트가 상류의 미세 비결정에 흔들리는 캐스케이드를 끊는다. base 쌍으로 dedup.
+            #   ⚠ 상한은 **넣기 전에** 본다 — 넣은 뒤에 보면 상한에 닿은 다음부터 청크마다 1개씩 더
+            #     들어가 상한이 지켜지지 않는다(2026-10-19 백로그 B9). 코퍼스 20원고의 최대 글로서리가
+            #     7개라 이 수정으로 바뀌는 AI 입력은 실측상 없다.
             if glossary is not None:
                 seen = {(o, c) for o, c in glossary}
                 for c in tagged:
+                    if len(glossary) >= GLOSSARY_MAX:
+                        break
                     if c.confidence != "high":
                         continue
                     entry = _normalize_glossary_entry(c.original, c.corrected)
@@ -497,8 +502,6 @@ class GeminiChecker:
                         continue
                     glossary.append(entry)
                     seen.add(entry)
-                    if len(glossary) >= GLOSSARY_MAX:
-                        break
 
             _report(i + 1)          # 확정: 이 청크는 실제로 끝났다
 
@@ -517,12 +520,20 @@ class GeminiChecker:
                     _slept += _step
                     _report(i + 1 + 0.4 * (_slept / AI_CALL_DELAY))
 
-        # 중복 제거
-        seen, unique = set(), []
+        # 중복 제거 — 같은 원문은 먼저 나온 제안을 남긴다. ⚠ 교정이 **다른** 충돌(청크마다 다르게
+        #   고친 경우)은 예전엔 흔적 없이 사라졌다 → 건수와 상세를 남긴다(동작은 그대로 첫승).
+        seen, unique, clashes = {}, [], []
         for item in result:
-            if item.original not in seen:
-                seen.add(item.original)
+            prev = seen.get(item.original)
+            if prev is None:
+                seen[item.original] = item
                 unique.append(item)
+            elif prev.corrected != item.corrected:
+                clashes.append((prev, item))
+        if clashes and logger:
+            logger(f"  [AI] 같은 원문을 다르게 고친 제안 {len(clashes)}건 — 먼저 나온 제안 유지")
+            for p, q in clashes:
+                logger(f"      · '{p.original}': '{p.corrected}' 유지 · '{q.corrected}' 제외")
         return unique
 
     @staticmethod
@@ -854,7 +865,12 @@ class GeminiChecker:
             corrected  = _clean(str(item.get("corrected", "")))
             reason     = str(item.get("reason",    ""))
             category   = str(item.get("category",  ""))
-            confidence = str(item.get("confidence", "high"))
+            # 대소문자·공백만 정리한다. 'medium' 등 high/low가 아닌 값은 **여기서 접지 않는다** —
+            #   워커의 강등 가드들이 그것을 low가 아닌 카드로 보고 먼저 사유([검수] 표지)를 단 뒤,
+            #   가드 체인 끝의 ai_guards.demote_uncertain_confidence가 남은 것을 low로 내린다.
+            #   여기서 low로 만들면 가드가 건너뛰어 [검수] 표지가 빠지고, 그 표지가 없으면 신뢰도
+            #   통일(reconcile_variant_confidence)이 high로 되올릴 수 있다(2026-10-19 코퍼스 확인).
+            confidence = str(item.get("confidence", "high")).strip().lower() or "high"
 
             if (original and corrected
                     and original != corrected

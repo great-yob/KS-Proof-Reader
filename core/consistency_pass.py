@@ -352,7 +352,7 @@ def enforce_consistency(corrections: list, document_text: str, logger=None) -> l
                 if word != canon.original:
                     subsumed_bases.add(base)
                 # 교정으로 base의 받침이 바뀌면 뒤 조사도 호응시킨다(스윕과→스위프와).
-                josa = reconcile_josa(canon_corrected_base, word[len(base):])
+                josa = reconcile_josa(canon_corrected_base, word[len(base):], orig_stem=base)
                 _add(replace(
                     canon,
                     original=word,
@@ -542,6 +542,11 @@ def reconcile_variant_confidence(corrections: list, logger=None) -> list:
       · validate發 강등(마커 없음)  → 통일 대상. '홋카이도현/홋카이도현의' 본래 목적.
       · 가드發 강등(`[검수]` 마커) → **정책 결정**이므로 통일에서 제외.
     ⚠ 새 강등 가드를 만들 땐 반드시 reason에 `[검수]`를 붙일 것 — 그게 이 보호막의 열쇠다.
+
+    ⚠ 묶음 키는 **(원문 어간, 교정 어간) 쌍**이다. 교정 어간만으로 묶으면 서로 다른 낱말이
+    같은 교정형으로 모인다 — AI가 low로 낸 '재시→제시'가 결정론 high '제시을→제시를'과 한
+    묶음이 돼 high로 올라갔다(2026-10-19 감사). 본래 목적인 '홋카이도현/홋카이도현의'는 원문
+    어간도 같아 그대로 묶인다.
     """
     if not corrections:
         return corrections
@@ -552,7 +557,7 @@ def reconcile_variant_confidence(corrections: list, logger=None) -> list:
             continue
         base = _strip_josa(_nfc(c.corrected))
         if len(base) >= 2:
-            groups[base].append(i)
+            groups[(_strip_josa(_nfc(c.original)), base)].append(i)
 
     out = list(corrections)
     promoted = kept_low = 0

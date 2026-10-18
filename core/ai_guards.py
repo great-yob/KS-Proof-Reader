@@ -2150,6 +2150,30 @@ def demote_sentence_boundary_change(corrections: list, logger=None) -> list:
     return corrections
 
 
+def demote_uncertain_confidence(corrections: list, logger=None) -> list:
+    """AI가 신뢰도를 high도 low도 아닌 값('medium' 등)으로 낸 교정을 low로 강등한다(제자리 수정).
+
+    검수 배지(review_panel._needs_review)와 전자동 거절(main_window)은 =="low"만 보므로 'medium'은
+    사실상 high — 자동 적용 — 로 취급되고 있었다(2026-10-19 백로그 B2, 사용자 결정). 코퍼스 20원고에서
+    AI 교정의 약 10%가 medium이었고 없는 낱말 삽입('신세시스임의'→'딥 신세시스 임의')·문장 재작성처럼
+    low보다 약한 것이 많았다.
+    ⚠ **가드 체인 맨 끝**에 둔다 — 앞의 강등 가드들이 medium을 low가 아닌 카드로 보고 더 구체적인
+      사유를 먼저 달게 한다. ⚠ 프롬프트의 출력 스키마(high|medium|low)는 바꾸지 않는다(내용·순서 모두
+      하중을 받는다 — memory gemini-call-hardening-and-prompts).
+    """
+    demoted = 0
+    for c in corrections:
+        if c.source in ("ai_typo", "ai_polish") and c.confidence not in ("high", "low"):
+            c.confidence = "low"
+            if not (c.reason or "").startswith("[검수]"):
+                c.reason = "[검수] " + (c.reason or "") + " (AI 신뢰도 '중간' — 검토 필요)"
+            demoted += 1
+    if logger and demoted:
+        logger(f"  → 신뢰도 '중간' AI 교정 {demoted}건 검수 카드로 강등 "
+               "(AI 스스로 확신하지 못한 교정 — 자동 적용 제외)")
+    return corrections
+
+
 def demote_word_deletion(corrections: list, exists_fn=None, logger=None) -> list:
     """㉖ 내용 낱말을 지우는 AI 교정을 low로 강등한다(제자리 수정 후 반환).
 

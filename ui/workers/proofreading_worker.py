@@ -41,6 +41,34 @@ _FREQ_INTENTIONAL = 3
 _BULLET_HEADS = ("∙", "·", "•", "‧", "⋅", "ㆍ", "◦", "○", "▪", "▫", "-", "―")
 
 
+def _flag_cover(merged: list):
+    """사전 안전망([6])·재개방([9.6])이 '이미 다른 교정이 다룬 미등재어'를 판정하는 술어.
+
+    ⚠ [6]과 [9.6]은 **반드시 이 함수 하나**를 쓴다 — 둘이 다르면 [9.6]이 [6]의 판정을 조용히 뒤집는다.
+    두 방향을 다르게 본다:
+      · 미등재어 ⊆ 교정 원문의 한글 런 — 교정이 그 낱말을 품고 있다(어느 카드든).
+      · 교정 원문 ⊆ 미등재어 — '케릭터'를 고친 카드가 '케릭터를'을 덮는 경우. 이 방향은 원문이
+        **한글 런 하나**인 카드의 2음절 이상 런만 센다. 예전엔 다어절 카드('수요 를'·'가 본')의
+        1글자 런('를'·'로'·'대')이 거의 모든 미등재어에 들어 있어 진짜 오타('캐릴터를')까지
+        덮었다(2026-10-19 코퍼스: AI 끈 20원고의 억제 51건 중 46건).
+    윤문(ai_polish)은 원문이 문장 전체라 한 문장의 모든 어휘를 덮으므로 제외한다.
+    반환: clean → bool 판정 함수.
+    """
+    runs, whole = set(), set()
+    for c in merged:
+        if c.source == "ai_polish":
+            continue
+        rs = re.findall(r"[가-힣]+", c.original)
+        runs.update(rs)
+        if len(rs) == 1 and len(rs[0]) >= 2:
+            whole.add(rs[0])
+
+    def covered(clean: str) -> bool:
+        return (any(clean in r for r in runs)
+                or any(w in clean for w in whole))
+    return covered
+
+
 class ProofreadingWorker(QThread):
     """교정 분석 백그라운드 워커"""
 
@@ -508,6 +536,8 @@ class ProofreadingWorker(QThread):
             #   않으므로, 앞에 두면 ㉕·㉖이 볼 카드를 먼저 강등해 그쪽 로그가 비어 원인
             #   추적이 어려워진다(강등은 멱등이라 결과는 같다).
             ai_list = ai_guards.demote_sentence_boundary_change(ai_list, logger=log)
+            # 신뢰도 '중간'(medium 등) 강등 — ⚠ 체인 **맨 끝**: 앞 가드들이 먼저 구체적 사유를 단다.
+            ai_list = ai_guards.demote_uncertain_confidence(ai_list, logger=log)
         elif not opts.get("use_ai", True):
             log("  [AI] AI 분석 제외 모드 — Gemini 호출 없이 사전·규칙 검사만 수행합니다.")
         self._emit_pct(70, "AI 분석 완료" if opts.get("use_ai", True)
@@ -653,7 +683,7 @@ class ProofreadingWorker(QThread):
                                     f"국가 표준 '{std}' → 국가 표준 우선")
                                 break
                             # 받침이 바뀌면 뒤 조사도 호응시킨다([5.7]·[5.8]과 동일 — '스윕과'→'스위프와').
-                            josa = _rj(norm, w[len(key):]) if w.startswith(key) else ""
+                            josa = _rj(norm, w[len(key):], orig_stem=key) if w.startswith(key) else ""
                             corrected = norm + josa
                             if w != corrected and w not in existing:
                                 info = _ud.pair_info(key) or {}
@@ -723,7 +753,7 @@ class ProofreadingWorker(QThread):
                             if _nd.is_noun_josa_homograph(key, w, text):
                                 continue
                             # 받침이 바뀌면 뒤 조사도 호응시킨다(스윕과→스위프와).
-                            josa = _rj(norm, w[len(key):]) if w.startswith(key) else ""
+                            josa = _rj(norm, w[len(key):], orig_stem=key) if w.startswith(key) else ""
                             corrected = norm + josa
                             if w != corrected and w not in existing:
                                 # 저자가 비표준형을 ≥_FREQ_INTENTIONAL회 반복하면 의도된 표기일
@@ -794,7 +824,7 @@ class ProofreadingWorker(QThread):
                             if _nd.is_noun_josa_homograph(key, w, text):
                                 continue
                             # 받침이 바뀌면 뒤 조사도 호응시킨다(스윕과→스위프와).
-                            josa = _rj(norm, w[len(key):]) if w.startswith(key) else ""
+                            josa = _rj(norm, w[len(key):], orig_stem=key) if w.startswith(key) else ""
                             corrected = norm + josa
                             if w != corrected and w not in existing:
                                 rid = _er.pair_rule_id(key) or ""
@@ -886,8 +916,24 @@ class ProofreadingWorker(QThread):
                     existing.add(orig)
                 # 괄호 없는 일반 어절의 받침 호응 조사 — '필드을'→'필드를'(필드 받침 없음 → 를).
                 #   kiwi 가드(앞 체언·어미 제외)로 '있는'·'가을' 등 거짓양성을 막는다(실문서 0 검증).
+                net_bj_review = []
                 for orig, fixed in _jr.find_batchim_josa(text):
                     if orig in existing:
+                        continue
+                    # '과→와' 방향만 검수 카드 — 받침 없는 체언 뒤의 '과'는 오탈자('항공유과 비교')와
+                    #   낱말 끝음절 '과(課·科)'(문장 속 부서명 '디지털정부과 담당자')가 같은 모양이고,
+                    #   find_batchim_josa의 표제어·줄 끝·인명 가드를 지나도 부서명이 남는다(2026-10-19
+                    #   코퍼스: 이 방향 정탐 2건뿐). 나머지 조사 방향은 낱말 끝음절로 흔하지 않아 high 유지.
+                    _d = next((i for i, (a, b) in enumerate(zip(orig, fixed)) if a != b), -1)
+                    if _d >= 0 and orig[_d] == "과" and fixed[_d] == "와":
+                        net_bj_review.append(Correction(
+                            original=orig, corrected=fixed,
+                            reason="[검수] 체언 받침에 조사를 호응 (받침 없음→와)\n"
+                                   "— '…과'가 부서·학과 이름의 끝 글자라면 그대로 둡니다",
+                            source="dict", color=HL_DICT,
+                            category="맞춤법", confidence="low",
+                        ))
+                        existing.add(orig)
                         continue
                     net.append(Correction(
                         original=orig, corrected=fixed,
@@ -928,6 +974,9 @@ class ProofreadingWorker(QThread):
                 if net:
                     merged.extend(net)
                     det_auto.append(("받침조사", len(net)))
+                if net_bj_review:
+                    merged.extend(net_bj_review)
+                    det_review.append(("받침조사", len(net_bj_review)))
                 if net_dup:
                     merged.extend(net_dup)
                     det_review.append(("조사중복", len(net_dup)))
@@ -1002,18 +1051,12 @@ class ProofreadingWorker(QThread):
         #     카드로 노출한다. 사전 탐지가 기본 베이스이므로, AI가 미묘한 오타
         #     (예: '상담채녈')를 놓쳐도 반드시 사용자 눈에 띈다. 자동수정이 아니라
         #     (original==corrected) → HWP 미수정, 검토 카드·정오표용.
-        # 'AI가 이미 교정함'으로 눌러 둔 카드 보관소 — [9.6]에서 되살릴 수 있게 남긴다.
+        # '다른 교정이 이미 다룸'(covered)으로 눌러 둔 카드 보관소 — [9.6]에서 되살릴 수 있게 남긴다.
         #   ⚠ 여기 담기는 건 **다른 모든 관문을 통과한** 완성된 카드다(억제 사유가
         #   오직 covered 하나인 것). 그래야 [9.6]이 판정 로직을 복제하지 않는다.
         held_flags = []
         if dict_flags and not self._stop.is_set():
-            # 윤문(ai_polish)은 original이 문장 전체라 한 문장 내 모든 어휘를
-            # '처리됨'으로 덮어 안전망을 과하게 억제한다 → 단어 단위 교정만 집계.
-            covered = set()
-            for c in merged:
-                if c.source == "ai_polish":
-                    continue
-                covered.update(re.findall(r"[가-힣]+", c.original))
+            _is_covered = _flag_cover(merged)
             net = []
             skipped_noise = 0
             # 조직 예외(무교정 화이트리스트, scope='all') — 조직이 승인한 표기는 비등재라도
@@ -1066,14 +1109,14 @@ class ProofreadingWorker(QThread):
                 if _i_flag % 10 == 0:
                     self._band(82, 86, _i_flag / _n_dict,
                                f"사전 안전망 검사 중… {_i_flag}/{_n_dict}")
-                # AI가 이 어휘를 이미 교정 대상으로 다뤘으면(부분 포함 포함) 카드를 누른다.
+                # 다른 교정(AI·결정론)이 이 어휘를 이미 다뤘으면 카드를 누른다(판정은 _flag_cover).
                 #   ⚠ 여기서 `continue`로 **버리면 안 된다** — 근거가 된 AI 교정이
                 #   [8](조사 변형 정리)·[9.5](본문·문서 대조)에서 **나중에 드롭될 수 있고**,
                 #   그러면 그 낱말은 AI 카드도 사전 카드도 없이 통째로 사라진다
                 #   (실측 2026-07-31: '재산관'·'더서울미디어'가 이렇게 소멸. 어느 낱말이
                 #   사라지는지가 AI 실행마다 달라 재현조차 어려웠다). 판정은 끝까지 하고
                 #   보관만 해 두었다가 [9.6]에서 커버가 풀렸는지 다시 본다.
-                _covered_now = any(clean in cov or cov in clean for cov in covered)
+                _covered_now = _is_covered(clean)
                 # 문서에서 반복되는 미등재어 → 작가 의도 용어로 보고 카드 제외
                 _fbase = _freq_strip(clean) or clean
                 if clean and max(text.count(clean), text.count(_fbase)) >= _FREQ_INTENTIONAL:
@@ -1116,6 +1159,12 @@ class ProofreadingWorker(QThread):
                         _fw_real = _mchk.available() and _mchk.is_known_form(
                             _fw_nfc, lambda x: lookup_word(x)["exists"],
                             single_char_tail_ok=False)
+                        # 문맥 재확인 — 어절 단독 분석은 '맺은'(관계를 맺은)을 통째 명사(NNG)로 읽어
+                        #   '사전에 없음' 카드를 냈다(2026-10-19 코퍼스). 문서 속 등장을 앞뒤 창으로 다시
+                        #   보아 용언 활용형이고 그 기본형이 표제어면 등재어로 본다.
+                        if not _fw_real and _mchk.available():
+                            _lem = _mchk.verb_inflection_lemma(text, _fw_nfc)
+                            _fw_real = bool(_lem) and lookup_word(_lem)["exists"]
                     except Exception:
                         _fw_real = False
                 if _fw_real:
@@ -1159,7 +1208,7 @@ class ProofreadingWorker(QThread):
             if skipped_covered or skipped_noise or excepted:
                 _sup = []
                 if skipped_covered:
-                    _sup.append(f"AI가 이미 교정 {skipped_covered}")
+                    _sup.append(f"다른 교정이 이미 다룸 {skipped_covered}")
                 if skipped_noise:
                     _sup.append(f"등재어·정상복합어·인명 판정 {skipped_noise}")
                 if excepted:
@@ -1346,12 +1395,21 @@ class ProofreadingWorker(QThread):
                     #   AI가 **소수형(띄어쓴 형태)** 을 실제로 고친 경우엔 런이 '개인'·'정보'로
                     #   쪼개져 오히려 스킵되지 않았다. → 소수형 문자열을 AI 교정 원문에서
                     #   **그대로** 찾아 실제로 겹칠 때만 스킵한다.
+                    # ⚠ 사전 안전망 카드(dict_flag)는 '이미 다룬 표기'로 세지 않는다 — 글자를 바꾸지 않는
+                    #   '확인 권장' 카드라 문서 전체 통일을 막을 이유가 없다. 예전엔 미등재어 카드
+                    #   '글로벌인재'가 31:1 일관성 카드를 막아 자동 통일이 사라지고 이음매 계층의 검수
+                    #   카드만 남았다(2026-10-19 — [6] 덮임 판정을 바로잡아 안전망 카드가 더 드러나며 확인).
+                    #   같은 원문의 일관성 카드가 생기면 그 안전망 카드는 아래에서 뺀다(낱말은 이미 보인다).
+                    _flag_only = ({c.original for c in merged if c.source == "dict_flag"}
+                                  - {c.original for c in merged if c.source != "dict_flag"}
+                                  - {c.original for c in sp_cards})
+                    _cons_over_flag = set()
                     _ai_origs = [c.original for c in merged
-                                 if c.source != "ai_polish" and c.original]
+                                 if c.source not in ("ai_polish", "dict_flag") and c.original]
                     from core import consistency_family as _cf
                     for minority, majority, n_min, n_maj in \
                             _morph.find_compound_spacing_consistency(text, exists_fn=_cons_exists):
-                        if minority in existing:
+                        if minority in existing and minority not in _flag_only:
                             continue
                         clean = re.sub(r"[^가-힣]", "", minority)
                         # AI가 이 표기의 **모든 등장**을 이미 다뤘을 때만 스킵한다.
@@ -1390,6 +1448,15 @@ class ProofreadingWorker(QThread):
                                 minority, majority, n_min, n_maj),
                         ))
                         existing.add(minority)
+                        if minority in _flag_only:
+                            _cons_over_flag.add(minority)
+                    if _cons_over_flag:
+                        _n0 = len(merged)
+                        merged[:] = [c for c in merged if not (
+                            c.source == "dict_flag" and c.original in _cons_over_flag)]
+                        _gone = _n0 - len(merged)
+                        det_review[:] = [(l, n - _gone) if l == "사전안전망" else (l, n)
+                                         for l, n in det_review]
                     # (복합명사 일관성 건수는 아래 '띄어쓰기 백스톱' 합계에 포함)
 
                 # 부호·영문 띄어쓰기(규칙 기반) — kiwi가 못 잡는 문장부호/스크립트
@@ -1715,7 +1782,7 @@ class ProofreadingWorker(QThread):
                     log(f"  [문서 대조] 검증 건너뜀: {e}")
                 self._emit_pct(98, "문서 대조 검증 완료")
 
-        # [9.6] 사전 안전망 재개방 — [6]에서 'AI가 이미 교정함'(covered)으로 눌러 둔
+        # [9.6] 사전 안전망 재개방 — [6]에서 '다른 교정이 이미 다룸'(covered)으로 눌러 둔
         #     미등재어 중, **그 근거가 사라진** 것을 되살린다.
         #     [6]의 covered는 그 시점의 merged로 계산하는데, 그 뒤 [8](조사 변형 정리)과
         #     [9.5](본문·문서 대조)가 교정을 **드롭한다**. 근거가 드롭되면 그 낱말은
@@ -1724,14 +1791,10 @@ class ProofreadingWorker(QThread):
         #     ⚠ 이 패스는 [9.5] **뒤**여야 한다(드롭이 다 끝난 뒤의 covered를 봐야 함).
         #     되살린 카드는 original==corrected라 문서 대조 대상이 아니므로 순서상 안전하다.
         if held_flags and not self._stop.is_set():
-            covered_final = set()
-            for c in merged:
-                if c.source == "ai_polish":
-                    continue
-                covered_final.update(re.findall(r"[가-힣]+", c.original))
+            _covered_final = _flag_cover(merged)          # [6]과 같은 술어(_flag_cover 주석)
             _exist_orig = {c.original for c in merged}   # [7] 백스톱 등과 카드 중복 방지
             revived = [card for clean, card in held_flags
-                       if not any(clean in cov or cov in clean for cov in covered_final)
+                       if not _covered_final(clean)
                        and card.original not in _exist_orig]
             if revived:
                 merged.extend(revived)

@@ -9,6 +9,11 @@ eval/corpus_harness/run_corpus.py — 실원고 코퍼스 결정론 파이프라
   extract           교정샘플/ 원고를 **사본으로** 열어 텍스트 추출 → 캐시(한/글 필요, 원고당 수 초)
   run NAME          결정론 파이프라인 실행 → 캐시/runs/NAME/<tag>.json (카드·로그·오류·초)
                     --seed N 이면 PYTHONHASHSEED=N으로 다시 실행한다(결정론 검사용)
+                    --ai 면 AI 경로까지 — Gemini 응답을 캐시/ai_cache/에 요청 단위로 저장·재생한다
+                    (_install_ai_cache). 첫 실행만 RPD를 쓰고(20원고 약 200회), AI **뒤**만 고친
+                    비교는 몇 번이든 무료. --ai-offline 은 캐시에 없는 요청을 부르지 않고 실패로 둔다.
+                    ⚠ 실단어 판정 호출은 앞 단계 카드가 바뀌면 후보가 달라져 빗나간다(정상) — 그땐
+                    --ai 로 그 몇 건만 실제로 부른다. 생성 호출이 빗나가면 AI 입력이 바뀐 것이다.
   diff A B          두 실행의 카드 비교(내용 집합 + --order 시 순서까지). 바뀐 카드를 전부 출력
   summary NAME      (source, category, confidence) 분포
   events            data/event_queue.db의 사용자 결정을 **현행 finder로 재분류**해 거절률 산출
@@ -22,8 +27,8 @@ eval/corpus_harness/run_corpus.py — 실원고 코퍼스 결정론 파이프라
   결정론: run s0 --seed 0 / run s777 --seed 777 / diff s0 s777 --order → differing_docs=0이어야 한다.
 
 ⚠ 고객 원고다. 캐시는 **교정샘플/.corpus/**(교정샘플/ 전체가 .gitignore)에만 둔다 — 레포에 커밋 금지.
-⚠ AI 경로(Gemini)는 돌지 않는다. covered(안전망)·일관성 패스처럼 **AI 결과가 있어야만 도는 단계**는
-  여기서 재현되지 않으니 합성 입력으로 따로 검사할 것(memory layer-order-silent-drop-audit 원칙 6).
+⚠ 기본 실행은 AI 경로(Gemini)를 돌리지 않는다. covered(안전망)·일관성 패스처럼 **AI 결과가 있어야만
+  도는 단계**는 `--ai`로 재거나 합성 입력으로 따로 검사할 것(memory layer-order-silent-drop-audit 원칙 6).
 ⚠ 오프라인 차단 때문에 우리말샘·온용어 폴백이 꺼져 실제 앱보다 '검수 필요' 카드가 조금 많다.
   수정 전/후 **비교**용이지 절대치용이 아니다.
 """
@@ -107,11 +112,89 @@ def cmd_extract(args):
         shutil.rmtree(work, ignore_errors=True)
 
 
+# ── AI 응답 캐시(--ai) ──────────────────────────────────
+AI_CACHE = os.path.join(CACHE, "ai_cache")
+
+
+class _CachedResp:
+    """generate_content 응답 흉내 — _call_and_parse가 읽는 .text·finish_reason만."""
+
+    def __init__(self, rec):
+        self.text = rec["text"]
+        fr = type("FR", (), {"name": rec.get("finish_reason") or ""})()
+        self.candidates = [type("C", (), {"finish_reason": fr})()]
+
+
+def _install_ai_cache(offline: bool):
+    """Gemini 호출을 **요청 단위로** 캐시한다 — 처음 한 번만 실제로 부르고 이후는 재생한다.
+
+    키 = (contents, system_instruction, seed, max_output_tokens). 모델은 키에 넣지 않는다 —
+    한도 소진으로 백업 모델이 받은 응답도 재생 때 그대로 나와야 실행이 결정론이 된다.
+    그래서 AI **입력**(프롬프트·청커·글로서리·seed)을 바꾸면 캐시가 빗나가 실제로 부르고,
+    AI **뒤**(가드·병합·안전망·일관성)만 바꾸면 RPD 0으로 몇 번이고 다시 돌릴 수 있다.
+    offline=True면 빗나간 요청은 실패로 처리한다(청크 실패로 집계 — 로그에 남는다).
+    ⚠ 고객 원고가 담긴다 — 교정샘플/.corpus/ai_cache/(gitignore)에만 둔다.
+    """
+    import core.gemini_checker as gc
+    os.makedirs(AI_CACHE, exist_ok=True)
+    real_client_cls = gc.genai.Client
+    gc.AI_CALL_DELAY = 0            # 스로틀은 실제 호출에만(아래 _last) — 재생은 즉시
+    gap = 4.1
+    _last = [0.0]
+    stat = Counter()
+
+    class _Models:
+        def __init__(self, real):
+            self._real = real
+
+        def generate_content(self, model, contents, config):
+            raw = json.dumps([contents, config.system_instruction, config.seed,
+                              config.max_output_tokens], ensure_ascii=False)
+            path = os.path.join(AI_CACHE, hashlib.sha1(raw.encode("utf-8")).hexdigest() + ".json")
+            if os.path.exists(path):
+                stat["hit"] += 1
+                with open(path, encoding="utf-8") as fp:
+                    return _CachedResp(json.load(fp))
+            if offline:
+                stat["miss"] += 1
+                raise RuntimeError("corpus ai_cache miss (offline)")
+            wait = gap - (time.time() - _last[0])
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                resp = self._real.models.generate_content(
+                    model=model, contents=contents, config=config)
+            finally:
+                _last[0] = time.time()
+            try:
+                fr = getattr(resp.candidates[0].finish_reason, "name",
+                             str(resp.candidates[0].finish_reason))
+            except Exception:
+                fr = ""
+            rec = {"model": model, "seed": config.seed, "finish_reason": fr,
+                   "text": resp.text or ""}
+            with open(path, "w", encoding="utf-8") as fp:
+                json.dump(rec, fp, ensure_ascii=False)
+            stat["live"] += 1
+            return _CachedResp(rec)
+
+    class _Client:
+        def __init__(self, api_key=None, **kw):
+            real = None if offline else real_client_cls(api_key=api_key, **kw)
+            self.models = _Models(real)
+
+    gc.genai.Client = _Client
+    import atexit
+    atexit.register(lambda: print(f"[ai_cache] 재생 {stat['hit']} · 실제 호출 {stat['live']}"
+                                  f" · 빗나감 {stat['miss']}"))
+
+
 # ── run ─────────────────────────────────────────────────
 def cmd_run(args):
     if args.seed is not None and os.environ.get("PYTHONHASHSEED") != str(args.seed):
         env = dict(os.environ, PYTHONHASHSEED=str(args.seed))
-        cmd = [sys.executable, os.path.abspath(__file__), "run", args.name, *args.tags]
+        cmd = [sys.executable, os.path.abspath(__file__), "run", args.name, *args.tags,
+               *(["--ai"] if args.ai else []), *(["--ai-offline"] if args.ai_offline else [])]
         sys.exit(subprocess.call(cmd, env=env))
     os.chdir(REPO)
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -146,13 +229,16 @@ def cmd_run(args):
             return {o: (o.replace("\n", "\r") in t) for o in originals}
 
     pw.HwpEditor = FakeEditor
+    if args.ai:
+        _install_ai_cache(offline=args.ai_offline)
     out_dir = os.path.join(RUNS, args.name)
     os.makedirs(out_dir, exist_ok=True)
     tags = args.tags or _docs()
     if not tags:
         print("캐시에 원고가 없습니다 — 먼저 extract를 실행하세요.")
         return
-    opts = {"use_ai": False, "scope_typo": True, "scope_spacing": True, "scope_polish": False}
+    opts = {"use_ai": bool(args.ai), "scope_typo": True, "scope_spacing": True,
+            "scope_polish": False}
     total = 0
     for tag in tags:
         with open(os.path.join(CACHE, tag + ".json"), encoding="utf-8") as fp:
@@ -284,6 +370,10 @@ def main():
     p.add_argument("name")
     p.add_argument("tags", nargs="*", help="일부 원고만(태그). 생략하면 전부")
     p.add_argument("--seed", type=int, default=None, help="PYTHONHASHSEED(결정론 검사)")
+    p.add_argument("--ai", action="store_true",
+                   help="AI 경로 포함(Gemini 응답을 ai_cache에 저장·재생 — 첫 실행만 RPD 소모)")
+    p.add_argument("--ai-offline", action="store_true",
+                   help="--ai 재생 전용: 캐시에 없는 요청은 호출하지 않고 실패로 둔다")
     p.set_defaults(fn=cmd_run)
     p = sub.add_parser("diff")
     p.add_argument("a")

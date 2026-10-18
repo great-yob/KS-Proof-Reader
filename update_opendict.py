@@ -9,7 +9,7 @@ setup_dict.py의 spellcheck-ko 스냅샷(2025-12)보다 최신인 공식 export�
 
   · 비교 리포트: export에만 있고 현재 DB에 없던 신규 단어 수 + 대행사/돌봄 확인
   · 안전: 교체 전 stdict.db.bak 백업, 임시 DB에 빌드 후 스왑
-  · register: senseinfo.type(방언/북한어/옛말) → register, 그 외 '' (검수 정책 정합)
+  · register: 전부 '' 로 넣는다(방언/북한어/옛말 매핑은 휴면 — 이유는 _iter_export 주석)
 
 실행:  python update_opendict.py
 """

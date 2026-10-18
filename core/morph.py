@@ -684,6 +684,8 @@ _DEP_NOUN = ("NNB", "NNG", "NNP")
 _ADNOMINAL = ("ETM", "MM", "NR")
 # 의존명사 '뒤'에서 새 단어를 시작하는(띄어 쓸) 품사 — '갈 수 있다'의 '있다' 등.
 _AFTER_NNB_STEM = ("VV", "VA", "VX", "NNG", "NNP", "MAG")
+# find_spacing_suggestions가 자르는 자리 **뒤** 토큰의 태그 — 문맥 재확인에도 같은 집합을 쓴다.
+_SPLIT_AFTER_TAGS = frozenset(_DEP_NOUN) | frozenset(_AFTER_NNB_STEM)
 
 # 고유어 수관형사(단위 나열 '한 개·두 개·세 명'에 쓰임) — 사전-명사 가드에서 제외한다.
 #   '두개(頭蓋)'·'한개'(부사)처럼 동형 표제어가 있어도 정상 단위 띄어쓰기('두 개')를 막지 않도록.
@@ -906,9 +908,11 @@ def find_spacing_suggestions(text: str, min_len: int = 2) -> list:
                 safe_prefix.add(w[pv.start:t.start + len(t.form)])
 
     # ── 2패스: 컷 결정 ──────────────────────────────────────────────────────────
-    out = []
+    staged = []            # 문맥 재확인을 통과한 (어절, 컷, 컷→덩어리)
+    ctx_safe = set()       # 문맥에서 낱말 내부로 판명된 관형어+명사 덩어리('한부모' — 문서 단위 증거)
     for w, tokens in words:
         cuts = set()
+        runs = {}
         for i, t in enumerate(tokens):
             if i == 0 or t.tag not in _DEP_NOUN:
                 continue
@@ -994,6 +998,8 @@ def find_spacing_suggestions(text: str, min_len: int = 2) -> list:
                     continue
             if 0 < t.start < len(w):
                 cuts.add(t.start)             # 관형어 뒤 명사 '앞' 띄움
+                if pv.tag in ("MM", "NR"):    # 문맥 증거용 덩어리(아래 ctx_safe) — safe_prefix와 같은 단위
+                    runs[t.start] = w[pv.start:t.start + len(t.form)]
             # 의존명사(NNB) 뒤에서 새 단어가 이어지면 그것도 띄움('갈 수 있다'의 '있다').
             # NNG/NNP(예 '전 세계')는 뒤 명사를 또 떼면 복합명사를 쪼개므로 적용 안 함.
             if t.tag == "NNB" and i + 1 < len(tokens):
@@ -1005,6 +1011,24 @@ def find_spacing_suggestions(text: str, min_len: int = 2) -> list:
         # 용언 활용형 가드 — 어절 단독 분석이 만든 관형사 오분석('세울'=세/MM+울/NNG)을
         #   근소차 대안('세우'/VV+'ᆯ'/ETM)으로 되돌린다. 컷이 잡힌 어절에만 재분석(비용 최소).
         if _reads_as_inflected_verb(w):
+            continue
+        # 문맥 재확인(_context_failing_cuts) — 뒤는 명사·용언 어간이어야 하고, 앞은 품사를 묻지 않되
+        #   접두사(XPN)만은 경계가 아니다('고영향력'·'저등급' — 고(高)·저(低)는 뒷말에 붙는다).
+        bad = _context_failing_cuts(text, w, cuts,
+                                    before_ok=lambda t: t.tag != "XPN",
+                                    after_ok=lambda t: t.tag in _SPLIT_AFTER_TAGS)
+        if bad:
+            ctx_safe.update(runs[c] for c in bad if c in runs)
+            continue
+        staged.append((w, cuts, runs))
+
+    # 문서 단위 증거 — 한 어절의 문맥에서 낱말 내부로 판명된 덩어리는 다른 어절에서도 자르지 않는다.
+    #   kiwi는 같은 문서에서 단독 '한부모'는 NNP로, '한부모지원,'은 한/MM+부모로 읽는다(2026-10-19
+    #   코퍼스) — 앞 카드만 지우면 뒤 어절이 '한 부모지원'이라는 새 오탐 카드로 남는다.
+    out = []
+    for w, cuts, runs in staged:
+        cuts = {c for c in cuts if runs.get(c) not in ctx_safe}
+        if not cuts:
             continue
         spaced = _insert_spaces(w, cuts)
         if spaced != w and spaced.replace(" ", "") == w:
@@ -1076,6 +1100,12 @@ def find_dependent_noun_spacing(text: str) -> list:
                     continue
                 cuts.add(cur.start)
         if not cuts:
+            continue
+        # 문맥 재확인(_cuts_hold_in_context) — 위 사전 가드가 숫자 든 어절엔 꺼져 있어 '차등(1인'이
+        #   '차 등(1인'으로, 인용 저자명+연도 괄호(성+이름 3음절)가 이름 끝에서 쪼개져 새던 자리(2026-10-19 코퍼스 2장).
+        if not _cuts_hold_in_context(text, w, cuts,
+                                     before_ok=lambda t: True,
+                                     after_ok=lambda t: t.tag.startswith("N")):
             continue
         spaced = _insert_spaces(w, cuts)
         if spaced != w and spaced.replace(" ", "") == w:
@@ -1291,6 +1321,60 @@ def find_auxiliary_verb_spacing(text: str) -> list:
 #   있다'(가고싶다)는 연결어미가 '-고'라 '-아/-어' 조건에서 자연 제외(과거 294건 노이즈와 무관).
 _AUX_CONNECTIVE = frozenset({"아", "어", "여"})              # -아/-어 연결어미(kiwi 정규화)
 _AUX_BOJO = frozenset({"주", "보", "나가", "내", "두", "놓", "버리", "대", "드리"})  # 띄어 쓰는 보조용언(지·하 제외)
+# 표준국어대사전에 **한 낱말**로 오른 '-아/-어 + 보조용언' 꼴 중 보조 의미('시험 삼아 ~해 보다' 등)가
+#   성립하지 않는 것 — 띄우면 오히려 틀린다(사용자 결정 2026-10-19). ⚠ 일괄 '사전 단일어 가드'는 쓰지
+#   말 것: 해보다(=겨루다)·들어주다(=부탁 수락)·찔러보다는 동형이라 '해 볼까요?'가 정탐이고(사용자
+#   반복 수락), 풀어내다도 사용자가 띄움을 수락해 왔다. 목록에 넣을 땐 이 두 조건을 다 확인할 것.
+_AUX_SINGLE_WORDS = frozenset({"알아보다", "알아내다", "물어보다", "살펴보다", "찾아내다", "내버려두다"})
+
+
+def _cuts_hold_in_context(text: str, w: str, cuts, before_ok, after_ok,
+                          max_occurrences: int = 4) -> bool:
+    """어절 `w`를 자른 자리(`cuts`, w 안의 위치)가 **문서 문맥에서도** 띄어 쓸 경계인가.
+
+    띄어쓰기 finder는 어절 하나만 kiwi에 넣는데, 문맥이 없으면 오분석한다 — 사전 단일어
+    '알아보면'(알아보다)을 알/VV+아/EC+보/VX로, 명사 '사본일'(사본+이+ㄹ)을 사/VV+아+보/VX+ㄴ+일로,
+    인명(가명 '이지원')을 이/MM+지원으로 쪼갠다. 등장마다 앞뒤 ±48자 창(verb_inflection_lemma와 같은 방식)을
+    다시 분석해 **모든 등장**(최대 max_occurrences)에서 자른 자리에 형태소 경계가 있고 그 앞 토큰이
+    `before_ok`, 뒤 토큰이 `after_ok`를 만족할 때만 True. 한 등장이라도 아니면 False — 카드는 그
+    어절의 모든 등장에 적용되므로 하나라도 낱말 내부면 띄우면 안 된다. 등장을 못 찾으면 True.
+    ⚠ 조건은 finder의 설계 경계에 맞춰 호출부가 준다. 문맥에서 품사가 바뀌는 것까지 막으면 정탐을
+      잃는다 — 목록형 문맥에서 kiwi는 '전(全) 주기'의 '전'을 NNG로 읽는다(사용자 5회 수락한 카드).
+    2026-10-19 코퍼스 실측(20원고): 보조용언 217장 중 7장 · 관형어+명사 402후보 중 실제 카드 24장이
+    걸렸고 전부 오탐이었다(정탐 손실 0). 문서당 0.5초 안팎.
+    """
+    return not _context_failing_cuts(text, w, cuts, before_ok, after_ok, max_occurrences)
+
+
+def _context_failing_cuts(text: str, w: str, cuts, before_ok, after_ok,
+                          max_occurrences: int = 4) -> set:
+    """_cuts_hold_in_context의 본체 — 한 등장에서라도 경계가 아닌 컷의 집합(빈 집합 = 전부 통과).
+
+    컷 단위로 돌려주는 이유: find_spacing_suggestions가 실패한 컷의 덩어리를 문서 단위 증거로 쓴다.
+    """
+    try:
+        pat = re.compile(r"(?<!\S)" + re.escape(w) + r"(?!\S)")
+    except re.error:
+        return set()
+    kiwi = _get_kiwi()
+    bad, n = set(), 0
+    for m in pat.finditer(text):
+        if n >= max_occurrences:
+            break
+        n += 1
+        lo = max(0, m.start() - 48)
+        window = text[lo:min(len(text), m.end() + 48)]
+        pos = m.start() - lo
+        try:
+            toks = kiwi.analyze(window)[0][0]
+        except Exception:
+            return set()
+        for c in cuts:
+            at = pos + c
+            if not (any(t.start == at and after_ok(t) for t in toks)
+                    and any(t.start + t.len == at and before_ok(t) for t in toks)):
+                bad.add(c)
+    return bad
 
 
 def find_aux_connective_spacing(text: str) -> list:
@@ -1321,8 +1405,31 @@ def find_aux_connective_spacing(text: str) -> list:
             if (cur.tag == "VX" and cur.form in _AUX_BOJO
                     and prev.tag.startswith("E") and prev.form in _AUX_CONNECTIVE
                     and 0 < cur.start < len(w)):
+                # 사전 단일어는 그 경계만 띄우지 않는다('살펴보겠다' — 살펴보다). 같은 어절의 다른
+                #   경계는 그대로 본다('살펴봐주세요'→'살펴봐 주세요').
+                if (i >= 2 and toks[i - 2].tag.startswith("V")
+                        and w[toks[i - 2].start:cur.start] + cur.form + "다" in _AUX_SINGLE_WORDS):
+                    continue
                 cuts.add(cur.start)
         if not cuts:
+            continue
+        # ⚠ 외래어 명사를 용언으로 오분석한 자리 — kiwi는 '커버리지'를 크/VA+어/EC+버리/VX+지/EF로
+        #   읽는다(앞뒤 ±48자 문맥을 줘도 같다 — 문맥 창으로는 못 고친다, 2026-10-19 실측).
+        #   그래서 조사·부호를 뗀 몸통이 **3음절 이상 등재어**이면 띄우지 않는다. 단 kiwi가 명사형
+        #   어미(-기, ETN)로 끝낸 경우는 제외한다 — '보여주기'는 등재어지만 '보여주기 어렵다'처럼
+        #   동사의 명사형으로 쓰여 띄우는 게 맞다. 2음절('가본'=假本 등재)은 '가본 적'이 정탐이라
+        #   제외. 코퍼스 20원고·사용자 결정 이력에서 이 가드가 거르는 건 '커버리지' 하나뿐이었다.
+        body = list(toks)
+        while body and body[-1].tag.startswith(("J", "S")):
+            body.pop()
+        if body and body[-1].tag != "ETN":
+            core = _re.sub(r"[^가-힣]", "", w[body[0].start:body[-1].start + body[-1].len])
+            if len(core) >= 3 and _is_headword(core):
+                continue
+        # 문맥 재확인 — 앞은 어미(E*), 뒤는 용언. 뒤가 본동사(VV)여도 두 낱말이라 띄운다('미루어 보았을').
+        if not _cuts_hold_in_context(text, w, cuts,
+                                     before_ok=lambda t: t.tag.startswith("E"),
+                                     after_ok=lambda t: t.tag in ("VX", "VV")):
             continue
         spaced = _insert_spaces(w, cuts)
         if spaced != w and spaced.replace(" ", "") == w:

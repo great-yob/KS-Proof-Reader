@@ -44,6 +44,9 @@ _LABEL_INNER_RE = re.compile(
 #   값은 괄호 안 글자 → 읽는 음절. 목록을 늘릴 땐 실문서 발화를 재측정할 것.
 _READ_THROUGH_INNER = {"안": "안", "案": "안"}
 
+# 어절 끝 문장부호(조사 뒤에 붙는 것) — find_batchim_josa가 떼고 판정한다. 항상 매치(빈 문자열 허용).
+_TRAIL_PUNCT_RE = re.compile(r"[.,;:!?…·)\]}」』》〉’”\"']*$")
+
 
 def _paren_josa_form(syll: str, josa: str):
     """음절 `syll` 뒤에 올 받침 호응 조사 형태(find_paren_josa 전용). 판정 불가면 None."""
@@ -64,7 +67,7 @@ def _jongseong(syll: str):
     return (ord(syll) - 0xAC00) % 28
 
 
-def reconcile_josa(stem: str, josa: str) -> str:
+def reconcile_josa(stem: str, josa: str, orig_stem: str = "") -> str:
     """새 어간 `stem`의 받침에 맞춰 뒤따르는 조사 `josa`의 형태를 교정해 돌려준다.
 
     규범표기/맞춤법 교정으로 어간 받침이 바뀌면(스윕[ㅂ받침]→스위프[받침없음]) 뒤 조사도
@@ -73,6 +76,7 @@ def reconcile_josa(stem: str, josa: str) -> str:
     보존한다. ⚠ '이'는 서술격조사('이다' 활용: 이라/이야/이란…)와 헷갈리므로 **단독일 때만**
     주격 이/가로 본다(스윕이라고→스위프가라고 같은 오교정 방지). 모호하면 원형 유지(무해).
 
+    `orig_stem`(바꾸기 전 어간)을 주면 맨 '로'도 고친다 — 아래 1) 주석.
     반환: 호응 교정된 조사 문자열(변경 없으면 입력 그대로).
     """
     if not stem or not josa:
@@ -84,7 +88,16 @@ def reconcile_josa(stem: str, josa: str) -> str:
     # 1) 으로/로 (도구·자격·방향) — 받침 없거나 ㄹ받침(8)이면 '로'
     if josa.startswith("으로"):
         return ("으로" if (has_batchim and jong != 8) else "로") + josa[2:]
-    #    bare '로' 선두는 도구격 여부가 모호 → 손대지 않음(무해).
+    #    맨 '로' 선두는 조사인지 낱말 끝음절인지 모호하다 — 도로명 '-로(路)'('테헤란로'·'을지로')와
+    #    조사 '로'가 같은 모양이다. 그래서 **바꾸기 전 어간에 '로'가 조사로서 맞게 붙어 있던 경우**
+    #    (받침 없음·ㄹ받침)에만, 새 어간에 받침이 생기면 '으로'로 고친다('로보트로'→'로봇으로' —
+    #    예전엔 '로봇로'라는 틀린 형태로 high 카드가 나갔다, 2026-10-19 백로그 B8). 원래 어간이
+    #    받침으로 끝났는데 '로'가 붙었다면 조사 오류이거나 '-로(路)'라 판단하지 않는다.
+    if josa.startswith("로"):
+        oj = _jongseong(orig_stem[-1]) if orig_stem else None
+        if oj in (0, 8) and has_batchim and jong != 8:
+            return "으" + josa
+        return josa
     # 2) 단음절 받침 조사 선두 — 과/와·은/는·을/를는 항상 격/보조사라 보조사가 뒤따라도 안전
     head, rest = josa[0], josa[1:]
     if head in ("과", "와", "은", "는", "을", "를"):
@@ -158,10 +171,14 @@ def find_batchim_josa(text: str) -> list:
     # 줄(문단·표 칸)의 마지막 어절 — 아래 가드 ② 판정용.
     line_final = {ln.split()[-1] for ln in text.split("\n") if ln.split()}
     out, seen = [], set()
-    for w in text.split():
-        if w in seen or len(re.sub(r"[^가-힣]", "", w)) < 2:
+    for tok in text.split():
+        if tok in seen or len(re.sub(r"[^가-힣]", "", tok)) < 2:
             continue
-        seen.add(w)
+        seen.add(tok)
+        # 끝에 붙은 문장부호('필드을,'·'연구은.')는 떼고 판정한다 — 그대로 두면 kiwi의 마지막
+        #   형태소가 부호라 조사를 못 보고 통째로 건너뛰었다(미탐). 교정문엔 부호를 그대로 되붙인다.
+        tail = _TRAIL_PUNCT_RE.search(tok).group()
+        w = tok[:len(tok) - len(tail)]
         try:
             toks = kiwi.analyze(w)[0][0]
         except Exception:
@@ -206,7 +223,7 @@ def find_batchim_josa(text: str) -> list:
         #   ② '과'가 **줄 끝**에 온다 → 뒤에 이을 말이 없어 공동격·접속 조사가 성립하지 않는다.
         #      표 칸의 부서명('보건복지부⏎⏎정신건강관리과⏎')이 전부 이 모양이었다. '과(課·科)'는
         #      낱말 끝음절로 흔하지만 '와'는 아니므로 '과'에만 건다(줄 끝 오탈자 '…팀와'는 계속 교정).
-        if f == "과" and w in line_final:
+        if f == "과" and tok in line_final:
             continue
         #   ③ 성씨(1글자 고유명사)로 시작하는 3음절 한글 런 → 인명의 끝 글자('(김소은 외'의 '은').
         #      바로 앞 형태소만 보는 위의 NNP 가드는 kiwi가 '김/NNP 소/NNG 은/NNG'로 쪼개면 비켜 간다.
@@ -219,7 +236,7 @@ def find_batchim_josa(text: str) -> list:
             continue
         fixed = w[:last.start] + corr + w[last.start + 1:]
         if fixed != w:
-            out.append((w, fixed))
+            out.append((tok, fixed + tail))
     return out
 
 

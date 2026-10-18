@@ -34,7 +34,7 @@ sys.path.insert(0, _ROOT)
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 from core import ai_guards
-from core.models import Correction, HL_TYPO
+from core.models import Correction, HL_DICT, HL_TYPO
 
 
 # ── Phase A: 가드 단위 (결정론) ─────────────────────────────
@@ -346,12 +346,51 @@ def phase_a_doc_dict():
     for name, reason, want in rvc_cases:
         pair = [Correction(original="지방정부", corrected="지방자치단체", reason=reason,
                            source="ai_typo", color=HL_TYPO, confidence="low"),
-                Correction(original="지방자치단쳬", corrected="지방자치단체", reason="오탈자",
+                Correction(original="지방정부의", corrected="지방자치단체의", reason="오탈자",
                            source="ai_typo", color=HL_TYPO, confidence="high")]
         got = _rvc(pair)[0].confidence
         if got != want:
             fails += 1
             print(f"  ✗ FAIL [신뢰도통일] {name}: 기대 {want} 실제 {got}")
+    # 원문이 다른 낱말은 교정형이 같아도 한 묶음이 아니다(2026-10-19 백로그 B3) — AI가 low로 낸
+    #   '재시→제시'가 결정론 high '제시을→제시를'에 묶여 high로 올라가던 결함.
+    pair = [Correction(original="재시", corrected="제시", reason="오탈자",
+                       source="ai_typo", color=HL_TYPO, confidence="low"),
+            Correction(original="제시을", corrected="제시를", reason="[맞춤법] 받침 호응",
+                       source="dict", color=HL_DICT, confidence="high")]
+    got = _rvc(pair)[0].confidence
+    if got != "low":
+        fails += 1
+        print(f"  ✗ FAIL [신뢰도통일] 다른 원문 낱말 미통일: 기대 low 실제 {got}")
+    # AI 신뢰도 '중간' 강등(2026-10-19 백로그 B2) — 검수 배지·전자동 거절은 =="low"만 보므로 'medium'
+    #   (AI 교정의 약 10%, 없는 낱말 삽입·문장 재작성 등)이 high처럼 자동 적용되고 있었다.
+    #   ⚠ _tag는 대소문자만 정리하고 medium을 그대로 둬야 한다 — 거기서 low로 접으면 앞 강등 가드들이
+    #     건너뛰어 [검수] 표지가 빠지고, 신뢰도 통일이 그 카드를 high로 되올릴 수 있다.
+    from core.gemini_checker import GeminiChecker as _GC
+    _raw = [{"original": f"o{i}", "corrected": f"c{i}", "confidence": v, "reason": "r"}
+            for i, v in enumerate(("medium", "High", " low ", "unsure"))]
+    _raw.append({"original": "o9", "corrected": "c9"})            # 누락은 기존대로 high
+    _tagged = _GC._tag(_raw, set(), "ai_typo", HL_TYPO)
+    if [c.confidence for c in _tagged] != ["medium", "high", "low", "unsure", "high"]:
+        fails += 1
+        print(f"  ✗ FAIL [AI 신뢰도 정리] 실제 {[c.confidence for c in _tagged]}")
+    _out = ai_guards.demote_uncertain_confidence(_tagged)
+    if ([c.confidence for c in _out] != ["low", "high", "low", "low", "high"]
+            or not _out[0].reason.startswith("[검수]") or _out[2].reason != "r"):
+        fails += 1
+        print(f"  ✗ FAIL [AI 신뢰도 '중간' 강등] 실제 {[(c.confidence, c.reason) for c in _out]}")
+    # 맨 '로' 조사 호응(2026-10-19 백로그 B8) — 바꾸기 전 어간에 조사로 맞게 붙어 있던 '로'만 고친다.
+    #   원래 어간이 받침으로 끝났는데 '로'가 붙었다면 조사 오류이거나 도로명 '-로(路)'라 손대지 않는다.
+    from core.josa_rules import reconcile_josa as _rj
+    for stem, josa, orig, want in (("로봇", "로", "로보트", "으로"),       # 예전엔 '로봇로'
+                                   ("로봇", "로서", "로보트", "으로서"),
+                                   ("스위프", "로", "스윕", "로"),         # 받침 없어짐 — 그대로
+                                   ("을순", "로", "갑식", "로"),           # 원래 받침+로 — 판단 보류
+                                   ("로봇", "로", "", "로")):              # 원래 어간 미상 — 기존 동작
+        if _rj(stem, josa, orig_stem=orig) != want:
+            fails += 1
+            print(f"  ✗ FAIL [맨 '로' 호응] {orig}+{josa}→{stem}: 기대 {want} "
+                  f"실제 {_rj(stem, josa, orig_stem=orig)}")
 
     # drop_word_substitution_paraphrase: 문맥 윤문의 '단어 교체'(하에→아래) 차단 —
     #   조사 추가·오탈자·최소대립쌍은 보존. 실 사전이 필요해 _WDICT로 등재 여부 모사.
@@ -884,6 +923,19 @@ _CLEAN_CORPUS = [
     "가나시 희망두배 청년통장을 운영한다.",
     #   부호 띄어쓰기: 한 음절씩 끊은 한글 머리글자 약칭(실원고의 사업명 — 사용자 19회 거절).
     "가나시 “가.나.다” 사업 내용을 참고한다.",
+    # ★2026-10-19 백로그(B4·B7·D3) — 어절 단독 kiwi 분석이 낱말 내부를 자르던 띄어쓰기 카드.
+    #   보조용언: 사전 단일어(알아보다·살펴보다) · 외래어 명사 '커버리지'(크/VA+어+버리/VX+지).
+    "이 문제를 알아보면 다음과 같다.",
+    "자세한 내용을 살펴보겠다.",
+    "‘대표코드 커버리지’ 등의 정량 지표를 산출했다.",
+    #   문맥 재확인(_cuts_hold_in_context): 사본+이+ㄹ · 인명 · 어미 '-ㄴ지' · 접두사 고(高)·저(低).
+    "원본이 아닌 사본일 경우 제출한다.",
+    "담당자 이지원 주무관이 작성했다.",            # 가명(같은 분석 재현: 이/MM+지원)
+    "신청인이 해당 지역에 속한지는 확인한다.",
+    "국제 고영향력 학술지 게재 실적",
+    "심사에서 저등급 판정을 받았다.",
+    #   의존명사 '등': 숫자 든 어절은 사전 가드가 꺼져 있어(9월말 보호) '차등'이 새던 자리.
+    "지원금 차등(1인 기준) 지급",
 ]
 
 # 발화 케이스 — (finder 이름, 오류 문장, 기대 원문 부분, 기대 교정 부분)
@@ -936,6 +988,17 @@ _POS_CASES = [
     ("spacing_suggestions", "국회 상임위 조영석의원 지적이다.",  "조영석의원", "조영석 의원"),
     #   한글 약칭 예외는 **세 음절 사슬부터** — 두 음절은 진짜 마침표 뒤 띄어쓰기 누락일 수 있다.
     ("punct_spacing",       "할 것.그 다음이다.",              "것.그", "것. 그"),
+    # ★2026-10-19 백로그 가드의 **반대편 자물쇠**(D-2 추가분과 짝).
+    #   보조용언: 문맥에서 본동사(VV)로 읽혀도 두 낱말 · 단일어 목록은 그 경계만 · 등재어라도 명사형
+    #   '-기'는 동사로 쓰인다 · 동형어 '해보다'는 보조 의미가 정탐.
+    ("aux_connective",      "결과를 미루어보았을 때 타당하다.", "미루어보았을", "미루어 보았을"),
+    ("aux_connective",      "자료를 살펴봐주세요.",            "살펴봐주세요.", "살펴봐 주세요."),
+    ("aux_connective",      "목표를 보여주기 어렵다.",          "보여주기", "보여 주기"),
+    ("aux_connective",      "한번 해볼까요?",                  "해볼까요?", "해 볼까요?"),
+    #   받침 조사: 끝의 문장부호를 떼고 판정(예전엔 '연구은,'을 건너뛰었다).
+    ("batchim_josa",        "이 연구은, 다음과 같다.",          "연구은,", "연구는,"),
+    #   문맥 재확인은 앞 품사를 묻지 않는다 — 목록형 문맥에서 kiwi는 '전(全)'을 NNG로 읽는다.
+    ("spacing_suggestions", "K-12~대학원 전주기 교육, 차세대 연구자 지원", "전주기", "전 주기"),
 ]
 
 # D-4 규범표기 용언 활용형 동형이의 가드 — (문장, 어절 w, norm_map 키, 기대 보류 여부, 설명).
