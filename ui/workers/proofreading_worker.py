@@ -1477,8 +1477,9 @@ class ProofreadingWorker(QThread):
                     _ai_origs = [c.original for c in merged
                                  if c.source not in ("ai_polish", "dict_flag") and c.original]
                     from core import consistency_family as _cf
-                    for minority, majority, n_min, n_maj in \
-                            _morph.find_compound_spacing_consistency(text, exists_fn=_cons_exists):
+                    for minority, majority, n_min, n_maj, basis in \
+                            _morph.find_compound_spacing_consistency(
+                                text, exists_fn=_cons_exists, with_basis=True):
                         if minority in existing and minority not in _flag_only:
                             continue
                         clean = re.sub(r"[^가-힣]", "", minority)
@@ -1500,6 +1501,13 @@ class ProofreadingWorker(QThread):
                         if tie:
                             reason = (f"[검수] 띄어쓰기 일관성 → 사용자 결정 필요\n"
                                       f"— {majority}({n_maj}) : {minority}({n_min})")
+                            # 동률 방향을 겹치는 낱말의 이음매로 정했으면 그 근거를 보인다 —
+                            #   가족·규범 기본값과 방향이 다를 수 있어 사용자가 이유를 알아야 한다.
+                            if basis and basis[0] == "nested":
+                                _w = " · ".join(
+                                    f"{w}(붙임 {a})" if a else f"{w}(띄움 {b})"
+                                    for w, a, b in basis[1][:3])
+                                reason += f"\n— 겹치는 낱말 표기에 맞춤: {_w}"
                         else:
                             tag = "[검수] " if close else ""
                             reason = (f"{tag}띄어쓰기 일관성 → 다수 표기로 통일\n"
@@ -1743,9 +1751,16 @@ class ProofreadingWorker(QThread):
                     _jp_exc = _ud2.exception_set("spacing")
                 except Exception:
                     _jp_exc = frozenset()
-                jd = _jp.resolve(merged, text, logger=log, exception_set=_jp_exc)
+                # 사전 등재 검사 — 근소차·동률 미탐 보완(세 조각 이상)의 규범 기본값용([7] 동률과 같은 값).
+                _jp_exists = None
+                if validator and validator.available:
+                    import nikl_dict as _nd_jp
+                    _jp_exists = lambda w: _nd_jp.lookup_word(w)["exists"]   # noqa: E731
+                jd = _jp.resolve(merged, text, logger=log, exception_set=_jp_exc,
+                                 exists_fn=_jp_exists)
                 # 화면에는 **한 줄로만** 낸다(사용자 지정 2026-07-30). 개별 판정
-                #   (미탐 보완/방향 정정/이음매 정합/이음매 그룹/상호 무효화 쌍)은 위
+                #   (미탐 보완/방향 정정/규칙 카드 검수 강등/이음매 정합/정합 보류/이음매 그룹/
+                #   상호 무효화 쌍)은 위
                 #   resolve가 `· ` 불릿 상세로 원문 로그에 남기고 activity_panel._ITEM_RE가
                 #   표시에서 걸러낸다 — 진단은 보존하고 화면만 정리하는 표준 방식이다.
                 #   n = 실제로 카드를 만들거나 고친 판정 수(보존은 무연산이라 제외).
@@ -1753,7 +1768,7 @@ class ProofreadingWorker(QThread):
                 #     이음매 그룹으로 묶여 grouped에 이미 반영된다(더하면 이중 계상).
                 n = (jd.get("recovered", 0) + jd.get("redirected", 0)
                      + jd.get("dropped", 0) + jd.get("harmonized", 0)
-                     + jd.get("grouped", 0))
+                     + jd.get("grouped", 0) + jd.get("demoted", 0))
                 if n:
                     log(f"  [보완] 용어간 이음매 정합성 판정 {n}건 추가")
                 # '정당한 구분 유지'는 카드를 만들지도 고치지도 않는 **보존** 판정이라

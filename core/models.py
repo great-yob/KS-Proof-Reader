@@ -184,7 +184,7 @@ def occurrence_skipped(occ) -> bool:
         · `_derive`      : excluded ⇒ skip           ← 옳다
         · `_plan_occurrences`: status != accepted 만 봄  ← `excluded`를 놓쳤다
 
-      일관성 통일(`_apply_unify_forward`)은 그룹의 **모든** 등장을 accepted로 찍는데,
+      일관성 통일(`_apply_unify`)은 그룹의 **모든** 등장을 accepted로 찍는데,
       거기엔 '등장이 아닌 자리'(excluded)도 섞여 있다. 그래서 보정이 한 번이라도
       발동하면 excluded가 통째로 치환 대상이 됐다 — '고립예방'→'고립 예방'이 검수
       패널에서 3곳만 수락됐는데 교정본에서는 **10곳 전부** 바뀌었고('고립예방사업'→

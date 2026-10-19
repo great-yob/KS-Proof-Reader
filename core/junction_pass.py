@@ -155,6 +155,12 @@ def build_variants(text: str, *, min_len: int = MIN_LEN, max_len: int = MAX_LEN,
                 break
             form = " ".join(t[0] for t in seq)
             base = strip(form) or form
+            # ⚠ 마지막 조각이 **통째로** 잘렸으면(홀로 선 계사·조사 — 'A B가 아니라'의 '아니라')
+            #   그 base는 한 조각 짧은 시퀀스('A B가')가 이미 셌다. 다시 세면 띄어쓴 표기가 두 번
+            #   잡힌다(2026-10-19 실측: 20원고 1,614회 — '아니라' 762·'아닌' 282 …). 다수 판정이
+            #   띄어쓴 쪽으로 기울어 'clear'가 거짓으로 나왔다.
+            if base.count(" ") < form.count(" "):
+                continue
             key = base.replace(" ", "")
             if min_len <= len(key) <= max_len and " " in base:
                 out[key][base] += 1
@@ -307,20 +313,98 @@ def _noun_group(counter) -> bool:
 
 
 # ── 본 패스 ───────────────────────────────────────────────────────────
+def _nested_evidence(variants: dict, word: str, pos: int, own_forms=()):
+    """이음매 word[:pos]|word[pos:]를 가로지르는 **더 짧은 낱말**의 문서 표기 → 'spaced'|'joined'|None.
+
+    `morph.find_compound_spacing_consistency`의 동률 계층(겹치는 낱말의 이음매)과 같은 판정을
+    변이표로 한다 — 조각은 양쪽 2글자 이상, 그 낱말의 모든 표기가 그 자리를 한 방향으로만
+    쓸 때만 방향을 준다.
+    ⚠ own_forms(지금 견주는 word의 표기들)의 등장은 **빼고** 센다. 변이표는 어절 시퀀스의 모든
+      부분 창을 세므로 '신뢰 실행 환경'(3회)이 '신뢰 실행'(3회)으로도 잡힌다 — 빼지 않으면 견주는
+      표기 자신이 근거가 돼 세 조각 표기가 늘 '띄움 근거'를 얻는다(구현 중 실측).
+    """
+    sp = jn = 0
+    own = variants.get(word) or {}
+    for i in range(0, pos - 1):
+        for j in range(pos + 2, len(word) + 1):
+            if i == 0 and j == len(word):
+                continue
+            s = word[i:j]
+            cnt = Counter(variants.get(s) or {})
+            for f_own in own_forms:
+                sp_own = spaces_of(f_own)
+                if (i == 0 or i in sp_own) and (j == len(word) or j in sp_own):
+                    cnt[apply_spaces(s, {p - i for p in sp_own if i < p < j})] -= own.get(f_own, 0)
+            for form, n in cnt.items():
+                if n <= 0:
+                    continue
+                if (pos - i) in spaces_of(form):
+                    sp += n
+                else:
+                    jn += n
+    if sp and not jn:
+        return "spaced"
+    if jn and not sp:
+        return "joined"
+    return None
+
+
+def _letter_spaced(form: str) -> bool:
+    """글자마다 띄운 표기인가('자 산 총 계' — 표 머리글 균등 배분). 세 조각 이상이 전부 한 글자."""
+    parts = (form or "").split(" ")
+    return len(parts) >= 3 and all(len(p) == 1 for p in parts)
+
+
+def _weak_target(key: str, counter, variants: dict, exists_fn):
+    """근소차·동률 낱말의 통일 표기 — 계층 **다수 > 겹치는 낱말의 이음매 > 규범 기본값**.
+
+    워커 [7] 2분할 finder의 동률 계층과 같은 순서다(가족 층은 이 패스에 근거가 없어 뺀다).
+    규범 기본값: 붙임형이 사전 등재어면 붙임, 아니면 띄어쓰기 원칙(맞춤법 제2항) — 공백이 가장
+    많은 표기. exists_fn이 없으면 띄어쓰기 원칙.
+    """
+    ranked = counter.most_common()
+    top = [f for f, n in ranked if n == ranked[0][1]]
+    if len(top) == 1:
+        return top[0]
+    diff = set()
+    for f in top:
+        diff |= spaces_of(f)
+    score = {f: 0 for f in top}
+    for p in sorted(diff):
+        ev = _nested_evidence(variants, key, p, top)
+        if ev:
+            for f in top:
+                score[f] += 1 if (p in spaces_of(f)) == (ev == "spaced") else -1
+    best = max(score.values())
+    top = [f for f in top if score[f] == best]
+    if len(top) == 1:
+        return top[0]
+    if key in top:
+        try:
+            if exists_fn and exists_fn(key):
+                return key
+        except Exception:
+            pass
+    return max(top, key=lambda f: (f.count(" "), f))
+
+
 def resolve(corrections: list, text: str, *, logger=None,
-            exception_set=frozenset()) -> dict:
+            exception_set=frozenset(), exists_fn=None) -> dict:
     """이음매 정합 패스. corrections를 **제자리에서** 손보고 진단 dict를 돌려준다.
+
+    exists_fn: 사전 등재 검사(근소차·동률 미탐 보완의 규범 기본값용 — 없으면 띄어쓰기 원칙).
 
     반환 키: preserved(정당한 구분 쌍) / harmonized(자동 정합 카드) /
              grouped(이음매 그룹 수) / recovered(미탐 보완 카드) / conflicts(총 충돌 쌍) /
              redirected(방향 정정 카드) / dropped(방향 오판으로 제거한 카드) /
+             demoted(저자 다수와 어긋나 검수로 내린 **규칙** 카드) /
              mutual(상호 무효화 쌍 — 전부 이음매 그룹으로 넘어가므로 grouped의 부분집합.
                     워커 요약 n에 **따로 더하지 말 것**: 같은 판정을 두 번 세게 된다)
     """
     log = logger or (lambda *_a, **_k: None)
     diag = {"conflicts": 0, "preserved": 0, "harmonized": 0,
             "grouped": 0, "recovered": 0, "redirected": 0, "dropped": 0,
-            "mutual": 0}
+            "demoted": 0, "mutual": 0}
     from core import morph as _morph
     if not text or not _morph.available():
         return diag
@@ -345,24 +429,63 @@ def resolve(corrections: list, text: str, *, logger=None,
     #    카드가 생겼는데 **3회짜리 '이상 거래 탐지'는 카드도 교정도 없이** 방치됐다.
     #    2분할 finder는 '붙임형 base'에서만 후보를 만들므로 띄어 쓴 소수형을 원리적으로
     #    못 본다 — 여기서 메우지 않으면 아무도 못 본다.
-    #    금지선은 그대로다: **승자가 반드시 띄어쓴 형태**여야 하므로(`" " in winner`)
-    #    '띄어 쓴 구를 붙여 한 낱말로 만드는' ⑩ 294 노이즈 부류는 여전히 생성되지 않는다.
-    #    여기서 하는 일은 **같은 낱말 안에서 공백 위치를 다수형에 맞추는 재배치**뿐이다.
+    #    금지선: '띄어 쓴 **구(句)** 를 붙여 한 낱말로 만드는' ⑩ 294 노이즈 부류는 만들지 않는다.
+    #    그래서 승자가 붙임형인 보완(아래 ①a-2)은 **저자가 그 붙임형을 낱말로 실제로 쓴 경우**
+    #    (변이표에 붙임형이 있다 = 한글 런으로 등장)에만, 그리고 **언제나 low(검수)** 로만 낸다.
+    #    구 창('국가 전략 과제 수행')은 붙임형이 문서에 없어 여기서 걸러진다.
     have = {(c.original or "") for c in corrections if _eligible(c)}
+    by_word = {}
+    for c in corrections:
+        if _eligible(c):
+            by_word.setdefault((c.original or "").replace(" ", ""), c)
     for key, counter in sorted(variants.items()):
         if len(counter) < 2:
             continue
-        st, winner, n_maj, n_min = verdict(counter)
-        if st != "clear" or not winner or " " not in winner:
-            continue          # 약함·동률은 보류 / 승자가 붙임형이면 결합이라 대상 아님
         if key in exception_set or not _noun_group(counter):
             continue
+        st, winner, n_maj, n_min = verdict(counter)
         # 2분할 변이가 있으면 기존 finder의 출력 공간 안이다(그쪽이 카드를 냈을 수도,
         #   kiwi 오분석으로 못 냈을 수도 있다 — 카드는 내되 자동 적용은 하지 않는다).
         _finder_visible = any(f.count(" ") == 1 for f in counter)
-        for form, n in sorted(counter.items()):
-            if form == winner or not n:
+        if st == "clear" and winner and " " in winner:
+            # ①a-1 승자가 띄어쓴 형태 — 패자 전부를 다수형으로(공백 재배치·붙은 낱말 띄우기).
+            targets = [(f, n) for f, n in sorted(counter.items()) if f != winner and n]
+            mode = "clear"
+        elif key in counter and st == "clear":
+            # ①a-2 승자가 붙임형(저자가 낱말로 쓴 표기) — **세 조각 이상** 패자만. 두 조각 패자는
+            #   2분할 finder [7]의 몫이다(같은 판정을 두 계층이 내지 않게). 실측 2026-10-19:
+            #   '최종목표지표'(18) : '최종 목표 지표'(1)는 [7]이 두 조각만 보고 이 패스가 붙이기를
+            #   금지해 **어느 계층도 카드를 내지 않았다**.
+            targets = [(f, n) for f, n in sorted(counter.items())
+                       if f != winner and n and f.count(" ") >= 2]
+            mode = "join"
+        elif key in counter and st == "weak":
+            # ①a-3 근소차·동률 — 2분할 finder가 볼 수 없는 무리(두 조각 표기가 없음)에만. 저자가
+            #   붙임형을 낱말로 쓴 경우로 한정한다(구 창 제외). '신뢰실행환경'(3) : '신뢰 실행
+            #   환경'(3)처럼 두 조각 동률이면 카드가 나오는데 세 조각 동률이면 아무 카드도 없던 사각.
+            #   두 조각 표기가 있으면 [7] 카드의 방향을 따른다(두 계층이 다른 표기로 끌지 않게).
+            ref = by_word.get(key)
+            if ref is not None and (ref.corrected or "").replace(" ", "") == key:
+                winner = ref.corrected
+            elif _finder_visible:
                 continue
+            else:
+                winner = _weak_target(key, counter, variants, exists_fn)
+            targets = [(f, n) for f, n in sorted(counter.items())
+                       if f != winner and n and (not _finder_visible or f.count(" ") >= 2)]
+            n_maj = counter.get(winner, 0)
+            mode = "weak"
+        else:
+            continue          # 약함·동률(구 창) / 승자가 붙임형인데 붙임형이 문서에 없음(구)
+        # ⚠ **글자마다 띄운 표기는 다루지 않는다**(승자로도 패자로도) — 표 머리글의 균등 배분
+        #   ('자 산 총 계')은 조판 장식이지 띄어쓰기 표기가 아니다. 2026-10-19 코퍼스에서 둘 다 나왔다:
+        #   ① 그게 2회라고 멀쩡한 '자산총계'를 글자마다 띄우자는 카드, ② '재 무 상 태'→'재무상태' —
+        #   머리글이 실제로는 '재 무 상 태 표'(다섯 글자)라 창이 그 중간을 잘라, 수락하면 문서가 78회
+        #   쓰는 '재무상태표' 옆에 '재무상태 표'가 새로 생긴다.
+        if _letter_spaced(winner):
+            continue
+        targets = [(f, n) for f, n in targets if not _letter_spaced(f)]
+        for form, n in targets:
             if form in have:      # 이미 그 표기의 카드가 있으면 중복 생성 금지
                 continue
             # ⚠ **자동 적용(high)은 기존에 검증된 모양에만 준다.** 이번 확장의 목적은
@@ -370,13 +493,15 @@ def resolve(corrections: list, text: str, *, logger=None,
             #   검증된 부류 = 원문이 **공백 없는 붙임형**이고 그 무리에 **2분할 변이가
             #   없어** 기존 finder가 원리적으로 못 보던 경우(예: 기초연금수급자확인서 9:1).
             #   그 밖은 전부 low — 띄어 쓴 표기의 공백 재배치도, finder가 볼 수 있었던
-            #   무리도, 사람이 카드로 한 번 보고 정한다.
-            joined_src = " " not in form and not _finder_visible
+            #   무리도, 붙이는 방향도, 근소차·동률도 사람이 카드로 한 번 보고 정한다.
+            joined_src = mode == "clear" and " " not in form and not _finder_visible
+            tie = mode == "weak" and n_maj == n
+            head = ("띄어쓰기 일관성 → 사용자 결정 필요" if tie
+                    else "띄어쓰기 일관성 → 다수 표기로 통일")
             corrections.append(Correction(
                 original=form, corrected=winner,
                 reason=(("" if joined_src else "[검수] ")
-                        + f"띄어쓰기 일관성 → 다수 표기로 통일\n"
-                        f"— {winner}({n_maj}) : {form}({n})"),
+                        + f"{head}\n— {winner}({n_maj}) : {form}({n})"),
                 source="spacing", color=HL_TYPO,
                 category="띄어쓰기",
                 confidence="high" if joined_src else "low",
@@ -392,6 +517,15 @@ def resolve(corrections: list, text: str, *, logger=None,
     #     1:1 동률이라며 '중복수급관리 대상'을 제안했지만, 문서는 '중복수급 관리 대상'을
     #     **15회** 쓴다). 이 정정이 없으면 그 카드가 '정당한 구분'으로 오분류돼
     #     실제 결함이 보존된다. 1순위 계층(낱말 근거)의 단일 카드 적용이다.
+    #     ⚠⚠ **'저자 다수' 권한은 일관성 카드(consistency_flip)에만 있다**(2026-10-19 실측).
+    #     문법 규칙 카드(보조용언 '-어야 하다'·의존명사·관형어+명사·숫자 단위·기호 뒤)는 '명백한
+    #     다른 품사 간 띄어쓰기'라 저자가 몇 번을 붙여 쓰든 규칙은 그대로다. 예전엔 이 정정이
+    #     카드 종류를 가리지 않아 '검토해야한다'×6 + '검토해야 한다'×1 문서에서 high 보조용언
+    #     카드가 **조용히 사라졌다**(저자가 일관되게 틀릴수록 더 확실히 지워진다 · 화면 로그에도
+    #     안 보인다). 원문 끝에 마침표·조사가 붙으면 키가 안 맞아 살아남아, 같은 오류가 어절
+    #     모양에 따라 갈리기도 했다. → 규칙 카드는 지우지도 방향을 바꾸지도 않고, 저자 다수가
+    #     원문 표기면 **검수(low)로 내리고 그 근거를 보인다** — finder가 틀렸을 수도('총지급액'의
+    #     접두사 '총-'), 저자 용어일 수도('공익법인등' — 법령 용어) 있어 사람이 정한다.
     dead_ids = set()
     for c in corrections:
         if not _eligible(c):
@@ -399,6 +533,16 @@ def resolve(corrections: list, text: str, *, logger=None,
         word = (c.original or "").replace(" ", "")
         st, winner, n_maj, n_min = verdict(variants.get(word))
         if st != "clear" or not winner or winner == c.corrected:
+            continue
+        if not c.consistency_flip:
+            if winner == c.original and "— 문서에서는 " not in c.reason:
+                c.confidence = "low"
+                body = c.reason[4:].lstrip() if c.reason.startswith("[검수]") else c.reason
+                c.reason = (f"[검수] {body}\n— 문서에서는 '{winner}' 표기가 다수({n_maj}회) "
+                            f"— 저자 용어인지 확인")
+                diag["demoted"] += 1
+                log(f"      · 규칙 카드 검수 강등 '{c.original}'→'{c.corrected}' "
+                    f"(문서 다수 표기가 원문 그대로 {n_maj}회)")
             continue
         if winner == c.original:
             # 문서 다수 표기가 곧 원문 — 이 카드는 방향이 거꾸로다. 고칠 것이 없다.
@@ -430,12 +574,18 @@ def resolve(corrections: list, text: str, *, logger=None,
         corrections[:] = [c for c in corrections if id(c) not in dead_ids]
 
     # ② 대상 카드 목록 + 낱말 근거 판정.
+    #    ⚠ 'clear'는 **카드의 교정 방향이 그 낱말의 문서 다수와 같을 때만**이다. 일관성 카드는
+    #    ①b가 이미 그렇게 맞췄지만, 규칙 카드는 저자 다수와 어긋난 채 남을 수 있다 — 그런 카드를
+    #    '근거 명확'으로 세면 정당한 구분 보존·자동 정합의 **근거 제공자**가 돼 버린다(근거는
+    #    반대쪽을 가리키는데). 그래서 약함(=사용자 결정)으로 본다.
     items = []
     for c in corrections:
         if not _eligible(c):
             continue
         word = (c.original or "").replace(" ", "")
         st, winner, n_maj, n_min = verdict(variants.get(word))
+        if st == "clear" and winner != c.corrected:
+            st = "weak"
         items.append({"c": c, "word": word, "sp": spaces_of(c.corrected),
                       "st": st, "winner": winner})
 
@@ -459,6 +609,7 @@ def resolve(corrections: list, text: str, *, logger=None,
 
     # ④ 계층 적용.
     adj = defaultdict(set)          # 이음매 그룹(연결 요소)용 인접 리스트
+    pending = defaultdict(list)     # 근거 없는 카드 id → [(근거 없는 쪽, 근거 있는 쪽, d, 짧은 쪽이 근거)]
     for a, b, d in pairs:
         sa, sb = a["st"], b["st"]
         if sa == "clear" and sb == "clear":
@@ -485,14 +636,86 @@ def resolve(corrections: list, text: str, *, logger=None,
             adj[id(b["c"])].add(id(a["c"]))
             continue
         if sa == "clear" and sb == "none":
-            _harmonize(b, a, d, log, diag)
+            pending[id(b["c"])].append((b, a, d, True))
             continue
         if sb == "clear" and sa == "none":
-            _harmonize_into_short(a, b, d, log, diag)
+            pending[id(a["c"])].append((a, b, d, False))
             continue
         # 근거가 약하거나 갈린다 → 사용자 결정(이음매 그룹).
         adj[id(a["c"])].add(id(b["c"]))
         adj[id(b["c"])].add(id(a["c"]))
+
+    # ④-2 자동 정합 — **충돌 분류를 다 끝낸 뒤에** 한다(2026-10-19 실측).
+    #   예전엔 쌍을 훑는 도중에 바로 정합해서, 근거 카드가 **나중에 다른 쌍에서 사용자 결정
+    #   그룹으로 넘어가도** 이미 그 카드 이음매로 고쳐 쓴 뒤였다. 실원고: '(SH공사)주거상향지원
+    #   사업'이 서로 충돌해 그룹으로 간 '주거상향'→'주거 상향'(535:6)·'주거상향지원사업'→'주거상향
+    #   지원사업'(5:1)에 차례로 정합되며 값이 세 번 뒤집혔고, 결과가 **카드 순서**에 따라 달랐으며
+    #   (합성 입력에서 순서만 바꾸면 '…주거상향 지원사업' ↔ '…주거 상향 지원사업'), 그룹 밖이라
+    #   사용자가 그룹을 정해도 따라가지 않았다. → 자동 정합은 근거가 **확정**일 때만:
+    #     · 근거 카드 중 하나라도 사용자 결정 그룹에 들었으면 → 정합하지 않고 그 그룹에 합류
+    #     · 근거 카드끼리 이 카드의 같은 이음매를 다르게 정하면 → 정합하지 않고 그 카드들과 그룹
+    #   그룹 합류는 고정점까지 반복한다(합류가 다른 근거 카드를 그룹에 끌어들일 수 있다) —
+    #   결과는 카드 순서와 무관하다. 남은 카드만 근거들의 이음매로 한 번에 정합한다.
+    def _assign(lst):
+        """근거 카드들이 이 카드 좌표에서 정하는 이음매 {자리: 띄움 여부}, 서로 갈리면 None."""
+        out = {}
+        for weak, strong, d, strong_short in lst:
+            if strong_short:            # 근거가 짧고 이 카드 안 d 자리에 들어 있다
+                rng = range(d + 1, d + len(strong["word"]))
+                sp = {i + d for i in strong["sp"] if 0 < i < len(strong["word"])}
+            else:                       # 이 카드가 근거 카드 안 d 자리에 통째로 들어 있다
+                rng = range(1, len(weak["word"]))
+                sp = {i - d for i in strong["sp"] if d < i < d + len(weak["word"])}
+            for p in rng:
+                v = p in sp
+                if out.get(p, v) != v:
+                    return None
+                out[p] = v
+        return out
+
+    #   같은 낱말의 다른 표기 카드('주거상향'·'주 거상향' → '주거 상향')는 **같은 이음매**를 정한다 —
+    #   하나가 그룹이면 형제도 같은 그룹이다. ③은 길이가 다른 쌍만 보므로 형제끼리는 이어지지
+    #   않았고, 그룹 밖 형제는 사용자가 그룹을 정해도 따라가지 않았다(2026-10-19 실측 1건).
+    #   그룹이 커질 때마다 다시 닫는다(고정점 안) — 형제를 근거로 한 정합도 보류돼야 한다.
+    by_word = defaultdict(list)
+    for it in items:
+        by_word[it["word"]].append(id(it["c"]))
+
+    def _close_siblings():
+        added = False
+        for ids in by_word.values():
+            if len(ids) > 1 and any(i in adj for i in ids):
+                for i in ids:
+                    for j in ids:
+                        if i != j and j not in adj[i]:
+                            adj[i].add(j)
+                            added = True
+        return added
+
+    joined_grp = set()
+    grew = True
+    while grew:
+        grew = _close_siblings()
+        for wid, lst in pending.items():
+            if wid in joined_grp:
+                continue
+            strongs = [s for _w, s, _d, _k in lst]
+            if _assign(lst) is None or any(id(s["c"]) in adj for s in strongs):
+                joined_grp.add(wid)
+                grew = True
+                for s in strongs:
+                    adj[wid].add(id(s["c"]))
+                    adj[id(s["c"])].add(wid)
+                log(f"      · 정합 보류 → 사용자 결정 '{lst[0][0]['c'].original}' "
+                    f"(겹치는 다수 표기가 사용자 결정 대상이거나 서로 다름)")
+    for wid, lst in pending.items():
+        if wid in joined_grp:
+            continue
+        weak = lst[0][0]
+        assign = _assign(lst)
+        spaces = ({p for p in weak["sp"] if p not in assign}
+                  | {p for p, v in assign.items() if v})
+        _rewrite(weak, spaces, [s for _w, s, _d, _k in lst], log, diag)
 
     # ⑤ 연결 요소 → junction_group 부여 + 자동적용 방지(low 강등).
     by_id = {id(it["c"]): it for it in items}
@@ -530,31 +753,20 @@ def resolve(corrections: list, text: str, *, logger=None,
     return diag
 
 
-def _harmonize(weak: dict, strong: dict, d: int, log, diag):
-    """근거 없는 **긴** 카드(weak)의 corrected를 근거 있는 짧은 카드(strong) 이음매로."""
-    keep = {i for i in weak["sp"] if not (d < i < d + len(strong["word"]))}
-    add = {i + d for i in strong["sp"] if 0 < i < len(strong["word"])}
-    _rewrite(weak, keep | add, strong, log, diag)
-
-
-def _harmonize_into_short(weak: dict, strong: dict, d: int, log, diag):
-    """근거 없는 **짧은** 카드(weak)의 corrected를 근거 있는 긴 카드(strong) 이음매로."""
-    add = {i - d for i in strong["sp"] if d < i < d + len(weak["word"])}
-    _rewrite(weak, add, strong, log, diag)
-
-
 _HARMONIZED_MARK = "— 이음매 정합"
 
 
-def _rewrite(weak: dict, spaces: set, strong: dict, log, diag):
+def _rewrite(weak: dict, spaces: set, strongs: list, log, diag):
+    """근거 없는 카드(weak)의 corrected를 근거 카드들(strongs)의 이음매로 고쳐 쓴다.
+
+    ⚠ 한 카드가 여러 근거 카드와 겹친다(실측 '일가정양립정책의'는 3건과 겹침). 예전엔 근거
+      카드마다 차례로 고쳐 써서 결과가 순서에 달렸다 — 이제 호출부(④-2)가 근거들의 이음매를
+      **한 번에 합쳐**(서로 갈리면 정합하지 않는다) 넘긴다.
+    """
     new = apply_spaces(weak["word"], spaces)
     c = weak["c"]
     if new == c.corrected:
         return
-    # ⚠ **정합 후 `weak["sp"]`를 반드시 갱신한다.** 한 카드가 여러 강한 카드와 겹칠
-    #   수 있고(실측 '일가정양립정책의'는 3건과 겹침), 갱신하지 않으면 두 번째
-    #   정합이 낡은 공백 집합에서 다시 계산해 **앞 정합을 되돌린다**(실측: 정합이
-    #   3회 돌며 결과가 매번 뒤집혔고 최종값은 순서 운에 달렸다).
     weak["sp"] = frozenset(spaces)
     if new == c.original:
         # 정합 결과가 원문과 같아지면 교정할 것이 없다 — 무의미 카드로 표시하고
@@ -566,8 +778,9 @@ def _rewrite(weak: dict, spaces: set, strong: dict, log, diag):
     old = c.corrected
     c.corrected = new
     if _HARMONIZED_MARK not in c.reason:
+        ref = "·".join(f"'{s}'" for s in dict.fromkeys(x["c"].corrected for x in strongs))
         c.reason = (c.reason + f"\n{_HARMONIZED_MARK}: 겹치는 이음매를 문서 다수 "
-                               f"표기('{strong['c'].corrected}')에 맞춤").strip()
+                               f"표기({ref})에 맞춤").strip()
     diag["harmonized"] += 1
     log(f"      · 이음매 정합 '{c.original}' → '{new}' (기존 '{old}')")
 

@@ -1368,12 +1368,22 @@ def phase_g_junction():
     _jp.resolve(cards4, doc4)
     inv.append(("URL 카드 미개입",
                 cards4[1].corrected == url.replace("관한법률", "관한 법률")))
-    #   (c) 결합 방향 미탐 보완 금지 — '띄어 쓴 구를 붙임'은 만들지 않는다(⑩ 노이즈 클래스)
+    #   (c) 결합 방향 미탐 보완의 금지선(⑩ 노이즈 클래스) — 2026-10-19 사용자 지시로 좁게 풀었다.
+    #       예전엔 '붙이는 방향 보완'을 아예 만들지 않았는데, 그래서 '최종목표지표'(18) :
+    #       '최종 목표 지표'(1)가 어느 계층에서도 카드가 안 나왔다. 지금 지키는 선은 둘이다:
+    #       ① 붙이는 방향은 **언제나 검수(low)** — 예전 사고('학교 밖 청소년 지원'→'학교밖청소년지원',
+    #          법률 용어)는 자동 적용(high)이라 사고였다. ② 저자가 붙임형을 낱말로 **쓴 적이 없는**
+    #          구 창('국가 전략과제 수행' ↔ '국가 전략 과제 수행')은 만들지 않는다.
     doc5 = "학교밖청소년지원 학교밖청소년지원 학교 밖 청소년 지원 "
     cards5 = []
     _jp.resolve(cards5, doc5)
-    inv.append(("결합 방향 보완 미생성",
-                all(" " not in c.original for c in cards5)))
+    inv.append(("결합 방향 보완은 검수(low)로만",
+                all(c.confidence == "low" for c in cards5
+                    if len(c.corrected.split()) < len(c.original.split()))))
+    doc5b = "국가 전략과제 수행 계획. 국가 전략 과제 수행 결과. "
+    cards5b = []
+    _jp.resolve(cards5b, doc5b)
+    inv.append(("붙임형 없는 구 창은 보완 미생성", not cards5b))
     #   (d) 보완 카드의 원문은 반드시 문서에 실재(브리지 적용 가능성)
     doc6 = ("기초연금 수급자 확인서 " * 6 + "기초연금수급자확인서 ")
     cards6 = []
@@ -1523,10 +1533,107 @@ def phase_g_junction():
         fails += 1
         print(f"  ✗ FAIL [G-7 꼬리조각] 조사로 시작하는 카드 생성: {_bad[:3]}")
 
+    # ── G-9 2026-10-19 빈틈 수정(검토 피로·빈틈 조사에서 재현으로 확정) ──────────────
+    g9 = 0
+    #   (a) '저자 다수' 권한은 일관성 카드에만 — 규칙 카드(보조용언 high 등)는 저자가 틀린 표기를
+    #       더 자주 써도 **지우지 않고** 검수로 내리며 근거를 붙인다. 일관성 카드의 방향 오판 제거는 유지.
+    g9 += 1
+    doc9a = "이 사항은 반드시 검토해야한다 는 의견이다. " * 6 + "이 사항은 검토해야 한다 는 의견. "
+    c9a = [Correction(original="검토해야한다", corrected="검토해야 한다", reason="보조용언 띄어쓰기",
+                      source="spacing", color=HL_TYPO, category="띄어쓰기", confidence="high"),
+           card("검토해야한다", "검토해야 한다")]          # 같은 모양의 일관성 카드(방향 오판)
+    _jp.resolve(c9a, doc9a)
+    _rule = [c for c in c9a if not c.consistency_flip]
+    if (len(_rule) != 1 or _rule[0].confidence != "low" or "[검수]" not in _rule[0].reason
+            or "문서에서는" not in _rule[0].reason):
+        fails += 1
+        print(f"  ✗ FAIL [G-9a 규칙 카드] 저자 다수에 지워지거나 근거 없이 남음 "
+              f"→ {[(c.original, c.confidence, c.reason) for c in _rule]}")
+    if any(c.consistency_flip for c in c9a):
+        fails += 1
+        print("  ✗ FAIL [G-9a 규칙 카드] 방향이 거꾸로인 일관성 카드는 여전히 제거돼야 한다")
+    #   (b) 자동 정합은 근거가 확정일 때만 — 근거 카드가 사용자 결정 그룹이면 정합하지 않고 그 그룹에
+    #       합류하며, 결과는 **카드 순서와 무관**하다(실원고 '(SH공사)주거상향지원사업').
+    g9 += 1
+    doc9b = ("주거 상향 사업을 한다. " * 8 + "주거상향 사업. " + "주거상향 지원사업 공고. " * 5
+             + "주거상향지원사업 공고. " + "(가)주거상향지원사업 공고. ")
+    _seen9b = set()
+    import itertools as _it
+    for perm in _it.permutations(range(3)):
+        mk = [lambda: card("주거상향", "주거 상향", conf="high"),
+              lambda: card("주거상향지원사업", "주거상향 지원사업", conf="high"),
+              lambda: Correction(original="(가)주거상향지원사업", corrected="(가) 주거상향지원사업",
+                                 reason="기호 뒤", source="spacing", color=HL_TYPO,
+                                 category="띄어쓰기", confidence="low")]
+        cs = [mk[i]() for i in perm]
+        _jp.resolve(cs, doc9b)
+        w = next(c for c in cs if c.original.startswith("(가)"))
+        grp = {c.junction_group for c in cs if c.original in ("주거상향", "주거상향지원사업")}
+        _seen9b.add((w.corrected, bool(w.junction_group) and w.junction_group in grp))
+    if _seen9b != {("(가) 주거상향지원사업", True)}:
+        fails += 1
+        print(f"  ✗ FAIL [G-9b 정합 순서] 순서마다 결과가 다르거나 그룹에 합류하지 않음 {_seen9b}")
+    #   정합 자체는 그대로 동작해야 한다(근거 카드가 확정이면 — G-2와 같은 모양, 근거 둘이 일치).
+    g9 += 1
+    doc9c = ("수급자 확인서 " * 6 + "수급자확인서 " + "급여 현금 " * 3 + "급여현금 "
+             + "급여현금수급자확인서 ")
+    c9c = [card("수급자확인서", "수급자 확인서"), card("급여현금", "급여 현금"),
+           card("급여현금수급자확인서", "급여현금 수급자확인서")]
+    c9c[2].consistency_flip = False
+    c9c[2].source = "punct"
+    _jp.resolve(c9c, doc9c)
+    if c9c[2].corrected != "급여 현금 수급자 확인서" or c9c[2].junction_group:
+        fails += 1
+        print(f"  ✗ FAIL [G-9b 정합] 근거 둘이 일치하면 한 번에 정합 → {c9c[2].corrected!r} "
+              f"group={c9c[2].junction_group!r}")
+    #   (c) 붙임 다수 + 세 조각 소수형 — [7]은 두 조각만 보고 예전 이 패스는 붙이기를 금지해
+    #       카드가 아예 없던 사각. 이제 검수 카드로 나온다.
+    g9 += 1
+    c9d = []
+    _jp.resolve(c9d, "최종목표지표 를 본다. " * 6 + "최종 목표 지표 를 본다. ")
+    if [(c.original, c.corrected, c.confidence) for c in c9d] != [
+            ("최종 목표 지표", "최종목표지표", "low")]:
+        fails += 1
+        print(f"  ✗ FAIL [G-9c 세 조각 붙임] → {[(c.original, c.corrected, c.confidence) for c in c9d]}")
+    #   (d) 세 조각 동률 — 두 조각 동률은 카드가 나오는데 세 조각 동률은 없던 사각. 방향은 [7] 동률과
+    #       같은 계층(겹치는 낱말 > 규범 기본값). ⚠ 견주는 표기 자신의 부분 창은 근거가 아니다.
+    for name, doc9, ex, want in (
+            ("근거 없음=띄어쓰기 원칙", "신뢰실행환경이다. " * 3 + "신뢰 실행 환경이다. " * 3, None,
+             ("신뢰실행환경", "신뢰 실행 환경")),
+            ("등재어=붙임", "신뢰실행환경이다. " * 3 + "신뢰 실행 환경이다. " * 3, lambda w: True,
+             ("신뢰 실행 환경", "신뢰실행환경")),
+            ("겹치는 낱말 붙임", "신뢰실행환경이다. " * 2 + "신뢰 실행 환경이다. " * 2
+             + "실행환경을 본다. " * 3, None, ("신뢰 실행 환경", "신뢰실행환경"))):
+        g9 += 1
+        c9 = []
+        _jp.resolve(c9, doc9, exists_fn=ex)
+        got = [(c.original, c.corrected) for c in c9]
+        if got != [want] or any(c.confidence != "low" for c in c9):
+            fails += 1
+            print(f"  ✗ FAIL [G-9d 세 조각 동률] {name}: {got}")
+    #   (f) 글자마다 띄운 표기(표 머리글 균등 배분 '자 산 총 계')는 승자로도 패자로도 다루지 않는다 —
+    #       멀쩡한 '자산총계'를 글자마다 띄우자는 카드, 그리고 '재 무 상 태 표'(다섯 글자) 머리글의 중간을
+    #       잘라 '재무상태 표'를 새로 만드는 카드가 실제로 나왔다(2026-10-19 코퍼스).
+    g9 += 1
+    c9f = []
+    _jp.resolve(c9f, "자 산 총 계 표. 자 산 총 계 합. 자산총계 기준. 재 무 상 태 표. 재무상태 기준. 재무상태 변동. "
+                     "재무상태 요약. ")
+    _got9f = [(c.original, c.corrected) for c in c9f]
+    if _got9f:
+        fails += 1
+        print(f"  ✗ FAIL [G-9f 글자 띄움] → {_got9f}")
+    #   (e) 변이표 계수 — 홀로 선 계사·조사('아니라')가 통째로 잘린 시퀀스를 한 번 더 세지 않는다
+    #       (실측 20원고 1,614회 — 띄어쓴 표기가 두 번 잡혀 '근거 명확'이 거짓으로 나왔다).
+    g9 += 1
+    _v9 = _jp.build_variants("신뢰 실행 환경이 아니라 신뢰실행환경이다. 신뢰 실행 환경 아니라 ")
+    if (_v9.get("신뢰실행환경") or {}).get("신뢰 실행 환경") != 2:
+        fails += 1
+        print(f"  ✗ FAIL [G-9e 변이표 계수] '아니라' 꼬리 중복 계수 → {_v9.get('신뢰실행환경')}")
+
     print(f"  G-1 보존 · G-2 정합/그룹 · G-3 불변식 {len(inv)}항목 · "
           f"G-4 전파 {len(sims)}케이스 · G-5 조사·기호 {len(josa)}케이스 · "
           f"G-6 URL {len(urlish)}판정+누출검사 · G-7 꼬리조각 {len(frag)}케이스 · "
-          f"G-8 제로폭 {len(zw_cases)}판정+누출검사 완료")
+          f"G-8 제로폭 {len(zw_cases)}판정+누출검사 · G-9 빈틈 수정 {g9}케이스 완료")
     print(f"  → Phase G {'✅ 통과' if fails == 0 else f'❌ {fails}건 실패'}")
     return fails
 
@@ -1822,6 +1929,46 @@ def phase_d_rules():
             fails += 1
             print(f"  ✗ FAIL [D-7 가족 타이브레이크] 동률 '정책자료'가 가족('자료') 다수="
                   f"붙임을 따라가야 한다 — 실제={_tb_hit}")
+
+        # ⓐ-2 동률의 **겹치는 낱말 이음매** 층(2026-10-19) — 가족·규범보다 먼저 본다. '기본급식지원'
+        #   1:1을 띄우면 문서가 늘 붙여 쓰는 '기본급식'과 같은 이음매가 갈린다(전부 수락 시뮬레이션에서
+        #   원래 없던 혼재 발생). 규범 기본값(미등재=띄움)과 반대 방향이어야 하고 근거가 붙어야 한다.
+        _nj_text = ("기본급식지원 사업. 기본 급식지원 사업. 기본급식 제공. 기본급식을 늘린다. "
+                    "학적변동정보 조회. 학적변동 정보 조회. 변동정보 갱신. 변동정보를 본다.")
+        _nj = _mp.find_compound_spacing_consistency(_nj_text, exists_fn=lambda w: False,
+                                                    with_basis=True)
+        for _base, _want in (("기본급식지원", "기본급식지원"), ("학적변동정보", "학적변동정보")):
+            n_fam += 1
+            _row = next((r for r in _nj if r[1].replace(" ", "") == _base), None)
+            if _row is None or _row[1] != _want or not (_row[4] and _row[4][0] == "nested"):
+                fails += 1
+                print(f"  ✗ FAIL [D-7 겹치는 낱말 이음매] 동률 '{_base}'는 짧은 낱말의 붙임을 따라야 "
+                      f"한다(근거 nested) — 실제={_row}")
+        #   ★자기 다수가 있는 낱말은 겹치는 낱말 근거로도 **절대** 안 움직인다(동률에만 쓰는 층).
+        n_fam += 1
+        _own = _mp.find_compound_spacing_consistency(
+            "기본 급식지원 사업. 기본 급식지원 계획. 기본급식지원 예산. 기본급식 제공. 기본급식을 늘린다.",
+            exists_fn=lambda w: False)
+        if not any(r[0] == "기본급식지원" and r[1] == "기본 급식지원" for r in _own):
+            fails += 1
+            print(f"  ✗ FAIL [D-7 겹치는 낱말 이음매] 자기 다수(띄움 2:1)가 있으면 그대로여야 한다 "
+                  f"— 실제={_own}")
+        # ⓐ-3 순수 명사 게이트 — 붙임형 한 번의 kiwi 분석만 보면 오분석('이상거래'=이/MM+상거래)에
+        #   낱말이 통째로 빠진다. 띄어쓴 조각이 순수 명사면 받는다(junction_pass._noun_group과 같은 기준).
+        n_fam += 1
+        _g = _mp.find_compound_spacing_consistency(
+            "이상거래 탐지. 이상거래 분석. 이상거래 대응. 이상 거래 점검.", exists_fn=lambda w: False)
+        if not any(r[0] == "이상 거래" and r[1] == "이상거래" for r in _g):
+            fails += 1
+            print(f"  ✗ FAIL [D-7 명사 게이트] '이상 거래'→'이상거래'(3:1) 후보가 없다 — 실제={_g}")
+        #   ⑪-b(AI 붙이기 위임)는 결정론 게이트와 **정확히 같은** 조건이어야 한다 — 결정론이 받는
+        #   모양을 AI 카드로 남겨 두면 같은 판단이 두 카드로 갈린다.
+        n_fam += 1
+        from core.models import Correction as _Cx
+        if not ai_guards.is_compound_join_respacing(_Cx(original="이상 거래", corrected="이상거래",
+                                                  reason="", source="ai_typo")):
+            fails += 1
+            print("  ✗ FAIL [D-7 명사 게이트] ⑪-b가 '이상 거래'→'이상거래'를 결정론에 위임하지 않는다")
 
         # ⓑ 충돌 산출 — 단위는 **카드가 아니라 낱말(base)**. ★거절 카드도 반드시 포함한다
         #   (거절 = 앱이 아무것도 안 바꿈 = 문서에 두 표기가 그대로 남음. 사용자 지적

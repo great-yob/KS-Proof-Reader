@@ -1629,7 +1629,7 @@ def eojida_join_near_tie(orig: str) -> bool:
 
 
 def find_compound_spacing_consistency(text: str, *, min_len: int = 4, max_len: int = 14,
-                                      exists_fn=None) -> list:
+                                      exists_fn=None, with_basis: bool = False) -> list:
     """복합명사의 띄어쓰기 혼재를 **저자 다수 표기로 통일**하는 후보를 만든다.
 
     실무 교정: 복합명사 띄어쓰기는 옳고 그름을 따지기보다, 한 문서 안에서 저자가 더
@@ -1637,26 +1637,54 @@ def find_compound_spacing_consistency(text: str, *, min_len: int = 4, max_len: i
     '정책 보고서' → '정책보고서'.
 
     방법(문서 주도·안전):
-      · 붙여 쓴 어절(조사 제거 base, len>=min_len, **순수 명사**: 분석 결과가 NNG/NNP
-        로만 구성)을 후보로 모아 붙여 쓴 등장 수(n_joined)를 센다.
+      · 붙여 쓴 어절(조사 제거 base, len>=min_len)을 후보로 모아 붙여 쓴 등장 수(n_joined)를 센다.
       · base를 모든 내부 위치에서 둘로 쪼개 보며, **문서에 실제로 등장하는 띄어쓴 형태**
-        (예: '데이터 베이스')를 정규식으로 찾아 n_spaced를 얻는다(kiwi가 안 쪼개는
-        복합어도 문서 실제 표기로 잡힌다). 가장 많이 등장한 분리 지점을 채택.
+        (예: '데이터 베이스')를 찾아 n_spaced를 얻는다(kiwi가 안 쪼개는 복합어도 문서 실제
+        표기로 잡힌다). 가장 많이 등장한 분리 지점을 채택.
+      · **순수 명사 낱말만** — 붙임형이 NNG/NNP로만 읽히거나, 문서의 **띄어쓴 형태가 조각마다**
+        NNG/NNP로만 읽힐 때. ⚠ 붙임형 한 번의 분석만 보면 kiwi 오분석에 낱말이 통째로 빠진다
+        (2026-10-19 실측: '이상거래'=이/MM+상거래 11:4 · '동행식당'=동/MM+행 115:2 · '족부궤양'
+        14:1이 카드 없이 혼재로 남았다). 저자가 띄어 쓴 형태는 경계가 드러나 정상 분석된다 —
+        이음매 패스 `junction_pass._noun_group`과 같은 기준이다(하나를 바꾸면 둘을 볼 것).
       · 두 형태가 모두 등장하고(혼재) 한쪽이 **엄격히 우세**하면 소수→다수 후보로 반환.
-      · **동률**(1:1 등)은 다수결이 불가하다 — `exists_fn`(사전 존재 검사)이 주어지면
-        **규범 기본 방향**으로 후보를 낸다: 붙임형이 사전 등재 복합어면 붙임으로, 아니면
-        띄어쓰기 원칙(한글 맞춤법 제2항 — 단어별 띄어 씀)으로. exists_fn=None이면 기존대로
-        제외(무회귀). 호출부는 동률(n_min==n_maj)을 반드시 저신뢰 검수 카드로 만들 것
-        (사용자 정책 결정 2026-07-02: '읍면동담당' 1:1 혼재도 검수 카드로 표출).
+      · **동률**(1:1 등)은 다수결이 불가하다 — `exists_fn`(사전 존재 검사)이 주어지면 아래
+        계층으로 방향을 정한다. exists_fn=None이면 기존대로 제외(무회귀). 호출부는 동률
+        (n_min==n_maj)을 반드시 저신뢰 검수 카드로 만들 것(사용자 정책 결정 2026-07-02:
+        '읍면동담당' 1:1 혼재도 검수 카드로 표출).
+          1 겹치는 낱말의 이음매 — 그 이음매를 가로지르는 **더 짧은 낱말**이 문서에서 한
+            방향으로만 쓰이면 그 방향(아래 `_junction_evidence`)
+          2 가족(머리낱말)의 다수
+          3 규범 기본값 — 붙임형이 사전 등재 복합어면 붙임, 아니면 띄어쓰기 원칙(맞춤법 제2항)
 
     반환: [(minority, majority, n_minority, n_majority), ...]. 미설치/실패 시 [].
+      with_basis=True면 5번째 원소로 동률 방향의 근거를 붙인다 — 겹치는 낱말 근거일 때만
+      `("nested", [(낱말, 붙임 수, 띄움 수), …])`, 그 밖(동률 아님·가족·규범)은 None.
     교정은 호출 측(워커)이 '검수 필요'(저신뢰) 카드로 만든다 — 자동수정 아님.
     """
     import re as _re
-    from collections import Counter
+    from collections import Counter, defaultdict
     kiwi = _get_kiwi()
     if kiwi is None or not text:
         return []
+
+    _sj = {}
+
+    def _strip(w):
+        if w not in _sj:
+            _sj[w] = strip_josa(w) or ""
+        return _sj[w]
+
+    _pn = {}
+
+    def _pure(w):
+        """NNG/NNP로만 읽히는가(순수 명사 덩어리 — 용언·의존명사·조사 섞이면 거짓)."""
+        if w not in _pn:
+            try:
+                toks = kiwi.analyze(w)[0][0]
+            except Exception:
+                toks = None
+            _pn[w] = bool(toks) and all(t.tag in ("NNG", "NNP") for t in toks)
+        return _pn[w]
 
     # 1) 붙여 쓴 **한글 런**의 조사 제거 base 등장 수(유니크 런만 분석).
     #    ⚠ 공백 split 토큰으로 세면 가운뎃점·괄호·쉼표가 낱말을 이어붙여
@@ -1667,43 +1695,75 @@ def find_compound_spacing_consistency(text: str, *, min_len: int = 4, max_len: i
     #    검사 원칙과 동일하게 한글 런으로 센다(순수 한글 입력이라 strip_josa도 정확).
     joined = Counter()
     for run, c in Counter(_re.findall(r"[가-힣]+", text)).items():
-        base = strip_josa(run) or run
+        base = _strip(run) or run
         if min_len <= len(base) <= max_len:
             joined[base] += c
 
+    # 띄어쓴 형태 색인 — **한 칸 공백으로 이어진 한글 런 쌍**(왼쪽 런 → 오른쪽 런 Counter).
+    #   'left right' 등장은 왼쪽 런이 정확히 left이고 오른쪽 런이 right(+조사 연쇄)인 쌍이다.
+    #   예전엔 후보·분리 지점마다 본문 전체를 정규식으로 다시 훑었다(같은 판정, 비용만 컸다).
+    #   ⚠ 카운트 정합(2026-07-15 사용자 보고 — 근거 수치와 검수 반복 수·실치환 불일치):
+    #   ① 공백은 **단일 스페이스**만 센다 — 카드 원문/브리지 RepeatFind가 'left right'
+    #      (한 칸) 리터럴로 탐색·치환하므로, 개행·다중 공백 등장을 세면 보이지도
+    #      치환되지도 않는 유령 근거가 된다.
+    #   ② **오른쪽도 어절 경계**를 판정한다(왼쪽 런 경계와 대칭) — '개선 방안연구'
+    #      는 pair('개선','방안연구')이지 ('개선','방안')이 아니다. 뒤 한글 런이 조사
+    #      연쇄면 같은 낱말('적정 급여를' 인정), 아니면 다른 낱말로 제외.
+    pairs = defaultdict(Counter)
+    runs = [(m.group(), m.start(), m.end()) for m in _re.finditer(r"[가-힣]+", text)]
+    for (a, _s, e), (b, s2, _e2) in zip(runs, runs[1:]):
+        if s2 == e + 1 and text[e] == " ":
+            pairs[a][b] += 1
+
+    def _split_count(left, right):
+        n = 0
+        for r2, c in (pairs.get(left) or {}).items():
+            if r2 == right or (r2.startswith(right) and _strip(r2) == right):
+                n += c
+        return n
+
+    def _junction_evidence(base, k):
+        """이음매 base[:k]|base[k:]를 가로지르는 **더 짧은 낱말**의 문서 표기 → 방향.
+
+        '기본급식지원'(1:1 동률)을 띄우면 문서가 늘 붙여 쓰는 '기본급식'(2회)과 같은 이음매가
+        갈린다(2026-10-19 실측 — 전부 수락하면 원래 없던 혼재가 생겼다). 동률은 자기 다수가
+        없으니 그 이음매에 대한 저자의 다른 기록을 먼저 본다. 조각은 양쪽 2글자 이상·전체
+        min_len 이상, 붙임은 런 base 일치, 띄움은 같은 자리 한 칸 공백(조사 연쇄 허용)으로 센다.
+        반환: (방향 'joined'|'spaced'|None, [(낱말, 붙임 수, 띄움 수), …]) — 한 방향뿐일 때만 방향.
+        """
+        wit, nj, ns = [], 0, 0
+        for i in range(0, k - 1):
+            for j in range(k + 2, len(base) + 1):
+                if i == 0 and j == len(base):
+                    continue
+                s = base[i:j]
+                if len(s) < min_len:
+                    continue
+                a, b = joined.get(s, 0), _split_count(s[:k - i], s[k - i:])
+                if a or b:
+                    wit.append((s, a, b))
+                    nj, ns = nj + a, ns + b
+        if nj and not ns:
+            return "joined", wit
+        if ns and not nj:
+            return "spaced", wit
+        return None, wit
+
     out, cand = [], []
     for base, n_joined in joined.items():
-        try:
-            tokens = kiwi.analyze(base)[0][0]
-        except Exception:
-            continue
-        if any(t.tag not in ("NNG", "NNP") for t in tokens):
-            continue   # 순수 명사 덩어리만(용언·의존명사·조사 섞이면 제외)
         # 2) 문서에 실제 등장하는 띄어쓴 분리 지점을 탐색(최다 등장 채택).
         best_n, best_sp = 0, None
         for k in range(2, len(base) - 1):
             left, right = base[:k], base[k:]
             if len(right) < 2:
                 continue
-            #   ⚠ 카운트 정합(2026-07-15 사용자 보고 — 근거 수치와 검수 반복 수·실치환 불일치):
-            #   ① 공백은 **단일 스페이스**만 센다 — 카드 원문/브리지 RepeatFind가 'left right'
-            #      (한 칸) 리터럴로 탐색·치환하므로, 개행·다중 공백 등장을 세면 보이지도
-            #      치환되지도 않는 유령 근거가 된다.
-            #   ② **오른쪽도 어절 경계**를 판정한다(왼쪽 (?<![가-힣])와 대칭) — '개선 방안연구'
-            #      는 pair('개선','방안연구')이지 ('개선','방안')이 아니다. 뒤 한글 런이 조사
-            #      연쇄면 같은 낱말('적정 급여를' 인정), 아니면 다른 낱말로 제외.
-            pat = _re.compile(r"(?<![가-힣])" + _re.escape(left) + " " + _re.escape(right))
-            n = 0
-            for m in pat.finditer(text):
-                j = m.end()
-                while j < len(text) and "가" <= text[j] <= "힣":
-                    j += 1
-                run = text[m.end():j]
-                if not run or (strip_josa(right + run) or "") == right:
-                    n += 1
+            n = _split_count(left, right)
             if n > best_n:
                 best_n, best_sp = n, f"{left} {right}"
         if not best_sp:
+            continue
+        # 순수 명사 낱말만 — 붙임형 또는 문서의 띄어쓴 형태(조각마다)가 NNG/NNP로만 읽힐 때.
+        if not (_pure(base) or all(_pure(p) for p in best_sp.split(" "))):
             continue
         cand.append((base, best_sp, n_joined, best_n))
 
@@ -1717,20 +1777,26 @@ def find_compound_spacing_consistency(text: str, *, min_len: int = 4, max_len: i
         fam_vote[(best_sp.split(" ")[-1], "joined" if n_j > n_s else "spaced")] += 1
 
     for base, best_sp, n_joined, n_spaced in cand:
+        basis = None
         if n_joined == n_spaced:
             if exists_fn is None:
                 continue   # 동률 → 제외(기존 동작 유지 — 호출부가 옵트인)
-            # 동률 — 자기 다수결이 불가하다. 계층 **낱말 자신의 다수 > 가족의 다수 >
-            #   규범 기본값**으로 방향을 정한다(2026-08-03 사용자 결정 — junction_pass의
-            #   '낱말 > 이음매 > 규범' 계층에 가족 한 층을 끼운 것).
-            #   ⚠ 왜 필요한가: 예전엔 동률을 **낱말별로** 규범 기본값으로 정해서, 같은
+            # 동률 — 자기 다수결이 불가하다. 계층 **낱말 자신의 다수 > 겹치는 낱말의 이음매 >
+            #   가족의 다수 > 규범 기본값**으로 방향을 정한다(2026-08-03 사용자 결정 —
+            #   junction_pass의 '낱말 > 이음매 > 규범' 계층에 가족 한 층을 끼운 것. 이음매 층은
+            #   2026-10-19 — 동률 카드가 카드 없는 짧은 낱말의 일관된 표기를 깨던 결함).
+            #   ⚠ 왜 가족이 필요한가: 예전엔 동률을 **낱말별로** 규범 기본값으로 정해서, 같은
             #   가족의 다른 낱말이 어느 방향이든 무시했다 → 규칙 스스로 계열 충돌을
             #   만들어냈다(실원고 5종 실측: 방향 충돌 가족 57개 중 **16개**가 이 원인).
             #   ⚠ 자기 다수가 있는 낱말은 절대 건드리지 않는다 — '산학협력'(51:10 붙임,
             #   산학협력법 용어)이 '국제 협력'(3:1 띄움)에 끌려가 깨지는 일은 없다.
+            ev, wit = _junction_evidence(base, best_sp.index(" "))
             head = best_sp.split(" ")[-1]
             n_fj, n_fs = fam_vote[(head, "joined")], fam_vote[(head, "spaced")]
-            if n_fj != n_fs:
+            if ev:
+                joined_wins = ev == "joined"                     # 겹치는 낱말의 이음매
+                basis = ("nested", wit)
+            elif n_fj != n_fs:
                 joined_wins = n_fj > n_fs                       # 가족의 다수
             else:
                 try:
@@ -1738,11 +1804,12 @@ def find_compound_spacing_consistency(text: str, *, min_len: int = 4, max_len: i
                 except Exception:
                     continue
             if joined_wins:
-                out.append((best_sp, base, n_spaced, n_joined))   # 붙임 방향
+                row = (best_sp, base, n_spaced, n_joined)   # 붙임 방향
             else:
-                out.append((base, best_sp, n_joined, n_spaced))   # 띄어쓰기 방향
+                row = (base, best_sp, n_joined, n_spaced)   # 띄어쓰기 방향
         elif n_joined > n_spaced:
-            out.append((best_sp, base, n_spaced, n_joined))   # 소수(띄어쓴)→다수(붙인)
+            row = (best_sp, base, n_spaced, n_joined)   # 소수(띄어쓴)→다수(붙인)
         else:
-            out.append((base, best_sp, n_joined, n_spaced))   # 소수(붙인)→다수(띄어쓴)
+            row = (base, best_sp, n_joined, n_spaced)   # 소수(붙인)→다수(띄어쓴)
+        out.append(row + (basis,) if with_basis else row)
     return out

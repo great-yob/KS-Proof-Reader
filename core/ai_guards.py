@@ -278,13 +278,19 @@ def is_compound_split_respacing(c) -> bool:
 #   ⚠ 판정은 **조각을 따로 분석하지 말 것** — 문맥 없이 '보다도'만 넣으면 kiwi가 MAG(부사)로
 #   읽어 조사임을 놓친다(실측). **붙인 형태 전체**를 분석해야 '분야보다도'=NNG+JKB+JX로 드러난다.
 #   ⚠ 조건은 `morph.find_compound_spacing_consistency`가 **실제로 받을 수 있는 형태**와
-#   정확히 같게 맞춘다(순수 한글 · 길이 4~14 · 분석 결과가 NNG/NNP뿐). 더 넓게 위임하면
-#   결정론이 그 후보를 스킵해 **카드가 통째로 사라진다**(⑪의 '2차전지' 회귀와 같은 부류).
+#   정확히 같게 맞춘다(순수 한글 · 길이 4~14 · 붙임형 또는 띄어쓴 조각마다 NNG/NNP뿐).
+#   더 넓게 위임하면 결정론이 그 후보를 스킵해 **카드가 통째로 사라진다**(⑪의 '2차전지'
+#   회귀와 같은 부류). 2026-10-19 결정론 게이트가 '띄어쓴 조각이 순수 명사'도 받게 되면서
+#   여기도 함께 넓혔다('이상 거래'→'이상거래' — 붙임형은 kiwi가 이/MM+상거래로 오독한다).
 _JOIN_MIN_LEN, _JOIN_MAX_LEN = 4, 14      # find_compound_spacing_consistency 기본값과 동일
 
 
-def _deterministic_takes_joined(joined: str) -> bool:
-    """붙임형이 결정론 다수결의 후보 조건(순수 한글 명사 덩어리·길이 4~14)을 만족하는가."""
+def _deterministic_takes_joined(joined: str, parts=()) -> bool:
+    """붙임형이 결정론 다수결의 후보 조건(순수 한글 명사 낱말·길이 4~14)을 만족하는가.
+
+    parts: 붙이기 전 조각들 — 붙임형이 순수 명사로 안 읽혀도 조각이 전부 순수 명사면 받는다
+    (결정론 쪽과 같은 기준).
+    """
     if not (_JOIN_MIN_LEN <= len(joined) <= _JOIN_MAX_LEN):
         return False
     if not all("가" <= ch <= "힣" for ch in joined):
@@ -294,10 +300,13 @@ def _deterministic_takes_joined(joined: str) -> bool:
         kiwi = _m._get_kiwi()
         if kiwi is None:
             return False
-        toks = kiwi.analyze(joined)[0][0]
+
+        def _pure(w):
+            toks = kiwi.analyze(w)[0][0]
+            return bool(toks) and all(t.tag in ("NNG", "NNP") for t in toks)
+        return _pure(joined) or (len(parts) > 1 and all(_pure(p) for p in parts))
     except Exception:
         return False
-    return bool(toks) and all(t.tag in ("NNG", "NNP") for t in toks)
 
 
 def is_compound_join_respacing(c) -> bool:
@@ -320,7 +329,8 @@ def is_compound_join_respacing(c) -> bool:
         if buf != ct:                                  # 어절 경계 어긋남(재배치) → 대상 아님
             return False
         if n >= 2:                                     # 이 교정문 어절이 여러 어절을 합쳤다
-            if not _deterministic_takes_joined(ct):
+            #   조각 기준은 두 조각일 때만 — 결정론 게이트가 보는 것도 2분할 조각이다.
+            if not _deterministic_takes_joined(ct, o_toks[j - n:j] if n == 2 else ()):
                 return False                           # 결정론이 못 받는 형태 → AI 카드 보존
             fired = True
     return fired and j == len(o_toks)

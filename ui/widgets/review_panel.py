@@ -672,7 +672,7 @@ class ReviewPanel(QWidget):
         self._full_text = ""
         self._note_ranges = []     # 각주 구간(표시 구분용 — 오프셋은 불변)
         # 등장 식별자 — 카드/미리보기 앵커는 **등장의 목록 인덱스가 아니라 uid**로 묶는다.
-        #   인덱스로 묶으면 역방향 교정 합류(_apply_flip)로 목록이 재정렬될 때마다 모든
+        #   인덱스로 묶으면 역방향 교정 합류(_apply_unify)로 목록이 재정렬될 때마다 모든
         #   카드의 id가 어긋나 '전량 재생성' 말고는 정합을 맞출 방법이 없었다(성능 원인).
         self._uid_seq = 0
         self._occ_pos = {}        # uid → self._occ 내 인덱스
@@ -1316,63 +1316,83 @@ class ReviewPanel(QWidget):
         self._card_scroll.setWidget(self._scroll_content)
 
     # ── 토스트 ───────────────────────────────────
+    #   ★**자리 3칸(상·중·하)을 차례로 돈다**(사용자 지시 2026-10-19). 예전엔 토스트가 하나뿐이고
+    #   늘 앱 정중앙에 떠서, 연달아 두 개가 나오면 앞의 것이 시간이 다 되기 전에 덮여 읽을 수 없었다
+    #   (일관성 카드의 수락 확인 팝업을 토스트로 바꾸면서 연달아 뜨는 일이 잦아졌다).
+    #   n번째 토스트는 n mod 3 자리에 뜨고 각자 제 타이머로 사라진다 — 네 번째는 첫 자리를 다시 쓴다.
+    _TOAST_SLOTS = 3
+    _TOAST_MS = 4500
+
     def _build_toast(self):
         """확인 팝업(LightConfirmDialog)과 같은 라이트 고정 카드 표면 — 헤드타이틀 +
         구분선 + 본문. 버튼만 없다(자동 소멸). 테마와 무관하므로 refresh_theme 불필요."""
-        # 바깥 컨테이너는 그림자 여백만 담당(투명) — 그림자는 안쪽 box에 걸린다.
-        self._toast_w = QWidget(self)
-        self._toast_w.setObjectName("lcdToastWrap")
-        # 앱 정중앙에 뜨므로 아래 콘텐츠 클릭을 가로채지 않게 마우스 통과(표시 전용).
-        self._toast_w.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        wrap = QVBoxLayout(self._toast_w)
-        wrap.setContentsMargins(20, 20, 20, 20)
-        wrap.setSpacing(0)
-        box, self._toast_title, self._toast_lbl = build_light_card("", "")
-        wrap.addWidget(box)
-        # ⚠ 배경 없는 plain QWidget은 전역 QSS에 물들 수 있어 명시적으로 투명 고정.
-        self._toast_w.setStyleSheet(
-            "QWidget#lcdToastWrap { background: transparent; border: none; }"
-            + LIGHT_CARD_QSS)
-        self._toast_w.setVisible(False)
-        self._toast_timer = QTimer(self)
-        self._toast_timer.setSingleShot(True)
-        self._toast_timer.timeout.connect(lambda: self._toast_w.setVisible(False))
+        self._toasts = []
+        for _i in range(self._TOAST_SLOTS):
+            # 바깥 컨테이너는 그림자 여백만 담당(투명) — 그림자는 안쪽 box에 걸린다.
+            w = QWidget(self)
+            w.setObjectName("lcdToastWrap")
+            # 앱 가운데 띠에 뜨므로 아래 콘텐츠 클릭을 가로채지 않게 마우스 통과(표시 전용).
+            w.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            wrap = QVBoxLayout(w)
+            wrap.setContentsMargins(20, 20, 20, 20)
+            wrap.setSpacing(0)
+            box, title_lbl, msg_lbl = build_light_card("", "")
+            wrap.addWidget(box)
+            # ⚠ 배경 없는 plain QWidget은 전역 QSS에 물들 수 있어 명시적으로 투명 고정.
+            w.setStyleSheet(
+                "QWidget#lcdToastWrap { background: transparent; border: none; }"
+                + LIGHT_CARD_QSS)
+            w.setVisible(False)
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda w=w: w.setVisible(False))
+            self._toasts.append((w, title_lbl, msg_lbl, timer))
+        self._toast_next = 0
 
     def _toast(self, message: str, title: str = "반복 일괄 처리"):
-        # 패널이 아닌 '앱 창' 정중앙에 표출 — 표시 시점에 최상위 창으로 옮겨
+        # 패널이 아닌 '앱 창' 기준으로 표출 — 표시 시점에 최상위 창으로 옮겨
         #   사이드바/활동 패널에 의해 중심이 치우치지 않게 한다. (__init__ 시점엔
         #   아직 창에 안 붙어 있어 여기서 지연 reparent.)
+        slot = self._toast_next
+        self._toast_next = (slot + 1) % self._TOAST_SLOTS
+        w, title_lbl, msg_lbl, timer = self._toasts[slot]
         win = self.window() or self
-        if self._toast_w.parentWidget() is not win:
-            self._toast_w.setParent(win)
-        self._toast_title.setText(title)
-        self._toast_lbl.setText(message)
-        set_card_msg_width(self._toast_lbl, message)
-        self._toast_w.adjustSize()
+        if w.parentWidget() is not win:
+            w.setParent(win)
+        title_lbl.setText(title)
+        msg_lbl.setText(message)
+        set_card_msg_width(msg_lbl, message)
+        w.adjustSize()
         # 좁은 창에서 가로로 넘치지 않게 — 래퍼(20×2)+카드(22×2) 여백을 뺀 폭으로 제한.
         avail = max(200, win.width() - 40)
-        if self._toast_w.width() > avail:
-            self._toast_lbl.setMaximumWidth(max(140, avail - 84))
-            self._toast_w.adjustSize()
-        self._position_toast()
-        self._toast_w.setVisible(True)
-        self._toast_w.raise_()
-        self._toast_timer.start(4500)
+        if w.width() > avail:
+            msg_lbl.setMaximumWidth(max(140, avail - 84))
+            w.adjustSize()
+        w.setVisible(True)
+        w.raise_()
+        self._position_toasts()
+        timer.start(self._TOAST_MS)
 
-    def _position_toast(self):
-        host = self._toast_w.parentWidget() or self
-        tw = self._toast_w.width()
-        th = self._toast_w.height()
-        x = (host.width() - tw) // 2
-        y = (host.height() - th) // 2
-        self._toast_w.move(max(12, x), max(12, y))
+    def _position_toasts(self):
+        """보이는 토스트를 상·중·하 자리에 놓는다. 칸 간격은 보이는 것 중 가장 큰 높이 —
+        내용 길이가 달라도 서로 겹치지 않는다(래퍼의 투명 여백 20px이 그 사이 간격이 된다)."""
+        shown = [(i, t[0]) for i, t in enumerate(self._toasts) if t[0].isVisible()]
+        if not shown:
+            return
+        pitch = max(w.height() for _i, w in shown) - 12
+        for i, w in shown:
+            host = w.parentWidget() or self
+            tw, th = w.width(), w.height()
+            x = (host.width() - tw) // 2
+            y = (host.height() - th) // 2 + (i - 1) * pitch
+            y = min(max(12, y), max(12, host.height() - th - 12))
+            w.move(max(12, x), y)
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self._equalize_splitter()
         self._align_search_row()
-        if self._toast_w.isVisible():
-            self._position_toast()
+        self._position_toasts()
 
     def showEvent(self, e):
         # 스테이지 전환으로 처음 보일 때는 크기가 그대로라 resizeEvent가 안 온다 —
@@ -2351,7 +2371,7 @@ class ReviewPanel(QWidget):
             return [c]
         # ⚠ _create_card가 카드마다 부르므로 전수 스캔을 두면 목록 길이의 제곱이 된다
         #   (690장 기준 수십만 회 — 카드 생성 4.1ms 예산에 그대로 얹힌다).
-        #   교정 목록은 _apply_flip의 append 말고는 변하지 않으므로 길이로 무효화한다.
+        #   교정 목록은 _apply_unify의 append 말고는 변하지 않으므로 길이로 무효화한다.
         if getattr(self, "_jmap_n", -1) != len(self._corrections):
             self._jmap = {}
             for x in self._corrections:
@@ -2479,41 +2499,47 @@ class ReviewPanel(QWidget):
                     lbl.setText(want)
 
     def _unify_dialog(self, occ: dict, status: str):
-        """일관성 카드 수락/거절 = 문서 전체 통일 방향 선택 — 확인 팝업 후 반영.
+        """일관성 카드 수락/거절 = 문서 전체 통일 방향 선택.
 
-        수락 → 교정 표기(corrected)로 통일, 거절 → 원문 표기(original)로 통일
-        (반대 방향 교정을 즉시 합성해 수락 상태로 추가). 두 방향 모두 그룹 전체가
-        함께 움직이며, 반대 카드에서 다시 선택하면 원래 방향으로 복귀한다(대칭).
+        수락 → 교정 표기(corrected)로 통일, 거절 → 원문 표기(original)로 통일. 같은 낱말의
+        통일 카드 전부가 함께 움직이며(`_unify_members`), 다른 카드에서 다시 고르면 그쪽으로
+        옮겨 간다(대칭).
+        ★수락은 **확인 팝업 없이** 바로 반영하고 토스트로 알린다(사용자 결정 2026-10-19 — 제안대로
+        통일하는 것은 카드에 이미 적힌 결과라 팝업이 정보 없이 조작만 한 번 더 시켰다). 거절은
+        다수 표기 쪽을 바꾸는 방향이라 무엇이 몇 곳 바뀌는지 팝업으로 보여 주고 확인받는다.
         """
         c = occ["c"]
         orig, corr = c.get("original", ""), c.get("corrected", "")
         target = corr if status == "accepted" else orig
+        lines = "\n".join(f"· '{f}' {n}곳 → '{target}'" for f, n in self._unify_plan(c, target))
+        if status == "accepted":
+            self._do_unify(occ, target)
+            self._toast(f"문서 전체를 '{target}' 표기로 통일했습니다."
+                        + (f"\n{lines}" if lines else ""), title="용어 일관성 통일")
+            return
         if not LightConfirmDialog.ask(
                 self, "용어 일관성 통일",
-                f"문서 전체를 '{target}' 표기로 통일합니다."):
+                f"문서 전체를 '{target}' 표기로 통일합니다."
+                + (f"\n\n{lines}" if lines else "")):
             return
         # 팝업이 완전히 닫힌 '다음 틱'에 실행 — 아래 작업(재판정·카드 재생성·미리보기
         #   재렌더)이 큰 문서에서 UI를 수 초 점유하는데, 팝업 창이 파괴되기 전에
         #   프리즈가 시작되면 빈 유령 창(응답 없는 흰 창)으로 화면에 남는다(사용자 보고).
         #   singleShot(0)으로 대화상자 테어다운을 먼저 완료시킨다.
-        QTimer.singleShot(0, lambda: self._do_unify(occ, orig, corr, status))
+        QTimer.singleShot(0, lambda: self._do_unify(occ, target))
 
-    def _do_unify(self, occ: dict, orig: str, corr: str, status: str):
-        """_unify_dialog 확인 후 실제 반영.
+    def _do_unify(self, occ: dict, target: str):
+        """_unify_dialog의 실제 반영.
 
         ⚠ **카드 목록을 재구성하지 않는다**(2026-07-27 성능 수정). 통일이 실제로 바꾸는
-          것은 ① 두 그룹의 수락/거절 상태와, 거절 방향에서만 ② 역방향 교정의 등장 몇 개다.
-          예전에는 그 둘을 반영하려고 _rebuild_cards로 카드를 전부 파괴한 뒤, 조작한
-          카드가 다시 나올 때까지 **0번부터 동기 재생성**했다 — 비용이 '조작한 카드의
+          것은 ① 같은 낱말 카드들의 수락/거절 상태·교정값과, ② 카드 없던 표기에 합성한 교정의
+          등장 몇 개다. 예전에는 그 둘을 반영하려고 _rebuild_cards로 카드를 전부 파괴한 뒤,
+          조작한 카드가 다시 나올 때까지 **0번부터 동기 재생성**했다 — 비용이 '조작한 카드의
           목록 위치'에 비례해, 목록 후반으로 갈수록 무한정 느려졌다(실측: 20번째 0.8초 →
           400번째 3.6초 → 690번째 6.2초). 이제 상태만 바뀌면 다시 칠하기만 하고, 등장이
           늘어난 경우에만 그 카드들을 제자리에 끼워 넣는다.
         """
-        c, ci = occ["c"], occ["ci"]
-        if status == "accepted":
-            self._apply_unify_forward(ci, orig, corr, active_occ=occ)
-        else:
-            self._apply_flip(c, ci, orig, corr, active_occ=occ)
+        self._apply_unify(occ["c"], target, active_occ=occ)
         # 처리한 카드를 목록 맨 위로 올리고 미리보기도 그 자리로 — **일반 카드와 완전히
         #   같은 마무리**다(`_set_status` 끝의 `_scroll_to`). 예전엔 앵커 복원으로 카드를
         #   '있던 자리에 그대로' 두었는데, 다른 카드는 전부 위로 정렬되는 터라 일관성
@@ -2628,11 +2654,6 @@ class ReviewPanel(QWidget):
             self._sync_rep_label(cd)
         self._schedule_prefetch()
 
-    def _find_reverse(self, orig: str, corr: str):
-        """반대 방향 교정(corr→orig)이 이미 목록에 있으면 반환."""
-        return next((r for r in self._corrections
-                     if r.get("original") == corr and r.get("corrected") == orig), None)
-
     def _mark_active_occ(self, active_occ):
         """미리보기 하이라이트의 '활성' 등장을 갱신 — 카드 재칠·미리보기 재렌더보다
         먼저 호출해야 새 카드/HTML이 활성 상태로 그려진다(재렌더 2회를 피한다).
@@ -2641,111 +2662,154 @@ class ReviewPanel(QWidget):
             return
         self._active_occ_id = active_occ["uid"]
 
-    def _apply_unify_forward(self, fwd_ci: int, orig: str, corr: str, active_occ=None):
-        """'교정 표기로 통일'(수락 방향) — 이 그룹 전체 수락 + 반대 교정 거절.
+    def _unify_members(self, c: dict) -> list:
+        """같은 낱말(공백 제거 키)의 통일 카드 — **낱말 하나 = 결정 하나**(c 포함, 목록 순).
 
-        반대 방향 카드를 새로 만들 필요는 없다: 원문 등장을 전부 corr로 바꾸면
-        문서에 원래 있던 corr 등장은 그대로라 그 자체로 통일이 완성된다. 다만 이전에
-        '원문 표기로 통일'을 했다면 반대 교정(corr→orig)이 수락 상태로 남아 있어
-        서로 상쇄되므로 반드시 거절로 되돌린다.
-
-        등장 목록은 그대로이고 상태만 바뀌므로 **카드 재구성이 없다**(항상 False 반환 —
-        '등장이 늘었는가'를 알리는 값이다).
+        ★3형태 변이('주거상향주민'·'주거상향 주민' → '주거 상향 주민')는 카드가 여러 장이라도
+          문서 전체 표기는 하나만 고를 수 있다. 예전엔 카드 한 장의 (원문, 교정) 쌍만 뒤집어서
+          ① 첫 카드를 거절(=붙임으로 통일)해도 형제 카드는 옛 다수형을 향한 채 대기로 남았고
+          ② 형제까지 거절하면 **원문이 같은 반대 카드가 하나 더** 생겨 그 등장이 전부 가려진 채
+          혼재가 조용히 남았다(2026-10-19 실측 · 코퍼스 27낱말). 카드는 그대로 다 보이고(사용자
+          지시 — 카드는 교정자에게 모두 제시한다) 결정만 낱말 단위로 묶는다.
+        ⚠ 이음매 그룹 카드는 뺀다 — 형제 중 하나가 그룹이면 이음매 패스가 형제를 모두 같은
+          그룹에 넣으므로(junction_pass ④-2) 그쪽 경로(_junction_dialog)가 맡는다.
         """
-        for o in self._occ:
-            if o["ci"] == fwd_ci:
-                o["status"] = "accepted"
-                o["auto"] = False
-                o["by_user"] = True
-        rev = self._find_reverse(orig, corr)
-        if rev is not None:
-            rev["status"] = "rejected"
-            for o in self._occ:
-                if o["c"] is rev:
-                    o["status"] = "rejected"
-                    o["auto"] = False
-                    o["by_user"] = True
-        self._mark_active_occ(active_occ)
-        self._derive_all()
-        self._restyle_dirty()
-        self._refresh_preview(defer=True)
-        self._emit_counts()
-        return False
+        key = (c.get("original") or "").replace(" ", "")
+        out = [x for x in self._corrections
+               if (x.get("original") or "").replace(" ", "") == key
+               and not x.get("junction_group") and self._flip_info(x)[0]]
+        if not any(x is c for x in out):
+            out.insert(0, c)
+        return out
 
-    def _apply_flip(self, c: dict, fwd_ci: int, orig: str, corr: str, active_occ=None):
-        """'원문 표기로 통일'(거절 방향) — 이 그룹 전체 거절 + 반대 교정(corr→orig) 수락.
+    @staticmethod
+    def _unify_forms(members: list) -> list:
+        """이 낱말이 문서에 가진 표기들(등장 순 아님 — 카드 순). 처음 제안값(_unify_base)도 포함한다
+        — 교정값을 다른 표기로 고쳐 쓴 뒤에도 원래 다수형을 잃지 않기 위해서다."""
+        forms = []
+        for x in members:
+            forms += [x.get("original", ""), x.get("corrected", ""),
+                      (x.get("_unify_base") or ("",))[0]]
+        return [f for f in dict.fromkeys(forms) if f]
 
-        반대 교정이 **새로 합성될 때만** 등장이 늘어난다(그때만 True 반환). 이미 있던
-        반대 교정을 되살리는 경우는 상태 변경뿐이라 카드 삽입도 일어나지 않는다.
+    def _unify_plan(self, c: dict, target: str) -> list:
+        """낱말 전체를 target으로 통일하면 바뀌는 표기 — [(표기, 곳 수)](target 제외)."""
+        members = self._unify_members(c)
+        out = []
+        for f in self._unify_forms(members):
+            if f == target:
+                continue
+            card = next((x for x in members if x.get("original") == f), None)
+            n = (sum(1 for o in self._occ if o["c"] is card and not o.get("shadowed"))
+                 if card is not None else self._count_substring(f))
+            if n:
+                out.append((f, n))
+        return out
+
+    def _apply_unify(self, c: dict, target: str, active_occ=None) -> bool:
+        """낱말 전체를 target 표기로 통일 — 같은 낱말의 통일 카드 전부를 한 번에 정한다.
+
+          · 원문이 target인 카드 → 거절(그 표기는 이미 목표다)
+          · 나머지 카드 → 교정값을 target으로 맞추고 수락(처음 제안과 같아지면 원래 사유로 복귀)
+          · 카드가 없는 표기(처음 다수형 등)가 문서에 있으면 → '그 표기→target' 교정을 합성·수락
+        두 방향(수락=교정 표기로 / 거절=원문 표기로)이 같은 연산이고, 다른 카드에서 다시 고르면
+        그 표기로 옮겨 간다(대칭). '표기 일관성 제안' 단계도 이 함수 하나로 뒤집는다.
+        반환: 등장이 늘었는가(합성 교정이 새로 생겼는가).
+
+        ⚠ 카드 목록을 재구성하지 않는다(_do_unify 주석). 등장이 늘 때만 _sync_cards.
+        ⚠ 사용자가 교정값을 직접 고친 형제 카드(_edited)는 건드리지 않는다.
+        ⚠ _build_occurrences 전체 재구성은 다른 카드의 부분 수락/거절(occ 단위) 상태를 지우므로
+          쓰지 않는다 — occ 상태를 보존한 채 판정만 다시 돈다.
         """
         # 카드 목록이 어디까지 만들어져 있는지 '등장 uid'로 기억 — 아래 재정렬로
         #   인덱스 기준 경계(_loaded_card_count)는 의미를 잃는다.
         prev_last_uid = (self._occ[self._loaded_card_count - 1]["uid"]
                          if 0 < self._loaded_card_count <= len(self._occ) else None)
+        members = self._unify_members(c)
+        forms = self._unify_forms(members)
+        reason = f"띄어쓰기 일관성(사용자 선택) — 문서 전체를 '{target}' 표기로 통일"
 
-        # 1) 이 방향(A→B)의 등장 전부 거절.
-        for o in self._occ:
-            if o["ci"] == fwd_ci:
-                o["status"] = "rejected"
-                o["auto"] = False
-                o["by_user"] = True
+        def _set(x, st):
+            x["status"] = st
+            for o in self._occ:
+                if o["c"] is x:
+                    o["status"] = st
+                    o["auto"] = False
+                    o["by_user"] = True
 
-        # 2) 반대 교정(B→A) 찾기(재뒤집기·복귀) 또는 생성 + 등장 합류.
-        rev = self._find_reverse(orig, corr)
-        if rev is None:
+        changed = set()
+        for x in members:
+            if x.get("_edited") and x is not c:
+                continue
+            if x.get("original") == target:
+                _set(x, "rejected")
+                continue
+            base = x.setdefault("_unify_base", (x.get("corrected", ""), x.get("reason", "")))
+            want, why = base if target == base[0] else (target, reason)
+            if x.get("corrected") != want:
+                x["corrected"], x["reason"] = want, why
+                x.pop("_compose_base", None)       # 겹침 합성은 새 값에서 다시 계산한다
+                changed.add(id(x))
+                for o in self._occ:
+                    if o["c"] is x:
+                        o.pop("_stem_done", None)  # 어절 경계 판정은 교정값에 의존한다
+            _set(x, "accepted")
+
+        # 카드가 없는 표기 → 합성. ⚠ 원문이 같은 카드가 이미 있으면(다른 종류의 카드라도) 만들지
+        #   않는다 — 원문이 같은 카드 두 장은 한 장의 등장을 전부 가린다(그게 바로 위 ②의 사고였다).
+        grew = False
+        taken = {x.get("original") for x in self._corrections}
+        for f in forms:
+            if f == target or f in taken:
+                continue
+            positions, start = [], 0
+            while self._full_text:
+                i = self._full_text.find(f, start)
+                if i < 0:
+                    break
+                positions.append(i)
+                start = i + len(f)
+            if not positions:
+                continue
             rev = {
-                "original": corr, "corrected": orig,
-                "reason": (f"[검수] 띄어쓰기 일관성(사용자 선택) — 문서 전체를 "
-                           f"'{orig}' 표기로 통일"),
+                "original": f, "corrected": target, "reason": "[검수] " + reason,
                 "source": c.get("source", "spacing"),
                 "color": c.get("color", 0),
                 "category": c.get("category") or "띄어쓰기",
                 "confidence": "low",
                 "status": "accepted",
-                "consistency_flip": True,   # 반대 카드에서 재뒤집기(원방향 복귀) 허용
-                # 가족 근거는 문서 등장 수라 방향을 뒤집어도 그대로다 — 물려주지 않으면
+                "consistency_flip": True,   # 이 카드에서 다시 고르면 다른 표기로 옮겨 간다
+                # 가족 근거는 문서 등장 수라 방향을 바꿔도 그대로다 — 물려주지 않으면
                 #   사용자가 통일 방향을 바꾼 낱말이 '표기 일관성 제안' 단계에서 사라진다.
                 "spacing_family": list(c.get("spacing_family") or ()),
+                "_unify_base": (target, "[검수] " + reason),
             }
             self._corrections.append(rev)
             rev_ci = len(self._corrections) - 1
-            positions, start = [], 0
-            while True:
-                i = self._full_text.find(corr, start)
-                if i < 0:
-                    break
-                positions.append(i)
-                start = i + len(corr)
+            taken.add(f)
             for k, p in enumerate(positions):
                 self._occ.append({
                     "uid": self._new_uid(),
-                    "ci": rev_ci, "c": rev, "pos": p, "end": p + len(corr),
+                    "ci": rev_ci, "c": rev, "pos": p, "end": p + len(f),
                     "rep_index": k + 1, "rep_total": len(positions),
                     "status": "accepted", "shadowed": False,
                     "auto": False, "by_user": True,
                 })
-            grew = bool(positions)
-        else:
-            grew = False
-            rev["status"] = "accepted"
-            for o in self._occ:
-                if o["c"] is rev:
-                    o["status"] = "accepted"
-                    o["auto"] = False
-                    o["by_user"] = True
+            grew = True
 
-        # 3) 전역 재정렬·어절경계/겹침 재판정(결정적·멱등) 후 파생값·카드·미리보기 갱신.
-        #    ⚠ _build_occurrences 전체 재구성은 다른 카드의 부분 수락/거절(occ 단위)
-        #    상태를 지우므로 쓰지 않는다 — occ 상태를 보존한 채 판정만 다시 돈다.
+        # 전역 재정렬·어절경계/겹침 재판정(결정적·멱등) 후 파생값·카드·미리보기 갱신.
         if grew:
-            self._ov_pairs = None    # 역방향 교정의 등장이 합류했다 — 캐시 무효화
+            self._ov_pairs = None    # 합성 교정의 등장이 합류했다 — 캐시 무효화
             self._occ.sort(key=lambda o: (o["pos"] is None, o["pos"] or 0))
             self._reindex_occ()
-            self._mark_stem_boundary_skips()   # 새 등장만 계산(_stem_done 메모)
+        if grew or changed:
+            self._mark_stem_boundary_skips()   # 새 등장·바뀐 교정값만 계산(_stem_done 메모)
             self._resolve_overlaps()
-        # ⚠ 활성 등장은 재정렬·역방향 등장 합류로 자리가 바뀐다 — 여기서 다시 잡는다.
+        # ⚠ 활성 등장은 재정렬·합성 등장 합류로 자리가 바뀐다 — 여기서 다시 잡는다.
         self._mark_active_occ(active_occ)
         self._derive_all()
+        if changed:
+            self._sync_corrected_widgets(changed)
         if grew:
             # 늘어난 등장의 카드만 제자리에 끼워 넣는다(전량 재생성 금지 — _do_unify 주석).
             self._sync_cards(prev_last_uid)
@@ -2913,7 +2977,7 @@ class ReviewPanel(QWidget):
     def apply_consistency(self) -> int:
         """수락된 가족을 선택 방향으로 통일하고 교정 그리드로 복귀. 뒤집은 낱말 수 반환.
 
-        실제 뒤집기는 기존 `_apply_flip`(그룹 거절 + 반대 교정 합성·수락)을 그대로 쓴다 —
+        실제 뒤집기는 기존 `_apply_unify`(낱말 전체를 한 표기로 — 형제 카드 포함)를 그대로 쓴다 —
         일관성 카드의 '반대 표기로 통일'과 같은 연산이라 새 경로를 만들지 않는다.
         ⚠ 가족 하나가 낱말 여러 개를 뒤집으므로 낱말마다 카드·미리보기를 다시 그리면
           프리즈가 된다 → `_batch_flip` 가드로 묶고 끝난 뒤 한 번만 재구성한다.
@@ -2931,7 +2995,7 @@ class ReviewPanel(QWidget):
         for f in self._families:
             if f["status"] in ("accepted", "rejected"):
                 self._fam_decided[f["key"]] = {"status": f["status"], "choice": f["choice"]}
-        # 그리드를 먼저 교정 카드 모드로 되돌린다 — _apply_flip이 만지는 카드 목록이
+        # 그리드를 먼저 교정 카드 모드로 되돌린다 — _apply_unify가 만지는 카드 목록이
         #   가족 카드면 안 되므로, 카드 없는 상태에서 데이터만 바꾸고 마지막에 재구성한다.
         self._fam_mode = False
         self._families = []
@@ -2947,10 +3011,8 @@ class ReviewPanel(QWidget):
             for act, ci, orig, corr in jobs:
                 if not (0 <= ci < len(self._corrections)):
                     continue
-                if act == "flip":
-                    self._apply_flip(self._corrections[ci], ci, orig, corr)
-                else:                       # "accept" — 거절해 둔 카드를 그 방향으로 되살림
-                    self._apply_unify_forward(ci, orig, corr)
+                # flip = 그 카드의 원문 표기로, accept = 그 카드의 교정 표기로 낱말 전체를 통일.
+                self._apply_unify(self._corrections[ci], orig if act == "flip" else corr)
         finally:
             self._batch_flip = False
         self._set_grid_title("교정 제안", self._CARD_STOPS)
