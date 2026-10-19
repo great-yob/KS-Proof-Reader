@@ -8,6 +8,8 @@ release.py — /release 스킬의 결정론 점검을 한 곳에 모은 도구
   · 손으로 관리하던 판별 목록(GUARD·DET)이 모듈을 놓쳤다(2026-10-16 감사: 4개). 판정을
     **실행 결과**로 한다 — 골드셋은 22초라 항상 돌리고, Phase E 기준선이 낡았는지는
     골드셋 출력의 '✅ 개선' 줄이 말해 준다.
+  · 실원고 코퍼스 재생(2026-10-19)은 eval/corpus_harness/run_corpus.py gate가 판정하고 여기선
+    종료 코드만 해석한다(점검 로직을 두 곳에 두지 않는다).
 
 사용(레포 루트에서, .venv64 파이썬으로):
   release.py preflight                    점검 전부 → 채널·판정
@@ -201,8 +203,8 @@ def preflight() -> int:
         elif e_line:
             ok(f"Phase E 기준선 최신 — {e_line}")
 
-    print("[점검] 적용 경로 E2E(실제 한/글)")
     runtime = [p for p in changed if _RUNTIME.match(p)]
+    print("[점검] 적용 경로 E2E(실제 한/글)")
     if not runtime:
         ok("런타임 코드 변경 없음 — E2E 생략")
     else:
@@ -223,6 +225,32 @@ def preflight() -> int:
             bad("E2E 원고가 없다 — KS_E2E_HWP 또는 교정샘플/05.hwp가 있는 PC에서 릴리스")
         else:
             bad(f"E2E 실패(exit {e.returncode})" + ("" if lines else f": {(e.stderr or '')[-400:]}"))
+
+    # 실원고 코퍼스 재생 게이트 — 골드셋(문장 단위)이 못 보는 계층 간 간섭·손실을 판정해 둔
+    #   카드 집합과의 차이로 잡는다(REFERENCE.md §코퍼스 재생 게이트). 사전 데이터도 카드를 바꾼다.
+    print("[점검] 실원고 코퍼스 재생(AI 켬·끔)")
+    if not runtime and not data_ch:
+        ok("런타임 코드·사전 데이터 변경 없음 — 코퍼스 재생 생략")
+    else:
+        t0 = time.time()
+        c = subprocess.run([PY, "eval/corpus_harness/run_corpus.py", "gate"], cwd=REPO,
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+        lines = [ln.rstrip() for ln in (c.stdout or "").splitlines() if ln.strip()]
+        for ln in lines:
+            print(f"      {ln.strip()}" if ln.startswith("[GATE]") else f"      {ln}")
+        if c.returncode == 0:
+            ok(f"코퍼스 카드 기준선과 같음 — {time.time() - t0:.0f}초")
+        elif c.returncode == 2:
+            judge_("코퍼스 카드가 판정해 둔 기준선과 다르다 — 바뀐 카드를 **한 장씩** 본다"
+                   "(`run_corpus.py diff _gate_ai_base _gate_ai --order` · `_gate_det_base _gate_det`). "
+                   "전부 이번 변경으로 설명되고 옳으면 `run_corpus.py gate --save-baseline` 후 다시 "
+                   "preflight, 커밋 메시지에 건수·사유 기록")
+        elif c.returncode == 4:
+            bad("코퍼스 원고 캐시가 없다 — 교정샘플/.corpus가 있는 PC에서 릴리스")
+        else:
+            bad(f"코퍼스 재생 실패(exit {c.returncode})"
+                + ("" if lines else f": {(c.stderr or '')[-400:]}"))
     return finish("PREFLIGHT")
 
 

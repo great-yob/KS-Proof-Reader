@@ -1,6 +1,6 @@
 ---
 name: release
-description: KS-Proof Reader 배포 릴리스를 중간 확인 없이 끝까지 완주한다 — release.py preflight(골드셋·Phase E·적용 경로 E2E·시크릿·.iss) → 버전·노트·커밋 → build_dist.py 빌드 → postbuild(평문 키·기동·설치 파일 백업) → GitHub Releases 업로드 → postrelease(업데이터 인식) → 구버전 정리. 성공 시 출력은 완료 문구와 링크 2줄뿐이며, 오류·확인 필요 사항·리마인드만 추가로 보고한다. 사용자가 "릴리스", "배포", "새 버전 올려줘", "/release" 라고 할 때 사용.
+description: KS-Proof Reader 배포 릴리스를 중간 확인 없이 끝까지 완주한다 — release.py preflight(골드셋·Phase E·적용 경로 E2E·실원고 코퍼스 재생·시크릿·.iss) → 버전·노트·커밋 → build_dist.py 빌드 → postbuild(평문 키·기동·설치 파일 백업) → GitHub Releases 업로드 → postrelease(업데이터 인식) → 구버전 정리. 성공 시 출력은 완료 문구와 링크 2줄뿐이며, 오류·확인 필요 사항·리마인드만 추가로 보고한다. 사용자가 "릴리스", "배포", "새 버전 올려줘", "/release" 라고 할 때 사용.
 user-invocable: true
 ---
 
@@ -47,7 +47,8 @@ touch .claude/.release-autoapprove
 ```
 
 워킹트리(깨끗해야 함)·채널 판별(`CHANNEL` 줄)·시크릿 감사·`.iss` 8항목·norm_map·**골드셋(항상, 22초)**·
-Phase E·**적용 경로 E2E**(런타임 코드가 바뀌었을 때, 약 80초)를 돈다. 마지막 줄이 판정이다.
+Phase E·**적용 경로 E2E**(런타임 코드가 바뀌었을 때, 약 80초)·**실원고 코퍼스 재생**(런타임 코드나 사전이
+바뀌었을 때, 약 3분 — 코드·사전·원고가 지난 실행과 같으면 즉시)을 돈다. 마지막 줄이 판정이다.
 
 - `PREFLIGHT OK` → 2단계.
 - `PREFLIGHT FAIL` → ✗ 줄을 보고하고 중단. 단, ✗가 **`[E 발화증가]`뿐**이면 증가분을 전수 확인한다
@@ -59,6 +60,13 @@ Phase E·**적용 경로 E2E**(런타임 코드가 바뀌었을 때, 약 80초)�
     `.venv64/Scripts/python.exe eval/ai_goldset/run_goldset.py --save-ambig-baseline`.
   - **E2E 수치가 기준선과 다르다** — 이번 릴리스의 결정론 계층 변경으로 설명되면
     `.venv64/Scripts/python.exe eval/e2e_apply/run_e2e.py --save-baseline`. 설명되지 않으면 중단·보고.
+  - **코퍼스 카드가 기준선과 다르다** — 바뀐 카드를 AI 켬·끔 둘 다 **한 장씩** 본다
+    (`.venv64/Scripts/python.exe eval/corpus_harness/run_corpus.py diff _gate_ai_base _gate_ai --order`, `_gate_det_base _gate_det`도).
+    사라진 카드도 본다(진짜 오타·비표준 표기가 숨었을 수 있다). 전부 이번 릴리스의 변경으로 설명되고 옳으면
+    `.venv64/Scripts/python.exe eval/corpus_harness/run_corpus.py gate --save-baseline`. 하나라도 설명되지 않거나
+    틀린 카드면 중단·보고.
+  - (✗) **AI 캐시 빗나감** — AI 입력이 바뀌었다. 릴리스 중엔 Gemini를 부르지 않는다(무료 한도·원고 전송) →
+    중단·보고. 채우기(`run_corpus.py gate --ai-live`)는 사용자 확인 후에만.
   - 기준선을 갱신했으면 preflight를 **다시 돌려 OK를 확인**하고, 건수·사유를 3단계 커밋 메시지에 남긴다
     (두 기준선 파일 모두 레포 밖이라 커밋 메시지가 유일한 기록이다).
 - 채널: 커밋이 있으면 앱, DB `meta.data_version`이 최신 `data-*` 태그보다 크면 데이터, 둘 다면 둘 다.
@@ -133,7 +141,8 @@ https://github.com/great-yob/KS-Proof-Reader/releases/tag/v{APP_VERSION}
   설치본 업그레이드이고, 이어지는 제거가 그것을 지운다(2026-07-23 실사고). 그 설치본은 자동 업데이트의
   유일한 실기 기준선이다. 설치 검증을 되살리지 말 것.
 - **점검 실패 상태로 릴리스**, 또는 점검을 느슨하게 고쳐 통과시키기.
-- **Phase E FAIL·E2E 변화를 확인 없이 기준선 갱신으로 덮기** — 갱신은 "보고 정당하다고 판정했다"는 서명이다.
+- **Phase E FAIL·E2E 변화·코퍼스 카드 변화를 확인 없이 기준선 갱신으로 덮기** — 갱신은 "보고 정당하다고
+  판정했다"는 서명이다.
 - **같은 번호로 다시 릴리스** — 이미 있는 태그를 옮기지 않는다(그 버전 사용자는 업데이트를 못 받는다).
 - **설치 파일 백업을 '지우기 직전'으로 미루기**, 백업에 없는 구버전 릴리스 삭제 — 되돌아갈 배포본이 사라진다.
 - **`gh release delete --cleanup-tag`** — 태그까지 지운다. 채널을 섞어 지우기(`data-*`·`stdict-*`는 독립 현행).

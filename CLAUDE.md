@@ -178,5 +178,5 @@ KS-Proof Reader — Korean-language proofreading tool for HWP (한/글) document
 - Korean docstrings/comments are the norm. Keep new code consistent.
 - `core/` is GUI-agnostic — never import `PySide6` from `core/`. UI threading lives in `ui/workers/`.
 - Long-running checkers accept a `threading.Event` named `stop_event` and a `logger` callable; honor both.
-- 자동 검증은 둘이다: **골드셋** `eval/ai_goldset/run_goldset.py`(교정 판단 · 결정론 · 22초)와 **적용 경로 E2E** `eval/e2e_apply/run_e2e.py`(실제 한/글 · 진짜 클릭 · 교정본 재추출을 기대 문서와 대조 · 약 80초 · 기준선은 원고 옆 `<원고>.e2e.json`). 둘 다 `/release`가 돌린다. 그 밖에는 앱(`.\.venv64\Scripts\python.exe main.py`)을 실제 `.hwp`/`.hwpx`로 돌려 확인한다. `core/` 모듈은 GUI 비의존이라 REPL에서 바로 돌릴 수 있다.
-- 결정론 규칙을 바꿀 때는 **실원고 코퍼스 하네스** `eval/corpus_harness/run_corpus.py`(run before/after → diff)로 카드 변화를 한 장씩 판정한다(릴리스 게이트 아님). 원고 캐시는 `교정샘플/.corpus/`에만 둔다.
+- 자동 검증은 셋이다: **골드셋** `eval/ai_goldset/run_goldset.py`(교정 판단 · 결정론 · 22초), **적용 경로 E2E** `eval/e2e_apply/run_e2e.py`(실제 한/글 · 진짜 클릭 · 교정본 재추출을 기대 문서와 대조 · 약 80초 · 기준선은 원고 옆 `<원고>.e2e.json`), **실원고 코퍼스 재생 게이트** `eval/corpus_harness/run_corpus.py gate`(20원고 × AI 켬(캐시 재생)·AI 끔 · 판정해 둔 카드 집합과 비교 · 약 3분). 셋 다 `/release`가 돌린다. 그 밖에는 앱(`.\.venv64\Scripts\python.exe main.py`)을 실제 `.hwp`/`.hwpx`로 돌려 확인한다. `core/` 모듈은 GUI 비의존이라 REPL에서 바로 돌릴 수 있다.
+- 결정론 규칙을 바꿀 때는 **실원고 코퍼스 하네스**(run before/after → diff)로 카드 변화를 AI 켬·끔 둘 다 한 장씩 판정하고, 판정이 끝나면 `gate --save-baseline`으로 서명한다(판정하지 않은 변화가 있으면 릴리스가 멈춘다). 원고 캐시·기준선은 `교정샘플/.corpus/`에만 둔다. 게이트는 AI 캐시가 빗나가면(= AI 입력 변경) 실패한다 — `--ai-live`(Gemini 호출)는 사용자 확인 후에만.
