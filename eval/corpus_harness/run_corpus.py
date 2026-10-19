@@ -17,12 +17,15 @@ eval/corpus_harness/run_corpus.py — 실원고 코퍼스 결정론 파이프라
   diff A B          두 실행의 카드 비교(내용 집합 + --order 시 순서까지). 바뀐 카드를 전부 출력
   summary NAME      (source, category, confidence) 분포
   events            data/event_queue.db의 사용자 결정을 **현행 finder로 재분류**해 거절률 산출
+  check NAME        **계층 간 불변식** 검사(invariants.py) — 원문 실재·[검수]=low·같은 원문 카드 1장 등.
+                    기준선과 무관하게 어떤 실행에서도 성립해야 하는 성질이다. gate는 두 방식에 자동으로 돌린다.
   gate              **릴리스 게이트** — AI 켬(캐시 재생·오프라인)·AI 끔 두 방식으로 병렬 실행해
                     판정해 둔 기준선 카드 집합과 비교한다(release.py preflight가 부른다). 코드·사전·
-                    원고 캐시의 지문이 지난 실행과 같으면 다시 돌리지 않는다.
+                    원고 캐시의 지문이 지난 실행과 같으면 다시 돌리지 않는다. 계층 간 불변식은 재사용해도
+                    매번 검사한다 — 위반은 기준선 차이(△)가 아니라 실패(✗)이고 기준선 서명도 막는다.
                     --save-baseline: 바뀐 카드를 한 장씩 판정한 **뒤에만** 현재 결과를 기준선으로 저장
                     --ai-live: 빗나간 AI 요청을 실제로 부른다(무료 한도·원고 전송 — 사용자 확인 후에만)
-                    종료 코드 0 같음 · 1 실패(실행 오류·AI 캐시 빗나감) · 2 다름/기준선 없음 · 4 원고 없음
+                    종료 코드 0 같음 · 1 실패(실행 오류·AI 캐시 빗나감·불변식 위반) · 2 다름/기준선 없음 · 4 원고 없음
 
 전형적 사용(규칙을 고치기 전/후):
   python eval/corpus_harness/run_corpus.py run before
@@ -305,6 +308,31 @@ def cmd_diff(args):
     print(f"합계 A={n_a} B={n_b} · 달라진 원고 {differ}")
 
 
+def _invariant_violations(name: str) -> dict:
+    """runs/NAME 전체의 계층 간 불변식 위반 {태그: [(id, 설명)]}. 검사기 자체 시험이 실패하면
+    그것도 위반으로 돌려준다(키 '_selftest') — 죽은 판정식으로 '위반 0'을 믿으면 안 된다."""
+    import invariants
+    dead = invariants.selftest()
+    if dead:
+        return {"_selftest": [(d, "검사기 자체 시험 실패 — 일부러 어긴 카드를 못 잡음") for d in dead]}
+    docs = {}
+    for tag, cards in _load_run(name).items():
+        with open(os.path.join(CACHE, tag + ".json"), encoding="utf-8") as fp:
+            docs[tag] = (cards, json.load(fp)["text"])
+    return invariants.check_run(docs)
+
+
+def cmd_check(args):
+    import invariants
+    res = _invariant_violations(args.name)
+    if not res:
+        print(f"[불변식] {args.name}: 위반 없음 — {len(invariants.INVARIANTS)}종 검사")
+        return
+    for ln in invariants.summarize(res, show=args.show):
+        print(f"[불변식] {ln}" if not ln.startswith("   ") else ln)
+    sys.exit(1)
+
+
 def cmd_summary(args):
     dist = Counter()
     for cards in _load_run(args.name).values():
@@ -561,6 +589,14 @@ def cmd_gate(args):
         if s.get("miss"):
             bad.append(f"AI 캐시 빗나감 {s['miss']}건 — AI 입력(프롬프트·청커·글로서리·seed)이나 실단어 "
                        "판정 후보가 바뀌었다. 사용자 확인 후 `run_corpus.py gate --ai-live`로 채운다")
+        if not s.get("proc_fail") and not s.get("missing_docs"):
+            import invariants
+            res = _invariant_violations("_gate_" + mode)
+            if res:
+                lines = invariants.summarize(res, show=_GATE_SHOW)
+                bad.append("계층 간 불변식 위반 — " + " · ".join(
+                    ln for ln in lines if not ln.startswith("   "))
+                    + "\n" + "\n".join(ln for ln in lines if ln.startswith("   ")))
         for msg in bad:
             print(f"[GATE] ✗ {label}: {msg}")
         broken = broken or bool(bad)
@@ -625,6 +661,10 @@ def main():
     p.set_defaults(fn=cmd_summary)
     p = sub.add_parser("events")
     p.set_defaults(fn=cmd_events)
+    p = sub.add_parser("check")
+    p.add_argument("name")
+    p.add_argument("--show", type=int, default=40, help="펼칠 위반 사례 수")
+    p.set_defaults(fn=cmd_check)
     p = sub.add_parser("gate")
     p.add_argument("--save-baseline", action="store_true",
                    help="현재 결과를 기준선으로(바뀐 카드를 전부 판정한 뒤에만)")

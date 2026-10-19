@@ -69,6 +69,24 @@ def _flag_cover(merged: list):
     return covered
 
 
+def _drop_flags_under_consistency(merged: list) -> int:
+    """같은 원문의 띄어쓰기 일관성 카드(`consistency_flip`)가 있으면 그 사전 안전망 카드(dict_flag)를
+    뺀다 — 낱말은 이미 카드로 보이고, 같은 원문 카드 두 장은 적용 등장 인덱스를 어긋나게 한다. 뺀 수 반환.
+
+    ⚠ 일관성 카드를 만드는 단계가 **둘**이라([7] 2분할 finder · [9.2] 이음매 미탐 보완) 둘 다 끝난
+      **[9.2] 뒤 한 곳**에서 부른다. 예전엔 [7] 안에서만 뺐다 — ① [9.2]가 만든 카드('일자리 수(19) :
+      일자리수(1)' — 뒷말이 1글자라 2분할 finder 밖)에는 규칙이 닿지 않아 같은 원문 카드가 두 장 남았고
+      ② [7] 카드가 [9.2]에서 방향 오판으로 제거되면 그 낱말은 안전망 카드까지 잃었다(2026-10-19
+      코퍼스 계층 간 불변식 검사 `unique_original`이 찾음).
+    """
+    cons = {c.original for c in merged if c.consistency_flip}
+    if not cons:
+        return 0
+    n0 = len(merged)
+    merged[:] = [c for c in merged if not (c.source == "dict_flag" and c.original in cons)]
+    return n0 - len(merged)
+
+
 class ProofreadingWorker(QThread):
     """교정 분석 백그라운드 워커"""
 
@@ -1148,7 +1166,7 @@ class ProofreadingWorker(QThread):
                 #   ⚠ 여기서 `continue`로 **버리면 안 된다** — 근거가 된 AI 교정이
                 #   [8](조사 변형 정리)·[9.5](본문·문서 대조)에서 **나중에 드롭될 수 있고**,
                 #   그러면 그 낱말은 AI 카드도 사전 카드도 없이 통째로 사라진다
-                #   (실측 2026-07-31: '재산관'·'더서울미디어'가 이렇게 소멸. 어느 낱말이
+                #   (실측 2026-07-31: '재산관'과 판권면의 인쇄소명이 이렇게 소멸. 어느 낱말이
                 #   사라지는지가 AI 실행마다 달라 재현조차 어려웠다). 판정은 끝까지 하고
                 #   보관만 해 두었다가 [9.6]에서 커버가 풀렸는지 다시 본다.
                 _covered_now = _is_covered(clean)
@@ -1451,11 +1469,11 @@ class ProofreadingWorker(QThread):
                     #   '확인 권장' 카드라 문서 전체 통일을 막을 이유가 없다. 예전엔 미등재어 카드
                     #   '글로벌인재'가 31:1 일관성 카드를 막아 자동 통일이 사라지고 이음매 계층의 검수
                     #   카드만 남았다(2026-10-19 — [6] 덮임 판정을 바로잡아 안전망 카드가 더 드러나며 확인).
-                    #   같은 원문의 일관성 카드가 생기면 그 안전망 카드는 아래에서 뺀다(낱말은 이미 보인다).
+                    #   같은 원문의 일관성 카드가 생기면 그 안전망 카드는 [9.2] 뒤 _drop_flags_under_consistency가
+                    #   뺀다(낱말은 이미 보인다 — 일관성 카드를 만드는 [9.2]까지 끝나야 판정할 수 있다).
                     _flag_only = ({c.original for c in merged if c.source == "dict_flag"}
                                   - {c.original for c in merged if c.source != "dict_flag"}
                                   - {c.original for c in sp_cards})
-                    _cons_over_flag = set()
                     _ai_origs = [c.original for c in merged
                                  if c.source not in ("ai_polish", "dict_flag") and c.original]
                     from core import consistency_family as _cf
@@ -1500,15 +1518,6 @@ class ProofreadingWorker(QThread):
                                 minority, majority, n_min, n_maj),
                         ))
                         existing.add(minority)
-                        if minority in _flag_only:
-                            _cons_over_flag.add(minority)
-                    if _cons_over_flag:
-                        _n0 = len(merged)
-                        merged[:] = [c for c in merged if not (
-                            c.source == "dict_flag" and c.original in _cons_over_flag)]
-                        _gone = _n0 - len(merged)
-                        det_review[:] = [(l, n - _gone) if l == "사전안전망" else (l, n)
-                                         for l, n in det_review]
                     # (복합명사 일관성 건수는 아래 '띄어쓰기 백스톱' 합계에 포함)
 
                 # 부호·영문 띄어쓰기(규칙 기반) — kiwi가 못 잡는 문장부호/스크립트
@@ -1754,6 +1763,11 @@ class ProofreadingWorker(QThread):
                     log(f"  [보완] 정당한 구분 유지 {jd['preserved']}건 추가")
             except Exception as e:
                 log(f"  [이음매 정합] 스킵: {e}")
+            # 일관성 카드가 다 만들어졌다([7]·[9.2]) — 같은 원문의 안전망 카드를 뺀다(함수 주석).
+            _gone = _drop_flags_under_consistency(merged)
+            if _gone:
+                det_review[:] = [(l, n - _gone) if l == "사전안전망" else (l, n)
+                                 for l, n in det_review]
 
         # [9.5] 적용 가능성 검증 — '문서에서 찾을 수 있는 원문'만 카드로 내보낸다(불변식).
         #     실패 항목 근절(사용자 보고 2026-07-03 — 30.hwp 실패 33건 중 5건이 이 부류):
