@@ -269,7 +269,8 @@ def is_homograph_norm_key(key: str) -> bool:
         return False
 
 
-def is_verb_inflection_homograph(key: str, eojeol: str, text: str) -> bool:
+def is_verb_inflection_homograph(key: str, eojeol: str, text: str,
+                                 near_tie: bool = False) -> bool:
     """norm_map 키 `key`가 이 문서에서 '표준 용언의 활용형'과 동형이라 치환을 보류해야 하는가?
 
     '나올'("답변이 나올 수 있다" = 나오+ㄹ 관형형)이 명사 표제어 '나올(羅兀)→너울'로
@@ -285,12 +286,15 @@ def is_verb_inflection_homograph(key: str, eojeol: str, text: str) -> bool:
         그 카드는 정당하므로 유지.
     억제 방향 트레이드오프(수용): 조사 없는 통어절 '된장 찌게'는 kiwi가 용언으로 읽어 미탐 —
     과교정 0 원칙 우선. 형태소 미가용 시 False(graceful — 기존 동작 유지).
+    `near_tie=True`면 ②를 **근접 대안 읽기**까지 넓혀 본다(core.doc_analysis.TIE_DELTA) — 워커는
+    이 판정이 참이면 카드를 지우지 않고 low로 내린다(분석이 갈리는 자리는 자동 적용하지 않는다).
     """
     if not key or key != eojeol:
         return False
     try:
         from core import morph as _morph
-        lemma = _morph.verb_inflection_lemma(text, eojeol) if _morph.available() else None
+        lemma = (_morph.verb_inflection_lemma(text, eojeol, near_tie=near_tie)
+                 if _morph.available() else None)
     except Exception:
         lemma = None
     if not lemma:
@@ -298,7 +302,8 @@ def is_verb_inflection_homograph(key: str, eojeol: str, text: str) -> bool:
     return lookup_norm(lemma) is None
 
 
-def is_noun_josa_homograph(key: str, eojeol: str, text: str) -> bool:
+def is_noun_josa_homograph(key: str, eojeol: str, text: str,
+                           near_tie: bool = False) -> bool:
     """norm_map 키 `key`가 이 문서에서 '체언 + 조사'와 동형이라 치환을 보류해야 하는가?
 
     is_verb_inflection_homograph(용언 활용형)의 **명사 쪽 짝**. 계기(2026-08-03 사용자
@@ -326,12 +331,14 @@ def is_noun_josa_homograph(key: str, eojeol: str, text: str) -> bool:
       core.morph.noun_josa_split 참조).
     억제 방향 트레이드오프(수용): 방언 명사를 조사 없이 통어절로 쓴 문맥('곰방이 물고')은
     체언+조사로 읽혀 미탐 — 과교정 0 원칙 우선. 형태소 미가용 시 False(graceful).
+    `near_tie=True`는 is_verb_inflection_homograph와 같다(근접 대안까지 — 워커는 low로 내린다).
     """
     if not key or key != eojeol:
         return False
     try:
         from core import morph as _morph
-        base = _morph.noun_josa_split(text, eojeol) if _morph.available() else None
+        base = (_morph.noun_josa_split(text, eojeol, near_tie=near_tie)
+                if _morph.available() else None)
     except Exception:
         base = None
     if not base:

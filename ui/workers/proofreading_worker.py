@@ -727,6 +727,7 @@ class ProofreadingWorker(QThread):
                 if norm_map:
                     existing = {c.original for c in merged}
                     net = []
+                    n_tie = 0
                     for w in doc_eojeols:
                         # 어절 자체 → 없으면 조사 제거형 순으로 매핑 조회
                         for key in (w, _strip_josa(w)):
@@ -765,12 +766,26 @@ class ProofreadingWorker(QThread):
                                 reason = f"[규범표기] 규범표기인 '{norm}' 권장"
                                 if repeated:
                                     reason += f"\n— 저자 '{key}' {freq}회 반복 → 사용자 결정 필요"
+                                # 분석 확신도 — 1순위 문맥 읽기는 위 두 동형이의 가드를 통과했지만
+                                #   **근접 대안 읽기**(core.doc_analysis.TIE_DELTA 이내)가 활용형·체언+조사로
+                                #   읽으면, kiwi가 거의 같은 확신으로 '나올'·'말이' 부류로도 읽는 자리다.
+                                #   지우지 않고 low로 내린다(가드 자체는 1순위로만 — 근접 대안까지 지우면
+                                #   kiwi의 흔들림에 정당한 규범표기 카드를 잃는다).
+                                tie = not repeated and (
+                                    _nd.is_verb_inflection_homograph(key, w, text, near_tie=True)
+                                    or _nd.is_noun_josa_homograph(key, w, text, near_tie=True))
+                                if tie:
+                                    # `[검수]` 접두 = 가드 강등 표지(consistency_pass._guard_demoted가
+                                    #   신뢰도 통일에서 되올리지 않는 열쇠).
+                                    reason = (f"[검수] 규범표기인 '{norm}' 권장 → 사용자 결정 필요\n"
+                                              "— 형태소 분석이 갈리는 자리(활용형·조사 결합으로도 읽힘)")
+                                    n_tie += 1
                                 net.append(Correction(
                                     original=w, corrected=corrected,
                                     reason=reason,
                                     source="dict", color=HL_DICT,
                                     category="규범표기",
-                                    confidence="low" if repeated else "high",
+                                    confidence="low" if (repeated or tie) else "high",
                                 ))
                                 existing.add(w)
                             break
@@ -779,8 +794,10 @@ class ProofreadingWorker(QThread):
                         _n_lo = sum(1 for c in net if c.confidence == "low")
                         if len(net) - _n_lo:
                             det_auto.append(("규범표기", len(net) - _n_lo))
-                        if _n_lo:
-                            det_review.append(("규범표기(빈출)", _n_lo))
+                        if _n_lo - n_tie:
+                            det_review.append(("규범표기(빈출)", _n_lo - n_tie))
+                        if n_tie:
+                            det_review.append(("규범표기(분석 갈림)", n_tie))
             except Exception as e:
                 log(f"  [규범표기] 정규화 스킵: {e}")
 
@@ -806,6 +823,7 @@ class ProofreadingWorker(QThread):
                 if pair_map:
                     existing = {c.original for c in merged}
                     net = []
+                    n_tie = 0
                     for w in doc_eojeols:
                         for key in (w, _strip_josa(w)):
                             norm = pair_map.get(key)
@@ -835,12 +853,19 @@ class ProofreadingWorker(QThread):
                                           + (f" ({rid})" if rid else ""))
                                 if repeated:
                                     reason += f" (저자 {freq}회 반복 — 검수 후 결정)"
+                                # 분석 확신도 — 근접 대안 읽기가 동형이의로 읽으면 low([5.7]과 동일).
+                                tie = not repeated and (
+                                    _nd.is_verb_inflection_homograph(key, w, text, near_tie=True)
+                                    or _nd.is_noun_josa_homograph(key, w, text, near_tie=True))
+                                if tie:
+                                    reason = "[검수] " + reason + " (형태소 분석이 갈리는 자리 — 검수 후 결정)"
+                                    n_tie += 1
                                 net.append(Correction(
                                     original=w, corrected=corrected,
                                     reason=reason,
                                     source="dict", color=HL_DICT,
                                     category="규범표기",
-                                    confidence="low" if repeated else "high",
+                                    confidence="low" if (repeated or tie) else "high",
                                 ))
                                 existing.add(w)
                             break
@@ -849,8 +874,10 @@ class ProofreadingWorker(QThread):
                         _n_lo = sum(1 for c in net if c.confidence == "low")
                         if len(net) - _n_lo:
                             det_auto.append(("어문규범", len(net) - _n_lo))
-                        if _n_lo:
-                            det_review.append(("어문규범(빈출)", _n_lo))
+                        if _n_lo - n_tie:
+                            det_review.append(("어문규범(빈출)", _n_lo - n_tie))
+                        if n_tie:
+                            det_review.append(("어문규범(분석 갈림)", n_tie))
             except Exception as e:
                 log(f"  [규범표기] 어문 규범 페어 스킵: {e}")
 
@@ -1353,11 +1380,16 @@ class ProofreadingWorker(QThread):
                         #   standalone '해야한다' 카드를 통째로 잘못 억제했다(사용자 보고 미탐).
                         if clean in covered:
                             continue
+                        # 분석 확신도 — 근접 대안 읽기(core.doc_analysis.TIE_DELTA)에서 그 자리가
+                        #   '-어야 + 하/되' 경계로 읽히지 않으면 자동 적용하지 않고 검수로 내린다.
+                        tie = _morph.aux_verb_spacing_near_tie(text, eojeol, spaced)
                         sp_cards.append(Correction(
                             original=eojeol, corrected=spaced,
-                            reason="보조용언 띄어쓰기\n— '···해야 한다/된다'는 띄어 씀이 원칙",
+                            reason=("[검수] 보조용언 띄어쓰기 → 사용자 검토 필요\n— '···해야 한다/된다'는"
+                                    " 띄어 씀이 원칙 · 형태소 분석이 갈리는 자리" if tie else
+                                    "보조용언 띄어쓰기\n— '···해야 한다/된다'는 띄어 씀이 원칙"),
                             source="spacing", color=HL_TYPO,
-                            category="띄어쓰기", confidence="high",
+                            category="띄어쓰기", confidence="low" if tie else "high",
                         ))
                         existing.add(eojeol)
 
@@ -1387,11 +1419,16 @@ class ProofreadingWorker(QThread):
                     for orig, joined in _morph.find_eojida_join(text):
                         if orig in existing:
                             continue
+                        # 분석 확신도 — 붙인 문자열의 근접 대안 읽기 중 피동 '-어지다'가 아닌 것이
+                        #   있으면('고려하여질적'처럼 체언이 숨는 부류) 자동 적용하지 않고 검수로 내린다.
+                        tie = _morph.eojida_join_near_tie(orig)
                         sp_cards.append(Correction(
                             original=orig, corrected=joined,
-                            reason="피동 '-어지다'는 한 단어이므로 붙여 씀(예: 이루어지다)",
+                            reason=("[검수] 피동 '-어지다' 붙여쓰기 → 사용자 검토 필요\n— 한 단어이므로"
+                                    " 붙여 씀(예: 이루어지다) · 형태소 분석이 갈리는 자리" if tie else
+                                    "피동 '-어지다'는 한 단어이므로 붙여 씀(예: 이루어지다)"),
                             source="spacing", color=HL_TYPO,
-                            category="띄어쓰기", confidence="high",
+                            category="띄어쓰기", confidence="low" if tie else "high",
                         ))
                         existing.add(orig)
 

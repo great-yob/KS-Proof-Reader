@@ -1188,6 +1188,15 @@ def phase_f_realword():
         ("검증 절차. 검증 기준. 검증 대상. 검증 방법. 검증 체계. "
          "서비스 결과의 겁증 및 현업 통제를 담당한다.", ("겁증", "검증")),
     ]
+    # 경로 B(오타 채널) — **문서에 정답형이 없어도** 방향까지 맞혀야 한다(2026-10-19 코퍼스 정탐 축약).
+    #   '영육'은 경로 A가 '교육'으로 잘못 짚던 표적이다.
+    fire += [
+        ("사기 피해자 지원을 강화하고 사기 협의자 처벌을 강화한다.", ("협의자", "혐의자")),
+        ("사익을 추구하게 될 경우 강력한 제제를 할 수 있도록 하였다.", ("제제를", "제재를")),
+        ("대중을 상대로 활용하기 부절절한 단어나 콘텐츠가 제시되기도 함.", ("부절절한", "부적절한")),
+        ("자녀 영육 부담이 크다.", ("영육", "양육")),
+        ("현장 상황을 부고 있다.", ("부고", "보고")),
+    ]
     total += len(fire)
     for doc, (bad, good) in fire:
         got = _rw.find_candidates(doc)
@@ -1206,6 +1215,12 @@ def phase_f_realword():
         "부서별 업무량 편차가 크다.",
         # 정상 문장 — 애초에 희소어-빈출어 편집거리1 쌍이 없어야 한다
         "사회보장급여의 지급 기준과 절차를 정비하여 과오지급을 예방한다.",
+        # 경로 B 가드 ① — 개조식 '-함/-음' 어미를 관형형으로 끌어당기면 안 된다(코퍼스 오탐 8/9)
+        "주거 상향 사후관리 기관의 진술을 바탕으로 작성함\n이해 난이도 쉬움 어려움",
+        # 경로 B 가드 ② — 인명(전부 고유명사)을 흔한 낱말로 끌어당기면 안 된다
+        "조보영과 이도윤(2023)은 청년의 시기적 특성을 분석했다.",   # 가명 — 채널이 '조부영'으로 끈다
+        # 표적 낱말의 정상 용례 — 오타 채널이 등재어를 그 자체로 의심하면 안 된다
+        "부고를 받고 장례식장에 갔다. 영육의 조화를 강조했다.",
     ]
     total += len(quiet)
     for doc in quiet:
@@ -1222,6 +1237,10 @@ def phase_f_realword():
     inv.append(("gap 임계값 유지", REALWORD_GAP_MIN >= 12.0))
     inv.append(("희소성 조건 유지", REALWORD_RARE_MAX == 1))
     inv.append(("희소어당 후보 2개", REALWORD_TOP_PER_WORD == 2))
+    # 오타 채널은 맞춤 자모 쌍만 — kiwi 내장 구어체 규칙(basic_typos)은 '상담채녈을'을 망가뜨렸다
+    rw_src = io.open(os.path.join(_ROOT, "core", "realword.py"), encoding="utf-8").read()
+    inv.append(("오타 채널 = 맞춤 규칙만", "basic_typos" not in rw_src
+                and "default_typo_transformer" not in rw_src))
     # ⚠ 이 카드는 반드시 저신뢰다 — high가 되는 순간 금지된 '거리 기반 추측 치환'이 된다
     src = io.open(os.path.join(_ROOT, "ui", "workers", "proofreading_worker.py"),
                   encoding="utf-8").read()
@@ -1722,6 +1741,42 @@ def phase_d_rules():
                 print(f"  ✗ FAIL [D-5 체언가드] {key!r}(어절 {w!r}): 기대 "
                       f"{'보류' if expect_skip else '유지'} 실제={got} — {label}")
         print(f"  D-5 체언+조사 가드: {n_nh}케이스 완료")
+
+        # D-5b 분석 확신도(근접 대안) — 1순위 읽기로는 가드를 통과하지만 근접 대안(doc_analysis.
+        #   TIE_DELTA)이 동형이의로 읽는 자리는 워커가 high→low로 내린다(지우지 않는다). 하드 가드는
+        #   그대로 1순위만 봐야 한다 — 근접 대안까지 지우면 kiwi의 흔들림에 정당한 카드를 잃는다.
+        n_tie = 0
+        for sent, key, expect_hard, expect_tie, label in (
+            ("요즘 일이 신나 가지고 매일 늦게까지 남는다.", "신나", False, True,
+             "1순위 신나/NNG · 근접 대안 신나/VV+아/EC — 검수로"),
+            ("아이들이 신나 뛰어논다.", "신나", True, True, "1순위부터 용언 — 하드 보류"),
+            ("작가 알랭 드 보통이 쓴 책을 읽었다.", "보통이", False, False, "인명 — 갈리지 않음"),
+        ):
+            n_tie += 1
+            hard = (_nd.is_verb_inflection_homograph(key, key, sent)
+                    or _nd.is_noun_josa_homograph(key, key, sent))
+            tie = (_nd.is_verb_inflection_homograph(key, key, sent, near_tie=True)
+                   or _nd.is_noun_josa_homograph(key, key, sent, near_tie=True))
+            if (hard, tie) != (expect_hard, expect_tie):
+                fails += 1
+                print(f"  ✗ FAIL [D-5b 근접 대안] {key!r}: 기대 하드={expect_hard}·근접={expect_tie} "
+                      f"실제 하드={hard}·근접={tie} — {label}")
+        # 띄어쓰기 high 카드(보조용언 '-어야'·피동 '-어지다') — 정상 표기는 갈리지 않고, 체언이 숨는
+        #   '고려하여 질적'(2026-08-05 자동 적용 사고)은 갈리는 자리로 잡혀야 한다.
+        for orig, expect in (("이루어 졌다", False), ("만들어 지고", False),
+                             ("나누어 진다", False), ("고려하여 질적", True)):
+            n_tie += 1
+            got = morph.eojida_join_near_tie(orig)
+            if got != expect:
+                fails += 1
+                print(f"  ✗ FAIL [D-5b 근접 대안] 피동 {orig!r}: 기대 {expect} 실제 {got}")
+        for sent in ("이 문제는 반드시 해결해야한다.", "기준을 지켜야하는 이유가 있다."):
+            for e, sp in morph.find_auxiliary_verb_spacing(sent):
+                n_tie += 1
+                if morph.aux_verb_spacing_near_tie(sent, e, sp):
+                    fails += 1
+                    print(f"  ✗ FAIL [D-5b 근접 대안] 보조용언 {e!r}: 정상 표기가 갈리는 자리로 잡힘")
+        print(f"  D-5b 분석 확신도(근접 대안): {n_tie}케이스 완료")
 
         # D-6 규범표기 카드 등장 경계(검수 패널 대상 ⑤와 동일 판정)
         from core import morph as _mp

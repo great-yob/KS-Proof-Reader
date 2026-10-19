@@ -385,7 +385,10 @@ _GATE_SHOW = 12                                      # 방식당 화면에 펼�
 def _fingerprint() -> str:
     """결과를 정하는 입력 전부의 지문 — 같으면 다시 돌려도 바이트까지 같다(카드 순서 결정론)."""
     h = hashlib.sha1(b"gate-v1")
-    files = subprocess.run(["git", "ls-files", "*.py"], cwd=REPO, capture_output=True,
+    # ⚠ 아직 커밋하지 않은 새 모듈도 넣는다(--others, .gitignore 존중) — 추적 파일만 보면 새 런타임
+    #   모듈(2026-10-19 core/doc_analysis.py)을 고쳐도 지문이 같아 지난 실행을 그대로 재사용했다.
+    files = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard", "*.py"],
+                           cwd=REPO, capture_output=True,
                            text=True, encoding="utf-8").stdout.split()
     for p in sorted(files):
         if _NOT_RUNTIME.search(p) and p != "eval/corpus_harness/run_corpus.py":

@@ -41,6 +41,19 @@ core/realword.py — 실단어 오류(real-word error) 후보 탐지 (결정론)
     정상 분석되는 경우가 많아 오히려 정답을 걸러낸다.
   · **온용어(전문용어 120만) 제외 가드도 기각.** 오탐 65%를 거르지만 진짜 오류의 33%
     ('부고'·'재시'·'일련')도 함께 거른다 — 표적을 잃는다.
+
+**후보 경로는 둘이다** — 둘 다 같은 불변식(①~④) 아래에서 AI 검증에 함께 실린다.
+  A. 빈출어 치환(위 설계) — 희소 어절을 문서 빈출어로 바꿔 문맥 점수가 오르는가.
+  B. **오타 채널(잡음 채널)** — kiwi에 출판 원고의 타자 오류 모양(models.REALWORD_TYPO_PAIRS —
+     두벌식 이웃 키·소리 혼동 자모 쌍)을 꽂아 원고를 다시 읽고(TypoTransformer), 오타로 고쳐 읽는
+     편이 그대로 읽는 것보다 훨씬 자연스러운 자리를 후보로 낸다(Kernighan·Church·Gale 1990의
+     잡음 채널 교정 — P(의도한 문장)·P(실제 친 글자 | 의도)). A와 달리 **문서에 정답형이 없어도**
+     후보가 나오고, 교정 방향을 언어모델이 정한다 — A는 '영육'을 문서 빈출어 '교육'으로 짚어 AI가
+     기각했는데(방향 오답) B는 '양육'을 낸다. 블록 읽기는 core.doc_analysis 공유 분석을 쓴다.
+     같은 길이 치환·희소성·어절당 하나 — A의 설계 근거(위)를 그대로 따른다.
+     실측(2026-10-19, 20원고 269만 자): 다른 계층이 다룬 어절을 뺀 B 후보 9건 중 실제 오타 5건
+     ('협의자'→'혐의자'·'제제를'→'제재를' 등 — 전부 현행 파이프라인이 놓치던 것), AI 검증이 정확히
+     그 5건만 통과. 상세는 docs/pipeline-reference.md 6.4절.
 """
 from __future__ import annotations
 
@@ -55,6 +68,10 @@ from .models import (
     REALWORD_TOP_PER_WORD,
     REALWORD_MAX_CANDIDATES,
     REALWORD_MIN_LEN,
+    REALWORD_TYPO_PAIRS,
+    REALWORD_TYPO_COST,
+    REALWORD_TYPO_COST_MAX,
+    REALWORD_TYPO_GAP_MIN,
 )
 
 # 한글 런 어절 — 저장소 전역 관례(붙임형/띄어쓴형/검수 패널이 공유하는 기준).
@@ -178,13 +195,121 @@ def find_candidates(text: str,
     #   1개로 줄이면 정답이 2등인 사례를 잃는다(실측: '재시'의 1등은 오답 '역시',
     #   정답 '제시'는 2등). 3개 이상은 AI 검증 부담만 늘고 이득이 없었다.
     seen = collections.Counter()
-    out = []
+    picked = []
     for r in rows:
         if seen[r["original"]] >= REALWORD_TOP_PER_WORD:
             continue
         seen[r["original"]] += 1
-        out.append(r)
-        if len(out) >= REALWORD_MAX_CANDIDATES:
-            log(f"  [실단어] 후보 상한 {REALWORD_MAX_CANDIDATES}건 도달 — 이후 절단")
-            break
+        picked.append(r)
+
+    # ── 5. 오타 채널(경로 B) — 경로 A의 상위 N 경쟁에 넣지 않는다 ────────────
+    #   두 경로의 gap은 눈금이 다르다(B는 오타 비용이 점수에 들어 있다). 섞어 줄 세우면 A의 오답
+    #   ('영육→교육')이 B의 정답('양육')을 자리에서 밀어낸다. B는 어절당 하나라 따로 붙인다.
+    have = {(r["original"], r["corrected"]) for r in picked}
+    for r in _typo_channel_rows(text, surf, stop_event, log):
+        if (r["original"], r["corrected"]) not in have:
+            have.add((r["original"], r["corrected"]))
+            picked.append(r)
+    if stop_event is not None and stop_event.is_set():
+        return []
+
+    out = picked[:REALWORD_MAX_CANDIDATES]
+    if len(picked) > REALWORD_MAX_CANDIDATES:
+        log(f"  [실단어] 후보 상한 {REALWORD_MAX_CANDIDATES}건 도달 — 이후 절단")
+    return out
+
+
+# ── 오타 채널(경로 B) ───────────────────────────────────────────────────
+_TYPO_TF = None
+# 개조식 '-ㅁ/-음' 어미의 kiwi 형태(받침 ㅁ은 종성 자모로 나온다).
+_NOMINAL_ENDINGS = frozenset({"ᆷ", "음"})
+
+
+def _typo_transformer():
+    """models.REALWORD_TYPO_PAIRS로 만든 kiwi TypoTransformer(양방향, 1회 생성 후 재사용)."""
+    global _TYPO_TF
+    if _TYPO_TF is None:
+        from kiwipiepy import TypoTransformer, TypoDefinition
+        defs = []
+        for a, b, where in REALWORD_TYPO_PAIRS:
+            # 받침은 '\'로 이스케이프해야 종성으로 본다(kiwipiepy TypoDefinition 규약).
+            x, y = ("\\" + a, "\\" + b) if where == "coda" else (a, b)
+            defs += [TypoDefinition([x], [y], REALWORD_TYPO_COST),
+                     TypoDefinition([y], [x], REALWORD_TYPO_COST)]
+        _TYPO_TF = TypoTransformer(defs)
+    return _TYPO_TF
+
+
+def _typo_channel_rows(text: str, surf, stop_event, log) -> list:
+    """오타 채널 후보 — 블록마다 오타 모델 읽기와 그대로 읽기의 점수차가 문턱 이상인 자리.
+
+    후보 = 오타로 고쳐 읽힌 형태소가 든 **희소 한글 런** 하나. 교정형은 그 런의 형태소를 공백 없이
+    다시 붙인 것(kiwi.join — '대응학'→대응/하/ᆯ→'대응할'). 경로 A와 같은 설계 가드:
+      · 같은 길이 치환만(삽입·삭제 금지 — 실측 오탐 전량) · 바뀐 글자는 오타 교정 형태소 자리 안에만
+      · 희소(REALWORD_RARE_MAX 이하 등장) · 최소 길이 · 순한글
+    실패·kiwi 없음이면 [](graceful).
+    """
+    try:
+        from . import doc_analysis
+        doc = doc_analysis.get(text)
+        typos = _typo_transformer()
+    except Exception as e:
+        log(f"  [실단어] 오타 채널 준비 실패 — 스킵: {e}")
+        return []
+    if doc is None:
+        return []
+    out = []
+    for i, (bs, be) in enumerate(doc.blocks):
+        if stop_event is not None and stop_event.is_set():
+            return []
+        runs = [m for m in _HANGUL.finditer(text, bs, be)
+                if len(m.group()) >= REALWORD_MIN_LEN and surf.get(m.group(), 0) <= REALWORD_RARE_MAX]
+        if not runs:
+            continue
+        tr = doc.block_analysis(i, typos=typos, cost_threshold=REALWORD_TYPO_COST_MAX)
+        if not tr or not tr[2]:
+            continue
+        toks, score, fixed = tr
+        base = doc.block_analysis(i)
+        if not base:
+            continue
+        gap = score - base[1]
+        if gap < REALWORD_TYPO_GAP_MIN:
+            continue
+        for m in runs:
+            rs, re_ = m.span()
+            hit = [k for k in fixed if rs <= k[2] < re_]
+            if not hit:
+                continue
+            w = m.group()
+            rtoks = [t for t in toks if rs <= t.start < re_]
+            if not rtoks or rtoks[0].start != rs or rtoks[-1].end != re_:
+                continue                   # 런 경계와 형태소 경계가 어긋남 — 다시 붙일 수 없다
+            cand = doc.join(rtoks)
+            if (len(cand) != len(w) or cand == w or not _HANGUL.fullmatch(cand)):
+                continue
+            allowed = set()
+            for _f, _t, s, n in hit:
+                allowed.update(range(s - rs, s - rs + n))
+            changed = {p for p, (a, b) in enumerate(zip(w, cand)) if a != b}
+            if changed - allowed:
+                continue
+            # 그대로 읽은 결과로 거른다 — 2026-10-19 코퍼스(20원고)에서 오탐이 몰린 두 모양:
+            btoks = [t for t in base[0] if rs <= t.start < re_]
+            #   ① 바뀐 글자가 **'-ㅁ/-음' 어미** 자리 — 개조식 문체의 '-함/-됨/-음'('고려함'·'작성함'·
+            #      '개최됨'·'쉬움')을 받침 ㅁ↔ㄴ 규칙이 관형형('-한')으로 끌어당긴다. 점수차 3.5~5 구간 후보
+            #      9건 중 8건이 이 모양이었다. kiwi는 이 어미를 문장 끝이면 EF, 아니면 ETN으로 읽어 둘 다 본다.
+            #      수용한 미탐: 진짜 '-ㅁ/-ㄴ' 오타('살펴봄 결과'→'살펴본').
+            if any(t.tag in ("ETN", "EF") and t.form in _NOMINAL_ENDINGS
+                   and (t.start - rs) in changed for t in btoks):
+                continue
+            #   ② 런의 내용 형태소가 **전부 고유명사** — 인명(인용 저자 — 가명 '조보영과'=조보영/NNP+과)·음역어('양탄일성
+            #      (两弹一星)'). kiwi가 고유명사로 확신하는 낱말을 흔한 낱말로 끌어당긴 것이다. 일부만
+            #      고유명사인 오타('괌심'=괌/NNP+심/NNG → 관심)는 남는다.
+            content = [t for t in btoks if t.tag[0] in "NVX" and not t.tag.startswith("XS")]
+            if content and all(t.tag == "NNP" for t in content):
+                continue
+            out.append({"original": w, "corrected": cand, "gap": round(gap, 1),
+                        "context": text[bs:be]})
+    out.sort(key=lambda r: -r["gap"])
     return out

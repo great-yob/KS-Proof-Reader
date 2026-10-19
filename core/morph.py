@@ -73,6 +73,16 @@ def available() -> bool:
     return _get_kiwi() is not None
 
 
+def _doc(text: str):
+    """text의 공유 문맥 분석(core.doc_analysis) — 원고 속 '그 자리'를 문맥으로 읽는 판정은 전부
+    이걸 쓴다(계층마다 창을 따로 잘라 다르게 읽던 것을 하나로). kiwi 미가용이면 None."""
+    try:
+        from . import doc_analysis
+        return doc_analysis.get(text)
+    except Exception:
+        return None
+
+
 def analyze_bases(word: str) -> list:
     """word의 내용 형태소 기본형 목록을 [(기본형, 'V'|'N'|'X')] 로 반환.
 
@@ -222,7 +232,8 @@ def strip_josa(word: str):
 _INFL_ENDINGS = ("ETM", "EF", "EC", "EP")
 
 
-def verb_inflection_lemma(text: str, eojeol: str, max_occurrences: int = 4):
+def verb_inflection_lemma(text: str, eojeol: str, max_occurrences: int = 4,
+                          near_tie: bool = False):
     """eojeol이 문서 문맥에서 '용언의 활용형'으로 읽히면 그 기본형(어간+다)을 반환.
 
     규범표기(norm_map)류 '어절 표면 매칭' 교정의 **용언 활용형 동형이의 가드**용:
@@ -232,17 +243,21 @@ def verb_inflection_lemma(text: str, eojeol: str, max_occurrences: int = 4):
     판정 — 통어절 등장( (?<![가-힣])eojeol(?![가-힣]) ) 표본 최대 max_occurrences개 중
     **하나라도** 용언으로 읽히면 그 기본형 반환(하나라도 용언이면 일괄 치환이 그 등장을
     훼손하므로 보수적으로 전체 보류가 옳다):
-      · 등장 주변 ±48자 창을 kiwi로 분석해 eojeol 스팬이 [첫 형태소 V*(VV/VA/VX) +
+      · 등장이 든 문맥(core.doc_analysis 공유 분석)의 eojeol 스팬이 [첫 형태소 V*(VV/VA/VX) +
         끝 어미 _INFL_ENDINGS]이면 용언 활용형.
       · 기본형 = 어간 + '다' (kiwi는 불규칙 어간도 표제어 형태로 정규화).
+    `near_tie=True`면 1순위뿐 아니라 **근접 대안**(doc_analysis.TIE_DELTA 이내)에서 그렇게 읽혀도
+    반환한다 — 호출부가 '분석이 갈리는 자리'를 high에서 내릴 때 쓴다(지우는 데 쓰지 말 것).
 
     ⚠ 조사 딸린 표면('찌게를')은 명사 사용 신호이므로 **호출 측이 가드 대상에서 제외**할 것.
     ⚠ 반환된 기본형이 그 자체로 비표준 용언(치루다·쳐지다 — norm_map 등재)인지 구분도
       호출 측 몫(nikl_dict.is_verb_inflection_homograph가 담당).
     kiwi 미가용·미발견 시 None (graceful — 가드 미적용).
     """
-    kiwi = _get_kiwi()
-    if kiwi is None or not text or not eojeol:
+    if not text or not eojeol:
+        return None
+    doc = _doc(text)
+    if doc is None:
         return None
     try:
         pat = re.compile(r"(?<![가-힣])" + re.escape(eojeol) + r"(?![가-힣])")
@@ -253,20 +268,15 @@ def verb_inflection_lemma(text: str, eojeol: str, max_occurrences: int = 4):
         if n >= max_occurrences:
             break
         n += 1
-        lo = max(0, m.start() - 48)
-        window = text[lo:min(len(text), m.end() + 48)]
-        pos = m.start() - lo
-        try:
-            tokens = kiwi.analyze(window)[0][0]
-        except Exception:
-            continue
-        span = [t for t in tokens if pos <= t.start < pos + len(eojeol)]
-        if not span:
-            continue
-        first = span[0].tag.split("-")[0]
-        last = span[-1].tag.split("-")[0]
-        if first in _VERBAL and last in _INFL_ENDINGS:
-            return span[0].form + "다"
+        spans = (doc.readings(m.start(), m.end()) if near_tie
+                 else [doc.reading(m.start(), m.end())])
+        for span in spans:
+            if not span:
+                continue
+            first = span[0].tag.split("-")[0]
+            last = span[-1].tag.split("-")[0]
+            if first in _VERBAL and last in _INFL_ENDINGS:
+                return span[0].form + "다"
     return None
 
 
@@ -276,7 +286,8 @@ def verb_inflection_lemma(text: str, eojeol: str, max_occurrences: int = 4):
 _NOMINAL = ("NNG", "NNP", "NNB", "NP", "NR", "XSN", "XPN")
 
 
-def noun_josa_split(text: str, eojeol: str, max_occurrences: int = 4):
+def noun_josa_split(text: str, eojeol: str, max_occurrences: int = 4,
+                    near_tie: bool = False):
     """eojeol이 문서 문맥에서 '체언 + 조사'로 읽히면 그 **체언 표면형**을 반환.
 
     regularization(norm_map/어문 페어)류 '어절 표면 매칭' 교정의 **체언+조사 동형이의
@@ -307,13 +318,18 @@ def noun_josa_split(text: str, eojeol: str, max_occurrences: int = 4):
         다시 읽지 않는다. 실측: 20원고 규범표기 카드 76장 중 '월이' 1장만 빠지고(엣지→에지
         등 NNP로 읽히는 정당 카드 6장 유지), 중의성 정문 27,807문장은 발화 변화 0.
 
+    `near_tie=True`면 근접 대안(doc_analysis.TIE_DELTA 이내)에서 체언+조사로 읽혀도 반환한다
+      (verb_inflection_lemma와 같은 쓰임 — high에서 내릴 때만).
+
     ⚠ 조사 딸린 표면('찌게를')은 명사 사용 신호이므로 **호출 측이 가드 대상에서 제외**할 것.
     ⚠ 반환된 체언이 실제 등재 표제어인지 확인도 호출 측 몫
       (nikl_dict.is_noun_josa_homograph가 담당 — 체언이 헛것이면 방언 표제어 쪽이 옳다).
     kiwi 미가용·미발견 시 None (graceful — 가드 미적용).
     """
-    kiwi = _get_kiwi()
-    if kiwi is None or not text or not eojeol:
+    if not text or not eojeol:
+        return None
+    doc = _doc(text)
+    if doc is None:
         return None
     try:
         pat = re.compile(r"(?<![가-힣])" + re.escape(eojeol) + r"(?![가-힣])")
@@ -324,24 +340,23 @@ def noun_josa_split(text: str, eojeol: str, max_occurrences: int = 4):
         if n >= max_occurrences:
             break
         n += 1
-        lo = max(0, m.start() - 48)
-        window = text[lo:min(len(text), m.end() + 48)]
-        pos = m.start() - lo
-        try:
-            tokens = kiwi.analyze(window)[0][0]
-        except Exception:
+        pos, end = m.start(), m.end()
+        span = doc.reading(pos, end)
+        if span is None:
             continue
-        span = [t for t in tokens if pos <= t.start < pos + len(eojeol)]
         base = _noun_josa_base(span, pos, eojeol)
         if base is None and len(span) == 1 and span[0].tag == "NNP" \
-                and not getattr(span[0], "oov", False) \
+                and not span[0].oov \
                 and span[0].start == pos and span[0].len == len(eojeol):
-            try:
-                alt = kiwi.analyze(window, blocklist=[f"{span[0].form}/NNP"])[0][0]
-            except Exception:
+            alt_span = doc.reading(pos, end, blocklist=[f"{span[0].form}/NNP"])
+            if alt_span is None:
                 continue
-            alt_span = [t for t in alt if pos <= t.start < pos + len(eojeol)]
             base = _noun_josa_base(alt_span, pos, eojeol, common_only=True)
+        if base is None and near_tie:
+            for alt in doc.readings(pos, end)[1:]:
+                base = _noun_josa_base(alt, pos, eojeol)
+                if base:
+                    break
         if base:
             return base
     return None
@@ -1321,10 +1336,25 @@ def find_auxiliary_verb_spacing(text: str) -> list:
                 cuts.add(cur.start)
         if not cuts:
             continue
+        # 문맥 재확인 — 다른 띄어쓰기 finder와 같은 공유 문맥 읽기로, 앞은 어미·뒤는 용언인지 본다.
+        #   이 finder는 high 카드를 내므로(워커 [7]) 어절 단독 읽기만 믿으면 안 된다.
+        if not _cuts_hold_in_context(text, w, cuts, before_ok=_AUXV_BEFORE, after_ok=_AUXV_AFTER):
+            continue
         spaced = _insert_spaces(w, cuts)
         if spaced != w and spaced.replace(" ", "") == w:
             out.append((w, spaced))
     return out
+
+
+_AUXV_BEFORE = lambda t: t.tag.startswith("E")             # noqa: E731 — '-어야'(EC)
+_AUXV_AFTER = lambda t: t.tag in ("VX", "VV")              # noqa: E731 — 하/되
+
+
+def aux_verb_spacing_near_tie(text: str, eojeol: str, spaced: str) -> bool:
+    """find_auxiliary_verb_spacing 카드(high)의 컷이 근접 대안 읽기에서 갈리는가 — 갈리면 워커가 low로
+    내린다(분석 확신도 — 읽기에 기대는 high 판정은 근접 대안에서도 같은 판정일 때만 high)."""
+    cuts = _inserted_cuts(eojeol, spaced)
+    return bool(cuts) and _cuts_split_near_tie(text, eojeol, cuts, _AUXV_BEFORE, _AUXV_AFTER)
 
 
 # ── 본용언 '-아/-어' + 보조용언 띄어쓰기 (보상해 주다 / 고려해 보다 / 조율해 나가다) ──
@@ -1351,8 +1381,8 @@ def _cuts_hold_in_context(text: str, w: str, cuts, before_ok, after_ok,
 
     띄어쓰기 finder는 어절 하나만 kiwi에 넣는데, 문맥이 없으면 오분석한다 — 사전 단일어
     '알아보면'(알아보다)을 알/VV+아/EC+보/VX로, 명사 '사본일'(사본+이+ㄹ)을 사/VV+아+보/VX+ㄴ+일로,
-    인명(가명 '이지원')을 이/MM+지원으로 쪼갠다. 등장마다 앞뒤 ±48자 창(verb_inflection_lemma와 같은 방식)을
-    다시 분석해 **모든 등장**(최대 max_occurrences)에서 자른 자리에 형태소 경계가 있고 그 앞 토큰이
+    인명(가명 '이지원')을 이/MM+지원으로 쪼갠다. 등장마다 그 문맥의 공유 읽기(core.doc_analysis —
+    verb_inflection_lemma와 같은 읽기)를 보고 **모든 등장**(최대 max_occurrences)에서 자른 자리에 형태소 경계가 있고 그 앞 토큰이
     `before_ok`, 뒤 토큰이 `after_ok`를 만족할 때만 True. 한 등장이라도 아니면 False — 카드는 그
     어절의 모든 등장에 적용되므로 하나라도 낱말 내부면 띄우면 안 된다. 등장을 못 찾으면 True.
     ⚠ 조건은 finder의 설계 경계에 맞춰 호출부가 준다. 문맥에서 품사가 바뀌는 것까지 막으면 정탐을
@@ -1373,25 +1403,65 @@ def _context_failing_cuts(text: str, w: str, cuts, before_ok, after_ok,
         pat = re.compile(r"(?<!\S)" + re.escape(w) + r"(?!\S)")
     except re.error:
         return set()
-    kiwi = _get_kiwi()
+    doc = _doc(text)
+    if doc is None:
+        return set()
     bad, n = set(), 0
     for m in pat.finditer(text):
         if n >= max_occurrences:
             break
         n += 1
-        lo = max(0, m.start() - 48)
-        window = text[lo:min(len(text), m.end() + 48)]
-        pos = m.start() - lo
-        try:
-            toks = kiwi.analyze(window)[0][0]
-        except Exception:
+        toks = doc.context_tokens(m.start(), m.end())
+        if toks is None:
             return set()
         for c in cuts:
-            at = pos + c
-            if not (any(t.start == at and after_ok(t) for t in toks)
-                    and any(t.start + t.len == at and before_ok(t) for t in toks)):
+            if not _cut_holds(toks, m.start() + c, before_ok, after_ok):
                 bad.add(c)
     return bad
+
+
+def _cut_holds(toks, at: int, before_ok, after_ok) -> bool:
+    """`at` 자리에 형태소 경계가 있고 앞 토큰이 before_ok, 뒤 토큰이 after_ok인가."""
+    return (any(t.start == at and after_ok(t) for t in toks)
+            and any(t.start + t.len == at and before_ok(t) for t in toks))
+
+
+def _cuts_split_near_tie(text: str, w: str, cuts, before_ok, after_ok,
+                         max_occurrences: int = 4) -> bool:
+    """자른 자리가 1순위 문맥 읽기에선 경계지만 **근접 대안 읽기**(doc_analysis.TIE_DELTA 이내)에서는
+    아닌 등장이 있는가 — kiwi가 거의 같은 확신으로 그 자리를 낱말 내부로도 읽는다는 뜻이다.
+
+    high로 내보내는 띄어쓰기 카드만 이걸로 확인한다(맞으면 low로 내린다 — 지우지 않는다). 근접 대안
+    전부를 만족해야 컷을 낸다는 식으로 쓰면 kiwi의 문맥별 흔들림('전' MM↔NNG)에 정탐을 잃는다
+    ([[correction-backlog-pass-2026-10-19]] 교훈 — 문맥 재확인은 1순위로만 한다).
+    """
+    try:
+        pat = re.compile(r"(?<!\S)" + re.escape(w) + r"(?!\S)")
+    except re.error:
+        return False
+    doc = _doc(text)
+    if doc is None:
+        return False
+    n = 0
+    for m in pat.finditer(text):
+        if n >= max_occurrences:
+            break
+        n += 1
+        for alt in doc.readings(m.start(), m.end())[1:]:
+            if any(not _cut_holds(alt, m.start() + c, before_ok, after_ok) for c in cuts):
+                return True
+    return False
+
+
+def _inserted_cuts(w: str, spaced: str) -> set:
+    """`spaced`가 `w`에 공백만 넣은 것일 때, 공백이 들어간 w 안의 위치 집합."""
+    cuts, i = set(), 0
+    for ch in spaced:
+        if ch == " " and (i >= len(w) or w[i] != " "):
+            cuts.add(i)
+            continue
+        i += 1
+    return cuts
 
 
 def find_aux_connective_spacing(text: str) -> list:
@@ -1499,27 +1569,7 @@ def find_eojida_join(text: str) -> list:
                 mt = kiwi.analyze(A + B)[0][0]
             except Exception:
                 continue
-            la = len(A)
-            straddle = any(t.start < la < t.end and t.tag.startswith("V") for t in mt)
-            ec = any(t.tag.startswith("E") and t.form in ("아", "어", "여")
-                     and t.start < la <= t.end for t in mt)
-            vx = any(t.tag == "VX" and t.form == "지" and t.start <= la < t.end for t in mt)
-            if not (straddle or (ec and vx)):
-                continue
-            # ⚠⚠ **후행 어절에 체언이 있으면 붙이지 않는다**(2026-08-05 사용자 보고).
-            #   kiwi는 붙인 문자열만 받으면 멀쩡한 '명사'를 피동으로 읽어 버린다 —
-            #   '고려하여 질적,' → '고려하여질적,'을 분석하면 지/VX + ᆯ/ETM + **적/NNB**
-            #   가 나와 위 (ec and vx) 분기를 그대로 통과했다(실파일: 中國科學院 보고서,
-            #   `high`라 **자동 적용**됐고 사유는 '피동 -어지다'였다). 띄어 쓴 원형은
-            #   질/NNG + 적/XSN 으로 정상 분석되지만, 이 규칙은 붙인 형태만 보므로
-            #   그 사실을 알지 못한다. ⚠ kiwi 점수 비교로는 못 가른다 — 실측상 kiwi가
-            #   내부적으로 자동 띄어쓰기를 해 두 형태의 점수가 **완전히 동일**하다
-            #   (작아 졌다·만들어 지고도 delta 0). 갈라지는 지점은 하나뿐이다:
-            #   진짜 피동 '-어지다'의 후행 어절은 **전부 용언 형태소**(지/VV·었/EP·다/EF)
-            #   이고, 오탐은 그 안에 **체언**이 들어 있다(적/NNB·지원/NNG·지역/NNG).
-            #   → 경계 이후 토큰에 체언 태그가 하나라도 있으면 스킵.
-            #   수용한 미탐: '만들어 진것'처럼 후행 어절에 의존명사가 붙은 경우(억제 방향).
-            if any(t.start >= la and t.tag in _JI_NOUN_TAGS for t in mt):
+            if not _eojida_reading_ok(mt, len(A)):
                 continue
             orig = A + " " + B
             if orig in seen:
@@ -1527,6 +1577,55 @@ def find_eojida_join(text: str) -> list:
             seen.add(orig)
             out.append((orig, A + B))
     return out
+
+
+def _eojida_reading_ok(mt, la: int) -> bool:
+    """붙인 문자열 A+B의 한 읽기가 피동 '-어지다' 한 낱말인가(find_eojida_join의 판정식).
+
+    (a) 용언 형태소가 경계(la)를 가로지르거나 (b) 경계에서 연결어미 '-아/-어'가 끝나고 보조용언
+    '지'(VX)가 시작하고, 경계 뒤에 체언이 하나도 없어야 한다(아래 ⚠⚠).
+    """
+    straddle = any(t.start < la < t.end and t.tag.startswith("V") for t in mt)
+    ec = any(t.tag.startswith("E") and t.form in ("아", "어", "여")
+             and t.start < la <= t.end for t in mt)
+    vx = any(t.tag == "VX" and t.form == "지" and t.start <= la < t.end for t in mt)
+    if not (straddle or (ec and vx)):
+        return False
+    # ⚠⚠ **후행 어절에 체언이 있으면 붙이지 않는다**(2026-08-05 사용자 보고).
+    #   kiwi는 붙인 문자열만 받으면 멀쩡한 '명사'를 피동으로 읽어 버린다 —
+    #   '고려하여 질적,' → '고려하여질적,'을 분석하면 지/VX + ᆯ/ETM + **적/NNB**
+    #   가 나와 위 (ec and vx) 분기를 그대로 통과했다(실파일: 中國科學院 보고서,
+    #   `high`라 **자동 적용**됐고 사유는 '피동 -어지다'였다). 띄어 쓴 원형은
+    #   질/NNG + 적/XSN 으로 정상 분석되지만, 이 규칙은 붙인 형태만 보므로
+    #   그 사실을 알지 못한다. ⚠ kiwi 점수 비교로는 못 가른다 — 실측상 kiwi가
+    #   내부적으로 자동 띄어쓰기를 해 두 형태의 점수가 **완전히 동일**하다
+    #   (작아 졌다·만들어 지고도 delta 0). 갈라지는 지점은 하나뿐이다:
+    #   진짜 피동 '-어지다'의 후행 어절은 **전부 용언 형태소**(지/VV·었/EP·다/EF)
+    #   이고, 오탐은 그 안에 **체언**이 들어 있다(적/NNB·지원/NNG·지역/NNG).
+    #   → 경계 이후 토큰에 체언 태그가 하나라도 있으면 스킵.
+    #   수용한 미탐: '만들어 진것'처럼 후행 어절에 의존명사가 붙은 경우(억제 방향).
+    return not any(t.start >= la and t.tag in _JI_NOUN_TAGS for t in mt)
+
+
+def eojida_join_near_tie(orig: str) -> bool:
+    """find_eojida_join 카드(high) 'A B'를 붙인 문자열의 **근접 대안 읽기** 중에 피동 '-어지다'로
+    읽히지 않는 것이 있는가 — 있으면 워커가 low로 내린다('고려하여질적'처럼 체언이 숨는 부류의
+    일반화: kiwi가 거의 같은 확신으로 다르게 읽는 자리는 자동 적용하지 않는다).
+    붙인 문자열은 원고에 없으므로 공유 문맥 분석이 아니라 그 문자열을 직접 N-best로 읽는다.
+    """
+    kiwi = _get_kiwi()
+    A, sep, B = (orig or "").partition(" ")
+    if kiwi is None or not sep:
+        return False
+    from .doc_analysis import NBEST, TIE_DELTA
+    try:
+        best = kiwi.analyze(A + B)[0]
+        alts = kiwi.analyze(A + B, top_n=NBEST)
+    except Exception:
+        return False
+    ref = max([best[1]] + [sc for _t, sc in alts])
+    return any(ref - sc <= TIE_DELTA and not _eojida_reading_ok(toks, len(A))
+               for toks, sc in alts)
 
 
 def find_compound_spacing_consistency(text: str, *, min_len: int = 4, max_len: int = 14,
