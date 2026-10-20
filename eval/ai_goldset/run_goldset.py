@@ -95,6 +95,15 @@ GUARD_CASES = [
     ("2차전지",             "2차 전지",             "ai_typo", False,  "⑪ 숫자'융합' 어절 분리는 보존 — 결정론이 못 받음(회귀수정)"),
     ("3세대",               "3 세대",               "ai_typo", False,  "⑪ 숫자융합 어절 분리 보존"),
     ("케릭터",              "캐릭터",              "ai_typo", False,  "⑪ 글자 교정(재띄어쓰기 아님) 보존"),
+    # ⑪ 결정론 다수결이 원리적으로 못 받는 문법 띄어쓰기는 보존(2026-10-20 코퍼스 재생 — 카드 없이 증발하던 정탐)
+    ("예를들어",            "예를 들어",            "ai_typo", False,  "⑪ 용언 띄어쓰기 — 다수결 후보 아님, 보존"),
+    ("위와같은",            "위와 같은",            "ai_typo", False,  "⑪ 조사 뒤 용언 — 보존"),
+    ("대표성있는",          "대표성 있는",          "ai_typo", False,  "⑪ 명사+용언 — 보존"),
+    ("학위가 없어도블루카드를", "학위가 없어도 블루카드를", "ai_typo", False, "⑪ 어미 뒤 띄어쓰기 — 보존"),
+    ("진행중인",            "진행 중인",            "ai_typo", False,  "⑪ 의존명사 '중' — 보존"),
+    ("해당시",              "해당 시",              "ai_typo", False,  "⑪ 3글자(min_len 미만) 의존명사 '시' — 보존"),
+    ("상호간에",            "상호 간에",            "ai_typo", False,  "⑪ 3글자 base 의존명사 '간' — 보존"),
+    ("인재확보에",          "인재 확보에",          "ai_typo", True,   "⑪ 조사 붙은 순수 명사 복합어는 계속 위임"),
     # ⑪-b 복합명사 **붙이기**도 같은 이유로 결정론 위임(드롭). 조사·어미·의존명사 붙이기는 보존.
     #   ⚠ 판정은 '붙인 형태 전체'를 형태소 분석해야 한다 — 조각만 보면 '보다도'가 MAG로 읽힌다.
     ("개인 정보",           "개인정보",             "ai_typo", True,   "⑪-b 복합명사 붙이기(보고 2026-07-31)"),
@@ -123,6 +132,8 @@ GUARD_CASES = [
     ("McKinsey",            "Mckinsey",             "ai_typo", True,   "⑭ 고유명사 케이스 왜곡 차단"),
     ("Desity",              "Density",              "ai_typo", False,  "⑭ 실제 영문 오타(글자 변경) 보존"),
     ("유지(Retention)",     "유지(리텐션)",          "ai_typo", False,  "⑭ 음역은 ⑥ 영역 — ⑭ 미발동"),
+    ("Skills TRaining:",    "Skills Training:",     "ai_typo", False,  "⑭ Shift 오타(대문자 둘+소문자)는 보존(2026-10-20)"),
+    ("SMEs",                "Smes",                 "ai_typo", True,   "⑭ 두문자어 복수형은 Shift 오타 아님 — 차단"),
     # ⑮ 문장 재구성(어간 보존·조사/어미 2곳+ 일괄 변형, ai_typo만)→저자 문장 존중(드롭).
     #    단일 조사 교정(빠짐/중복/받침)·오타 수정·윤문 스코프는 보존.
     ("사전 구직 활동이 허용된다.", "사전 구직 활동을 허용한다.", "ai_typo", True,  "⑮ 피동→능동 문장 재구성(보고)"),
@@ -135,6 +146,8 @@ GUARD_CASES = [
     ("과학혁신기술부(DSIT)간", "과학기술혁신부(DSIT)간", "ai_typo", True,   "⑯ 부호·조사 딸린 재배열도 차단"),
     ("빠르게 매우 달렸다",    "매우 빠르게 달렸다",      "ai_typo", True,   "⑯ 어절 순서 재배열도 오탈자 스코프 밖"),
     ("과확혁신기술부",        "과학혁신기술부",         "ai_typo", False,  "⑯ 실제 오타(음절 치환·멀티셋 상이)는 보존"),
+    ("지방조보금의",          "지방보조금의",           "ai_typo", False,  "⑯ 이웃 두 음절 자리바꿈 오타는 보존(2026-10-20)"),
+    ("향상키시고",            "향상시키고",             "ai_typo", False,  "⑯ 자리바꿈 오타(용언) 보존"),
     ("빠르게 매우 달렸다",    "매우 빠르게 달렸다",      "ai_polish", False, "⑯ 윤문의 어순 다듬기는 그 스코프 권한 — 보존"),
 ]
 
@@ -177,6 +190,104 @@ def phase_a_doc_dict():
         if dropped != expect_drop:
             fails += 1
             print(f"  ✗ FAIL [확장] {o!r}→{c!r} 기대제외={expect_drop} 실제={dropped}")
+
+    # 부분조각 확장의 예외(2026-10-20 사용자 결정) — 한 음절이 빠진 **진짜 잘림 오타**만 검수(low)로 남긴다.
+    #   사전 조회가 있어야 발동한다(없으면 위 판정 그대로). 사전은 이 문서의 낱말만 흉내 낸다.
+    doc_t = ("지역가입자 수는 늘었다. 지역가입자 보험료. 지역가입자의 분포. 월 10만 원 이하 역가입자 중 일부. "
+             "보건복지부 발표. 보건복지부 자료. 보건복지부의 사업. 복지부 담당자. "
+             "산업안전보건관리비 계상. 산업안전보건관리비 사용. 산업안전보건관리비의 집행. "
+             "메뉴[산업안전보건관리비-안전보건관리비 관리]. "
+             "건강보험 가입. 건강보험 자격. 건강보험의 급여. 의료급여와 건강보     험대상자. "
+             "인구감소지 현황. 인구감소지 비교. 인구감소지 여부. 인구감소지역 지정. "
+             "인구감소지역 정책. 인구감소지역의 특성.")
+    _known = {"복지부", "보건복지부", "지역가입자", "건강보험", "인구감소지역"}
+    trunc_cases = [
+        ("역가입자", "지역가입자", "low"),           # ★코퍼스 실측 — 앞 한 음절 누락 → 검수 카드
+        ("복지부", "보건복지부", None),              # 등재어·두 음절 → 약칭(드롭)
+        ("안전보건관리비", "산업안전보건관리비", None),  # 두 음절 — 메뉴 이름(드롭)
+        ("건강보", "건강보험", None),                # 빠진 '험'이 바로 옆에 — 낱말 속 공백(드롭)
+        ("인구감소지", "인구감소지역", None),         # 저자 용어(독립 3회+) — 드롭
+    ]
+    for o, c, want in trunc_cases:
+        cor = Correction(original=o, corrected=c, reason="", source="ai_typo", color=HL_TYPO)
+        kept = ai_guards.filter_redundant_expansions([cor], doc_t, exists_fn=lambda w: w in _known)
+        got = kept[0].confidence if kept else None
+        if got != want or (kept and not kept[0].reason.startswith("[검수]")):
+            fails += 1
+            print(f"  ✗ FAIL [잘림 오타] {o!r}→{c!r} 기대={want} 실제={got}")
+    kept = ai_guards.filter_redundant_expansions(
+        [Correction(original="역가입자", corrected="지역가입자", reason="", source="ai_typo",
+                    color=HL_TYPO)], doc_t)
+    if kept:
+        fails += 1
+        print("  ✗ FAIL [잘림 오타] 사전 조회가 없으면 예전대로 드롭해야 한다")
+
+    # 글로서리 오적용 — 'S→T'를 S가 아닌 낱말에 적용한 교정 드롭. 연쇄 오염 항목은 출처로 인정하지 않는다
+    #   (2026-10-20 코퍼스 장부: [('복지부','보건복지부'), ('복지지갑','보건복지부')] → '복지지갑'→'보건복지부' high).
+    gl = [("복지부", "보건복지부"), ("복지지갑", "보건복지부"), ("년도", "연도"), ("보건건복지부", "보건복지부")]
+    gm_cases = [
+        ("복지지갑", "보건복지부", True),               # 연쇄 오염 항목을 '규칙 그대로'로 보면 안 된다
+        ("복지지갑은 서비스다", "보건복지부는 서비스다", True),
+        ("행복이음,", "보건복지부,", True),
+        ("복지부", "보건복지부", False),                # 규칙의 S 그 자체(옳고 그름은 다른 가드의 몫)
+        ("해당년도", "해당연도", False),                 # S를 품은 낱말
+        ("보건복지브", "보건복지부", False),             # T로 가는 오타 교정(편집거리 1)
+        ("통합적 메시지를", "통합적 메시지", False),       # 낱말 그대로·조사만(T가 아니어도 무관)
+    ]
+    for o, c, want in gm_cases:
+        cor = Correction(original=o, corrected=c, reason="", source="ai_typo", color=HL_TYPO)
+        got = not ai_guards.drop_glossary_misapplication([cor], gl)
+        if got != want:
+            fails += 1
+            print(f"  ✗ FAIL [글로서리 오적용] {o!r}→{c!r} 기대드롭={want} 실제={got}")
+
+    # JSON 키·값 쌍 복구 — 따옴표 하나 빠진 값이 객체를 통째로 버리던 것(2026-10-20 '파리핀' 유실).
+    #   되살린 항목은 글로서리에 넣지 않도록 표시가 붙는다. 같은 키에 값이 갈리면 포기.
+    from core.gemini_checker import GeminiChecker as _GC
+    _raw = ('[{"original": "비행부대을", "corrected": "비행부대를", "confidence": "high"},'
+            ' {"original": "파리핀", "corrected":유도 표기 … 교정", "corrected": "파라핀", "confidence": "high"},'
+            ' {"original": "가", "corrected": "나", "corrected": "다"}]')
+    _got = _GC._parse_json_response(_raw, None)
+    _by = {x.get("original"): x for x in _got}
+    if (set(_by) != {"비행부대을", "파리핀"} or _by["파리핀"].get("corrected") != "파라핀"
+            or not _by["파리핀"].get("_salvaged") or _by["비행부대을"].get("_salvaged")):
+        fails += 1
+        print(f"  ✗ FAIL [JSON 쌍 복구] → {_got}")
+
+    # 인용 구간 — 남의 제목·참고문헌은 띄어쓰기 일관성 다수결에 표를 던지지 않는다(2026-10-20,
+    #   core/citation_spans). 「…정책 연구」·참고문헌 줄의 '정책 연구'는 저자 본문 '정책연구'와 혼재가 아니다.
+    from core import citation_spans as _cit, morph as _mph
+    _cdoc = ("본 정책연구는 두 단계로 진행했다. 정책연구의 범위는 아래와 같다. "
+             "선행 보고서로 「주요국 인재 유치 정책 연구」가 있다.\n"
+             "김철수(2020). 인재 유치 정책 연구. 한국연구원.\n"
+             "출처: 국가 정책 연구 자료집\n")
+    _csp = _cit.citation_spans(_cdoc)
+    _c_raw = [x for x in _mph.find_compound_spacing_consistency(_cdoc) if "정책연구" in (x[0] + x[1]).replace(" ", "")]
+    _c_mask = [x for x in _mph.find_compound_spacing_consistency(_cit.mask(_cdoc)) if "정책연구" in (x[0] + x[1]).replace(" ", "")]
+    _c_ok = (len(_csp) == 3 and _c_raw and not _c_mask
+             and _cit.mask(_cdoc).count("」") == 1                   # 괄호·부호는 그대로(한글만 가린다)
+             and not _cit.covers(_csp, _cdoc.find("정책연구"), _cdoc.find("정책연구") + 4))
+    _body_line = "연구소(2022)의 분류체계를 따랐다.\n"                    # 본문 '(연도)의'는 참고문헌 줄이 아니다
+    if not _c_ok or _cit.citation_spans(_body_line):
+        fails += 1
+        print(f"  ✗ FAIL [인용 구간] spans={_csp} raw={_c_raw} mask={_c_mask} "
+              f"body={_cit.citation_spans(_body_line)}")
+
+    # ⑤의 예외 — 명백한 연도 오타만 검수 카드, 나머지 숫자 변경은 드롭(2026-10-20 사용자 결정).
+    for o, c, want in [("2016년 17.8%, 2217년 22.0%", "2016년 17.8%, 2017년 22.0%", True),
+                       ("2024년", "2025년", False),       # 가능한 연도끼리 — 명백하지 않음
+                       ("2050년 목표", "2051년 목표", False),
+                       ("3217년", "2017년", False),       # 두 자리 차이 — 명백하지 않음
+                       ("42.18%", "41.18%", False)]:      # 계산 보정 — 내용 편집
+        cor = Correction(original=o, corrected=c, reason="연도 오탈자", source="ai_typo",
+                         color=HL_TYPO, confidence="high")
+        kept, _ = ai_guards.filter_overcorrections([cor])
+        kept = ai_guards.demote_obvious_year_typo(kept)
+        ok = (bool(kept) and kept[0].confidence == "low" and kept[0].reason.startswith("[검수]")) if want \
+            else not kept
+        if not ok:
+            fails += 1
+            print(f"  ✗ FAIL [연도 오타] {o!r}→{c!r} 기대 검수카드={want} → {[(k.confidence, k.reason) for k in kept]}")
 
     # demote_hedged_corrections: AI 사유에 헤지(보이나·권장·추정 등) → low 강등(자동 적용 금지).
     hd_cases = [
@@ -583,7 +694,10 @@ def phase_a_doc_dict():
 
     n = (len(exp_cases) + len(hd_cases) + len(dm_cases) + len(ws_cases) + len(pj_cases)
          + len(gn_cases) + len(cv_cases) + len(fr_cases) + len(ts_cases)
-         + len(rvc_cases) + len(hg_cases) + len(mk_lat) + len(mk_han) + 1 + 1 + 1 + 1)
+         + len(rvc_cases) + len(hg_cases) + len(mk_lat) + len(mk_han) + 1 + 1 + 1 + 1
+         + len(trunc_cases) + 1 + 5    # 잘림 오타 + 사전 없음 1 + 연도 오타 5
+         + len(gm_cases) + 1           # 글로서리 오적용 + JSON 쌍 복구 1
+         + 1)                          # 인용 구간 1
     print(f"  → {n - fails}/{n} 통과" + ("  ✅" if fails == 0 else "  ❌"))
     return fails
 
@@ -616,6 +730,19 @@ def phase_a_norm_guard():
         if got != exp:
             fails += 1
             print(f"  ✗ FAIL [복합어성분] {key!r} 기대억제={exp} 실제={got}")
+    # ── 미등재 규범 표기 → 검수 강등(2026-10-20) — 등재 외래어를 표제어도 아닌 표기법 형태로 바꾸는 쌍.
+    #   사용자 거절 집중(폴로어 4/4·멀티모덜 3/4). 목표어가 등재된 순화·사이시옷·두음은 대상 아님.
+    unatt_cases = [
+        ("위젯", "위짓", True), ("멀티모달", "멀티모덜", True), ("팔로워", "폴로어", True),
+        ("컨셉", "콘셉트", False), ("리플렛", "리플릿", False), ("수퍼마켓", "슈퍼마켓", False),
+        ("세수그릇", "세숫그릇", False),     # 원문이 외래어 표제어가 아니다(목표 미등재 복합어 28.5% 보호)
+    ]
+    for key, norm, exp in unatt_cases:
+        got = _nd.is_unattested_loanword_norm(key, norm)
+        if got != exp:
+            fails += 1
+            print(f"  ✗ FAIL [미등재 규범 표기] {key!r}→{norm!r} 기대={exp} 실제={got}")
+    cases = cases + unatt_cases          # 아래 통과 수 합계용
     # ── 온용어 화이트리스트 거부권 가드(_norm_pair_components, 네트워크 불필요) ──
     #   온용어엔 비표준 표기가 등재돼 있다(실측: '컨텐츠' 조회 → '디지털^컨텐츠' 등재).
     #   규범표기 교정 대상을 성분으로 품은 어절은 온용어가 승인해도 화이트리스트 금지.
@@ -1552,6 +1679,17 @@ def phase_g_junction():
     if any(c.consistency_flip for c in c9a):
         fails += 1
         print("  ✗ FAIL [G-9a 규칙 카드] 방향이 거꾸로인 일관성 카드는 여전히 제거돼야 한다")
+    #   (a-2) AI 순수 재띄어쓰기 카드도 같은 강등만 받는다(2026-10-20 — ⑪이 남긴 '공익법인등' AI high).
+    #         지우거나 방향을 바꾸지는 않는다.
+    g9 += 1
+    c9a2 = [Correction(original="검토해야한다", corrected="검토해야 한다", reason="보조 용언은 띄어 씀",
+                       source="ai_typo", color=HL_TYPO, category="띄어쓰기", confidence="high")]
+    _jp.resolve(c9a2, doc9a)
+    if (len(c9a2) != 1 or c9a2[0].corrected != "검토해야 한다" or c9a2[0].confidence != "low"
+            or "문서에서는" not in c9a2[0].reason):
+        fails += 1
+        print(f"  ✗ FAIL [G-9a-2 AI 재띄어쓰기] 저자 다수 강등을 못 받음 "
+              f"→ {[(c.original, c.corrected, c.confidence, c.reason) for c in c9a2]}")
     #   (b) 자동 정합은 근거가 확정일 때만 — 근거 카드가 사용자 결정 그룹이면 정합하지 않고 그 그룹에
     #       합류하며, 결과는 **카드 순서와 무관**하다(실원고 '(기관명)주거상향지원사업').
     g9 += 1

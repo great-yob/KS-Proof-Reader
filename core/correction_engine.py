@@ -54,6 +54,11 @@ class GeminiEngine:
         return {"failed": getattr(self._checker, "last_failed_chunks", 0),
                 "total":  getattr(self._checker, "last_total_chunks", 0)}
 
+    @property
+    def last_glossary(self) -> list:
+        """직전 check_scope가 청크 프롬프트에 주입한 글로서리 [(원문 base, 교정 base), …]."""
+        return list(getattr(self._checker, "last_glossary", None) or [])
+
 
 def build_engine(api_key: str = "", *, logger=None):
     """생성 엔진 생성. API 키가 없으면 None.

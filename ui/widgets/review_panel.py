@@ -1627,6 +1627,11 @@ class ReviewPanel(QWidget):
             return
         import re as _re
         _hang = _re.compile(r"[^가-힣]")
+        # 인용 구간(남의 제목·참고문헌) — 일관성 카드는 그 속 등장을 바꾸지 않는다(core/citation_spans).
+        #   워커 [7]·[9.2]가 같은 구간을 가린 텍스트로 다수결을 셌으므로 근거 수치와도 맞는다.
+        from core import citation_spans as _cit
+        if getattr(self, "_cit_text", None) is not text:
+            self._cit_text, self._cit_spans = text, _cit.citation_spans(text)
         for o in self._occ:
             p = o.get("pos")
             if p is None or o.get("_stem_done"):
@@ -1635,6 +1640,9 @@ class ReviewPanel(QWidget):
             c = o["c"]
             orig = c.get("original", "") or ""
             corr = c.get("corrected", "") or ""
+            if c.get("consistency_flip") and _cit.covers(self._cit_spans, p, p + len(orig)):
+                o["excluded"] = True
+                continue
             # 대상 ①: 순수 '분리' 띄어쓰기 교정(글자 불변 + 원문 공백 없음 + 공백 추가).
             is_split = not (" " in orig or not corr or orig == corr
                             or orig.replace(" ", "") != corr.replace(" ", "")

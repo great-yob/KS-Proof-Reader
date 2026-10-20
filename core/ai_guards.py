@@ -99,13 +99,62 @@ def is_bulk_delete(c) -> bool:
 #   교정 도구는 저자가 쓴 수치를 바꾸면 안 된다. '숫자열을 뺀 나머지'가 동일하고 아라비아 숫자열만
 #   다를 때 차단(공백·문장부호 변경은 대상 아님 — 나머지가 달라져 자연 제외).
 def is_number_change(c) -> bool:
-    """⑤ 원문/교정문이 아라비아 숫자열만 다르고 나머지 글자는 동일(수치 임의 변경)."""
+    """⑤ 원문/교정문이 아라비아 숫자열만 다르고 나머지 글자는 동일(수치 임의 변경).
+
+    ⚠ **명백한 연도 오타**(`is_obvious_year_typo`)만 예외 — 드롭하지 않고 `demote_obvious_year_typo`가
+    검수(low) 카드로 내린다(2026-10-20 사용자 결정: "명백하지 않으면 드롭 — 과교정 방지").
+    """
     if c.source not in ("ai_typo", "ai_polish") or c.original == c.corrected:
         return False
     if not re.search(r"\d", c.original):
         return False
+    if is_obvious_year_typo(c.original, c.corrected):
+        return False
     return (re.sub(r"\d+", "", c.original) == re.sub(r"\d+", "", c.corrected)
             and re.findall(r"\d+", c.original) != re.findall(r"\d+", c.corrected))
+
+
+# '명백한 연도 오타' — 있을 수 없는 연도('2217년')를 숫자 **한 자리만** 바꿔 있을 법한 연도로 고친 것.
+#   코퍼스 실측(2026-10-20): '2013년 29.5%, 2016년 17.8%, 2217년 22.0%, 2022년 …' 연도열 속 오타.
+#   그 밖의 숫자 변경('42.18%'→'41.18%' 계산 보정, '11개'→'9개')은 명백하지 않아 계속 드롭한다.
+#   ⚠ 미래 연도 서술('2050년')은 범위 안이라 '있을 수 없는 연도'가 아니다 — 범위를 넓히지 말 것.
+_YEAR_RE = re.compile(r"(?<!\d)(\d{4})(?=\s*년)")
+_PLAUSIBLE_YEARS = range(1900, 2101)
+
+
+def is_obvious_year_typo(o: str, cr: str) -> bool:
+    """o→cr이 숫자 외 글자는 같고, 'NNNN년' 하나만 불가능한 연도→한 자리 다른 가능 연도인가."""
+    o, cr = o or "", cr or ""
+    if re.sub(r"\d+", "", o) != re.sub(r"\d+", "", cr):
+        return False
+    do, dc = re.findall(r"\d+", o), re.findall(r"\d+", cr)
+    if len(do) != len(dc):
+        return False
+    diff = [(a, b) for a, b in zip(do, dc) if a != b]
+    if len(diff) != 1:
+        return False
+    a, b = diff[0]
+    if len(a) != 4 or len(b) != 4 or sum(x != y for x, y in zip(a, b)) != 1:
+        return False
+    if a not in _YEAR_RE.findall(o):
+        return False
+    return int(a) not in _PLAUSIBLE_YEARS and int(b) in _PLAUSIBLE_YEARS
+
+
+def demote_obvious_year_typo(corrections: list, logger=None) -> list:
+    """⑤의 예외(명백한 연도 오타)를 low 검수 카드로 내린다(제자리 수정). 숫자는 저자 몫이라 자동 적용 금지."""
+    demoted = 0
+    for c in corrections:
+        if (c.source in ("ai_typo", "ai_polish") and c.confidence != "low"
+                and is_obvious_year_typo(c.original, c.corrected)):
+            c.confidence = "low"
+            if not (c.reason or "").startswith("[검수]"):
+                c.reason = ("[검수] " + (c.reason or "")
+                            + " (연도 숫자 변경 — 있을 수 없는 연도라 오타로 보이나 수치는 저자 확인)")
+            demoted += 1
+    if logger and demoted:
+        logger(f"  → 연도 오타 AI 교정 {demoted}건 검수 카드로 강등 (수치 변경은 자동 적용 제외)")
+    return corrections
 
 
 # ── ⑥ 영문 → 한글 음역(표기 통일) ──────────────────────────
@@ -232,8 +281,17 @@ def is_colon_to_middot(c) -> bool:
 #   len≥4)만 받는다. 그래서 **숫자/라틴이 어절 안에 융합**된 '2차전지'→'2차 전지'는 드롭하면
 #   결정론이 base='차전지'(3글자)로 **스킵**해 카드가 통째로 사라진다(회귀). → 쪼개지는 어절이 순수
 #   한글일 때만 위임하고, 융합 어절은 **보존**(2026-07-01 후속6, '2차전지' 회귀 수정).
+#   ⚠ 순수 한글로도 부족했다 — 2026-10-20부터 ⑪-b와 같은 '결정론이 받는 형태' 게이트(함수 docstring).
 def is_compound_split_respacing(c) -> bool:
-    """⑪ 한글 복합명사 어절을 공백으로 쪼개는 분리(글자 불변) → 결정론 다수결에 위임(드롭)."""
+    """⑪ 한글 복합명사 어절을 공백으로 쪼개는 분리(글자 불변) → 결정론 다수결에 위임(드롭).
+
+    ⚠ **결정론이 실제로 받는 형태만** 위임한다(⑪-b와 같은 게이트 `_deterministic_takes_joined`).
+    예전엔 '쪼개지는 어절이 순수 한글'이기만 하면 드롭해서, 다수결이 원리적으로 못 받는 **문법
+    규칙 띄어쓰기**까지 대체 카드 없이 사라졌다(2026-10-20 코퍼스 재생 실측 — 20원고에서
+    '예를들어'·'위와같은'·'대표성있는'·'없어도블루카드를'(용언·어미 뒤), '진행중'·'해당시'(20곳)·
+    '구조속에서'·'상호간에'(의존명사·3글자 낱말) 등 정탐 약 20건이 카드 없이 증발). 다수결은
+    조사 뗀 base가 순수 명사·4~14글자일 때만 후보를 만든다 — 그 밖은 AI 카드가 유일한 카드다.
+    """
     if c.source not in ("ai_typo", "ai_polish") or c.original == c.corrected:
         return False
     o, cr = c.original, c.corrected
@@ -246,7 +304,7 @@ def is_compound_split_respacing(c) -> bool:
     #   순수 분리라면 원문 어절 경계는 교정문 어절 경계의 부분집합 → 어절별로 소비된다.
     j, fired = 0, False
     for ot in o_toks:
-        buf = ""
+        buf, j0 = "", j
         while j < len(c_toks) and len(buf) < len(ot):
             buf += c_toks[j]
             j += 1
@@ -254,11 +312,15 @@ def is_compound_split_respacing(c) -> bool:
                 break
         if buf != ot:                                  # 어절 경계 어긋남(재배치) → 대상 아님
             return False
-        # 이 원문 어절이 2개 이상으로 쪼개졌다면, 그 어절은 **순수 한글**이어야 위임(드롭).
-        #   융합 어절('2차전지'·'A모델')은 결정론이 못 받으므로 보존.
-        if buf != c_toks[j - 1]:                       # 마지막 소비 어절과 다르면 = 여러 어절로 분리됨
+        # 이 원문 어절이 2개 이상으로 쪼개졌다면, 결정론이 받는 형태여야 위임(드롭).
+        #   융합 어절('2차전지'·'A모델')·용언/의존명사 분리('예를들어'·'진행중')는 보존.
+        if j - j0 >= 2:
             if not all("가" <= ch <= "힣" for ch in ot):
                 return False
+            parts = list(c_toks[j0:j])
+            parts[-1] = _strip_josa(parts[-1])         # 결정론은 조사 뗀 base로 센다
+            if not _deterministic_takes_joined(_strip_josa(ot), parts if len(parts) == 2 else ()):
+                return False                           # 결정론이 못 받는 형태 → AI 카드 보존
             fired = True
     return fired and j == len(c_toks)
 
@@ -437,13 +499,28 @@ def is_numeral_to_hangul(c) -> bool:
 #   ⚠ 실제 영문 오타 교정(Desity→Density)은 글자가 달라 casefold 불일치 → 자연 보존. 한글은
 #   대소문자가 없어 casefold 무영향이라 한글 교정도 전부 보존. 양방향(소문자화·대문자화 모두) 차단.
 _LATIN_RE = re.compile(r"[A-Za-z]")
+# Shift를 한 글자 더 누른 오타('TRaining') — 대문자 둘 뒤에 소문자가 둘 이상. 두문자어 복수형
+#   ('SMEs')·단위('GHz')는 소문자가 하나라 걸리지 않는다.
+_SHIFT_TYPO_RE = re.compile(r"\b([A-Z])([A-Z])([a-z]{2,})\b")
+
+
+def _fixes_shift_typo(o: str, cr: str) -> bool:
+    """대소문자 차이가 전부 'TRaining'→'Training' 꼴(둘째 대문자만 소문자로)인가."""
+    fixed = _SHIFT_TYPO_RE.sub(lambda m: m.group(1) + m.group(2).lower() + m.group(3), o)
+    return fixed != o and fixed == cr
 
 
 def is_latin_case_change(c) -> bool:
-    """⑭ 라틴 대소문자만 다른 AI 교정(그 외 글자 불변) → 저자 영문 표기 존중(드롭)."""
+    """⑭ 라틴 대소문자만 다른 AI 교정(그 외 글자 불변) → 저자 영문 표기 존중(드롭).
+
+    ⚠ Shift 오타('TRaining'→'Training')는 표기 스타일이 아니라 오타라 보존한다(2026-10-20 코퍼스
+    재생 실측 — 이 가드가 지운 4건 중 1건).
+    """
     if c.source not in ("ai_typo", "ai_polish") or c.original == c.corrected:
         return False
     if not _LATIN_RE.search(c.original):
+        return False
+    if _fixes_shift_typo(c.original, c.corrected):
         return False
     return c.original.casefold() == c.corrected.casefold()
 
@@ -513,15 +590,35 @@ def is_sentence_grammar_rewrite(c) -> bool:
 _HANGUL_CHAR_RE = re.compile(r"[가-힣]")
 
 
+def _adjacent_transposition(o: str, c: str) -> bool:
+    """o와 c가 **한 어절 안 이웃한 두 음절의 자리바꿈 한 번**만 다른가('조보금'↔'보조금')."""
+    if len(o) != len(c):
+        return False
+    diff = [i for i, (a, b) in enumerate(zip(o, c)) if a != b]
+    if len(diff) != 2 or diff[1] != diff[0] + 1:
+        return False
+    i = diff[0]
+    return (o[i] == c[i + 1] and o[i + 1] == c[i]
+            and "가" <= o[i] <= "힣" and "가" <= o[i + 1] <= "힣")
+
+
 def is_syllable_reorder(c) -> bool:
-    """⑯ 한글 음절 멀티셋 동일·순서만 다른 AI 교정(ai_typo) → 저자 어순·명칭 존중(드롭)."""
+    """⑯ 한글 음절 멀티셋 동일·순서만 다른 AI 교정(ai_typo) → 저자 어순·명칭 존중(드롭).
+
+    ⚠ **이웃 두 음절 자리바꿈 한 번**은 손가락 오타의 전형이라 보존한다('지방조보금의'→
+    '지방보조금의', '향상키시고'→'향상시키고' — 2026-10-20 코퍼스 재생에서 이 가드가 지운 3건 중
+    2건이 이 부류였다). 막아야 할 명칭 재배열('과학혁신기술부'→'과학기술혁신부')은 **낱말 덩어리**를
+    맞바꾸므로 여기에 걸리지 않는다.
+    """
     if c.source != "ai_typo" or c.original == c.corrected:
         return False
     ho = _HANGUL_CHAR_RE.findall(c.original)
     hc = _HANGUL_CHAR_RE.findall(c.corrected)
     if len(ho) < 2 or ho == hc:
         return False
-    return sorted(ho) == sorted(hc)
+    if sorted(ho) != sorted(hc):
+        return False
+    return not _adjacent_transposition(c.original.strip(), c.corrected.strip())
 
 
 # ── ⑰ 인명(성명) 붙이기 → 고유명사 서식은 교정 대상 아님(드롭) ─────────────────
@@ -676,7 +773,68 @@ def _appears_standalone(needle: str, hay: str) -> bool:
         start = i + 1
 
 
-def filter_redundant_expansions(ai_list: list, document_text: str, logger=None):
+def _standalone_positions(needle: str, hay: str) -> list:
+    """`_appears_standalone`과 같은 기준의 독립 등장 위치 전부."""
+    out, n, start = [], len(needle), 0
+    while needle:
+        i = hay.find(needle, start)
+        if i < 0:
+            break
+        before = hay[i - 1] if i > 0 else ""
+        after = hay[i + n] if i + n < len(hay) else ""
+        if not ("가" <= before <= "힣"):
+            if not ("가" <= after <= "힣"):
+                out.append(i)
+            else:
+                k = i + n
+                while k < len(hay) and "가" <= hay[k] <= "힣":
+                    k += 1
+                if _JOSA_RUN_RE.fullmatch(hay[i + n:k]):
+                    out.append(i)
+        start = i + 1
+    return out
+
+
+# 부분조각 확장의 예외 — **진짜 잘림 오타**('월 10만 원 이하 역가입자 중'→'지역가입자').
+#   2026-10-20 사용자 결정: 드롭 대신 검수(low) 카드. 오염('지역가입자' 속 '역가입자'까지 치환)은 검수 패널
+#   `_mark_stem_boundary_skips` 대상 ③(자기확장)이 겹으로 막는다. 조건은 전부 충족해야 한다:
+#     · 빠진 글자가 **정확히 한 음절**(타자 누락) — 두 음절 이상은 약칭이다('복지부'·'책임연'·메뉴 이름
+#       '안전보건관리비 관리' ← 산업안전보건관리비)
+#     · 조각이 순한글 한 어절 · 사전 미등재 · 문서에 **독립으로 1~2번만** (저자 용어 '인구감소지' 40+회 제외)
+#       ⚠ 등재어 조각('순히' — 順히)은 실단어 오타라 판별 신호가 없어 계속 드롭한다.
+#     · 교정형은 문서에 독립으로 3번 이상(저자가 실제로 쓰는 낱말이다 — 표 약칭 '책임연' 제외)
+#     · 조각의 독립 등장마다, 빠진 앞·뒤 글자가 **바로 옆(공백 건너)에 없다** — '건강보     험대상자'(낱말 속
+#       공백)·'근로자퇴직급여 보장법'(이미 온전한 이름)은 잘림이 아니다.
+_TRUNC_MAX_FRAG, _TRUNC_MIN_FULL = 2, 3
+
+
+def _is_genuine_truncation(frag: str, full: str, doc: str, exists_fn) -> bool:
+    if exists_fn is None or not re.fullmatch(r"[가-힣]{2,}", frag or ""):
+        return False
+    full = (full or "").replace(" ", "")
+    k = full.find(frag)
+    if k < 0 or len(full) - len(frag) != 1:
+        return False
+    try:
+        if exists_fn(frag):
+            return False
+    except Exception:
+        return False
+    pos = _standalone_positions(frag, doc)
+    if not (1 <= len(pos) <= _TRUNC_MAX_FRAG):
+        return False
+    if len(_standalone_positions(full, doc)) < _TRUNC_MIN_FULL:
+        return False
+    pre, suf = full[:k], full[k + len(frag):]
+    for i in pos:
+        if pre and doc[:i].rstrip().endswith(pre):
+            return False
+        if suf and doc[i + len(frag):].lstrip().startswith(suf):
+            return False
+    return True
+
+
+def filter_redundant_expansions(ai_list: list, document_text: str, logger=None, exists_fn=None):
     """원문 조각을 '문서에 **독립 단어로** 이미 있는 더 긴 표기'로 부풀리는 AI 과교정을 제외한다.
 
     예) '소프트'→'소프트웨어'(문서에 '소프트웨어'가 독립 단어로 존재), '소규모·저'→'소규모·저매출',
@@ -699,11 +857,26 @@ def filter_redundant_expansions(ai_list: list, document_text: str, logger=None):
     이 과교정은 (a) 같은 조각이 본문에 수십~수백 번 나오면 검수 카드가 그만큼 폭증하고,
     (b) corrected ⊇ original이라 적용 시 자기재매칭으로 증식·오염된다. → 카드 생성 단계에서 제외.
 
-    반환: 걸러낸 리스트(원본 미변경). 문서 텍스트 없으면 입력 그대로.
+    ⚠ exists_fn(사전 조회)이 주어지면 **진짜 잘림 오타**(`_is_genuine_truncation`)는 드롭하지 않고
+       검수(low) 카드로 남긴다(2026-10-20). 없으면 예전대로 전부 드롭.
+
+    반환: 걸러낸 리스트(원본 미변경 — 예외 항목만 제자리에서 low로). 문서 텍스트 없으면 입력 그대로.
     """
     if not ai_list or not document_text:
         return ai_list
     doc = _norm_ws(document_text)
+    kept_low = 0
+
+    def _keep_as_review(c, frag, full) -> bool:
+        nonlocal kept_low
+        if not _is_genuine_truncation(frag, full, doc, exists_fn):
+            return False
+        c.confidence = "low"
+        if not (c.reason or "").startswith("[검수]"):
+            c.reason = ("[검수] " + (c.reason or "")
+                        + " (낱말 앞뒤가 잘린 오타로 보임 — 같은 낱말 속 등장은 바꾸지 않음, 검토 필요)")
+        kept_low += 1
+        return True
 
     def _standalone_any(s: str) -> bool:
         # 띄어 쓴 교정문('미생성 코드')과 붙여 쓴 문서 표기('미생성코드')는 같은 확장이다.
@@ -719,19 +892,106 @@ def filter_redundant_expansions(ai_list: list, document_text: str, logger=None):
         if c.source in ("ai_typo", "ai_polish") and o and o != cr:
             # (a) bare 확장 — original 그대로가 corrected의 진부분('소프트'→'소프트웨어').
             if o in cr and len(cr) > len(o) and _standalone_any(cr):
-                dropped += 1
-                continue
-            # (b) 조사형 확장 — 조사를 떼면 base가 진부분('미생성[이]'→'미생성 코드[가]').
-            #     kiwi 미가용 시 _strip_josa가 입력을 그대로 돌려줘 (a)와 동일 판정(무회귀).
-            bo, bcr = _strip_josa(o), _strip_josa(cr)
-            if (len(bo) >= 2 and bo != bcr and bo in bcr and len(bcr) > len(bo)
-                    and _standalone_any(bcr)):
-                dropped += 1
-                continue
+                if not _keep_as_review(c, o, cr):
+                    dropped += 1
+                    continue
+            else:
+                # (b) 조사형 확장 — 조사를 떼면 base가 진부분('미생성[이]'→'미생성 코드[가]').
+                #     kiwi 미가용 시 _strip_josa가 입력을 그대로 돌려줘 (a)와 동일 판정(무회귀).
+                bo, bcr = _strip_josa(o), _strip_josa(cr)
+                if (len(bo) >= 2 and bo != bcr and bo in bcr and len(bcr) > len(bo)
+                        and _standalone_any(bcr)):
+                    if not _keep_as_review(c, bo, bcr):
+                        dropped += 1
+                        continue
         kept.append(c)
     if logger and dropped:
         logger(f"  → 부분조각 확장 AI 교정 {dropped}건 제외 "
                f"(문서에 독립 단어로 있는 더 긴 표기의 조각 — 카드 폭증·자기증식 방지)")
+    if logger and kept_low:
+        logger(f"  → 잘림 오타 AI 교정 {kept_low}건 검수 카드로 강등 "
+               f"(부분조각 확장의 예외 — 같은 낱말 속 등장은 바꾸지 않음)")
+    return kept
+
+
+# ══════════════════════════════════════════════════════════
+# ▌글로서리 오적용 드롭 — 'S→T' 규칙을 다른 낱말 W에 적용해 T로 바꾼 교정
+# ══════════════════════════════════════════════════════════
+# 글로서리는 `_run_chunked`가 청크마다 high 교정을 **가드보다 먼저** 쌓아 뒤 청크 프롬프트에
+#   넣는다(청크 간 일관성 힌트). 2026-10-20 코퍼스 장부 실측: 한 청크의 '복지부'→'보건복지부'
+#   (부분조각 확장 — 가드가 지운 오교정)가 글로서리에 남자, 뒤 청크의 AI가 "글로서리 규칙에 따라"
+#   서비스명 '복지지갑'을 '보건복지부'로(high 3장), '행복이음'을 '보건복지부'로 바꿨다.
+#   글로서리 항목은 'S라는 낱말을 T로'라는 뜻이지 'T가 아닌 것은 T로'가 아니다 — 교정 낱말의
+#   base가 T인데 원문 낱말이 S도 아니고 S를 품지도 않으면 오적용이다. 철자 수정('보건건복지부'
+#   →'보건복지부', `is_spelling_repair`)은 T로 가는 정당한 오타 교정이라 남긴다.
+#   ⚠ AI 입력(글로서리 자체)은 건드리지 않는다 — 가드보다 먼저 쌓는 구조를 고치면 뒤 청크의
+#   프롬프트가 바뀌어 실호출 검증이 필요하다(사용자 확인 사항). 이건 출력 쪽 결정론 그물이다.
+def _gloss_tok_base(tok: str) -> str:
+    return _strip_josa(_EDGE_NONHANGUL_RE.sub("", tok or ""))
+
+
+def _misapplies(ot: str, ct: str, targets: dict, exists_fn=None) -> bool:
+    """원문 조각 ot → 교정 낱말 ct가 글로서리 T(=ct의 base)를 S가 아닌 낱말에 적용한 것인가."""
+    bc = _gloss_tok_base(ct)
+    srcs = targets.get(bc)
+    if not srcs:
+        return False
+    flat = ot.replace(" ", "")
+    if _gloss_tok_base(flat) == bc:
+        return False                          # 낱말은 그대로(조사만 바뀜) — 글로서리와 무관
+    if _gloss_tok_base(flat) in srcs or any(s in flat for s in srcs):
+        return False                          # 규칙의 S 그 자체(조사 변형 포함) — 정당한 적용
+    return not is_spelling_repair(ot, ct, exists_fn)   # T로 가는 오타 교정은 정당
+
+
+def _is_glossary_misapplication(c, targets: dict, exists_fn=None) -> bool:
+    if c.source != "ai_typo" or not targets:
+        return False
+    import difflib
+    o_toks, c_toks = (c.original or "").split(), (c.corrected or "").split()
+    sm = difflib.SequenceMatcher(a=o_toks, b=c_toks, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag != "replace":
+            continue
+        ob, cb = o_toks[i1:i2], c_toks[j1:j2]
+        if len(cb) == 1:                       # 여러 어절 → 한 낱말('출생 연도'→'출생년도')
+            pairs = [(" ".join(ob), cb[0])]
+        elif len(ob) == len(cb):
+            pairs = list(zip(ob, cb))
+        else:
+            continue
+        if any(_misapplies(ot, ct, targets, exists_fn) for ot, ct in pairs):
+            return True
+    return False
+
+
+def _glossary_sources(glossary, exists_fn=None) -> dict:
+    """T → 정당한 S 집합. ⚠ 글로서리는 **연쇄로 오염**된다 — 오적용 교정('복지지갑'→'보건복지부')이
+    high로 나오면 그것도 글로서리에 들어가 뒤 청크의 같은 오적용을 '규칙 그대로'로 보이게 한다
+    (2026-10-20 실측 [('복지부','보건복지부'), ('복지지갑','보건복지부')]). 그래서 순서대로 읽으며,
+    이미 있는 T로 가는 새 항목이 그 자체로 오적용이면 출처로 인정하지 않는다."""
+    targets = {}
+    for s, t in glossary:
+        if t in targets and _misapplies(s, t, targets, exists_fn):
+            continue
+        targets.setdefault(t, set()).add(s)
+    return targets
+
+
+def drop_glossary_misapplication(ai_list: list, glossary, exists_fn=None, logger=None) -> list:
+    """글로서리 'S→T'를 다른 낱말에 적용한 AI 교정을 **드롭**한다. glossary=[(S, T), …](base 쌍)."""
+    if not ai_list or not glossary:
+        return ai_list
+    targets = _glossary_sources(glossary, exists_fn)
+    kept, dropped = [], 0
+    for c in ai_list:
+        if _is_glossary_misapplication(c, targets, exists_fn):
+            dropped += 1
+            continue
+        kept.append(c)
+    if logger and dropped:
+        logger(f"  → 글로서리 오적용 AI 교정 {dropped}건 제외 "
+               "(앞 청크의 'A→B' 규칙을 A가 아닌 낱말에 적용)")
     return kept
 
 

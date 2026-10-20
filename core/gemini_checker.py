@@ -166,6 +166,35 @@ def _salvage_json_objects(s: str) -> list:
     return out
 
 
+_PAIR_RE = re.compile(r'"(original|corrected|reason|category|confidence)"\s*:\s*"((?:[^"\\\n]|\\.)*)"')
+
+
+def _salvage_pairs(s: str, have: set) -> list:
+    """객체 회수로도 못 살린 항목을 **잘 닫힌 "키": "값" 쌍**만으로 되살린다(마지막 단계).
+
+    따옴표 하나가 빠진 값('"corrected":유도 표기 … 교정"')은 문자열 상태를 뒤집어 `_salvage_json_objects`가
+    그 객체를 통째로 버린다(2026-10-20 코퍼스 실측 — 204응답 중 1건, '파리핀'→'파라핀' 유실). 문자열
+    상태와 무관하게 '}…{'로 잘라 조각마다 쌍을 모은다. 같은 키에 **서로 다른 값이 둘 이상**이면 그 조각은
+    포기한다(어느 쪽이 AI의 뜻인지 모른다). have: 이미 회수한 original — 중복 회수 금지.
+    """
+    out = []
+    for piece in re.split(r"}\s*,?\s*{", s):
+        vals = {}
+        for k, v in _PAIR_RE.findall(piece):
+            vals.setdefault(k, set()).add(v)
+        if any(len(v) > 1 for v in vals.values()):
+            continue
+        item = {k: next(iter(v)) for k, v in vals.items()}
+        if item.get("original") and item.get("corrected") and item["original"] not in have:
+            try:
+                rec = {k: json.loads(f'"{v}"') for k, v in item.items()}
+            except json.JSONDecodeError:
+                continue
+            rec["_salvaged"] = True        # 글로서리에 넣지 않는다(_run_chunked) — 깨진 출력의 조각이다
+            out.append(rec)
+    return out
+
+
 # ⚠ 어문 규범(KAGEC) 컨텍스트 주입은 제거됨(2026-06-22). 규범 블록이 AI 오탈자 탐지를
 #   분산시켜 회귀를 유발함(eomun.db 비활성 시 복귀로 입증). 어문 규범은 결정론 페어로만 사용.
 
@@ -240,6 +269,9 @@ class GeminiChecker:
         #   사용자에게 표출한다(과거엔 실패도 빈 결과와 구분 불가 → 침묵 성공).
         self.last_failed_chunks = 0
         self.last_total_chunks  = 0
+        # 직전 오탈자 패스가 청크 프롬프트에 주입한 글로서리 [(원문 base, 교정 base), …].
+        #   워커가 '글로서리 오적용'(ai_guards.drop_glossary_misapplication)을 거르는 데 쓴다.
+        self.last_glossary: list = []
 
     # ── 공개 메서드 ────────────────────────────────────
 
@@ -283,6 +315,7 @@ class GeminiChecker:
                 return None
             return build_integrated_prompt(chunk, _chunk_sw(chunk), glossary=None)
 
+        self.last_glossary = glossary          # 같은 리스트 — 청크마다 쌓이는 그대로 노출
         return self._run_chunked(
             text, prompt_tmpl, AI_CHUNK_TYPO,
             set(), "ai_typo", HL_TYPO,
@@ -492,10 +525,15 @@ class GeminiChecker:
             #     7개라 이 수정으로 바뀌는 AI 입력은 실측상 없다.
             if glossary is not None:
                 seen = {(o, c) for o, c in glossary}
+                # 키·값 쌍으로 건진 항목(`_salvage_pairs`)은 넣지 않는다 — 깨진 출력의 조각이고,
+                #   넣으면 뒤 청크 프롬프트가 바뀐다(2026-10-20: 재생 캐시 2요청 빗나감으로 확인).
+                from core.consistency_pass import _nfc as _clean
+                salv = {_clean(str(it.get("original", ""))) for it in raw_items
+                        if isinstance(it, dict) and it.get("_salvaged")}
                 for c in tagged:
                     if len(glossary) >= GLOSSARY_MAX:
                         break
-                    if c.confidence != "high":
+                    if c.confidence != "high" or c.original in salv:
                         continue
                     entry = _normalize_glossary_entry(c.original, c.corrected)
                     if entry is None or entry in seen:
@@ -837,6 +875,9 @@ class GeminiChecker:
                 pass
             # 2차 복구 — 객체 단위로 회수(깨진 항목만 버리고 나머지 살림).
             salvaged = _salvage_json_objects(blob)
+            # 3차 — 객체 회수가 놓친 항목을 잘 닫힌 키·값 쌍으로(따옴표 하나 빠진 값).
+            salvaged += _salvage_pairs(
+                blob, {str(x.get("original", "")) for x in salvaged if isinstance(x, dict)})
             if salvaged:
                 if logger:
                     logger(f"  [AI] JSON 부분 복구 — {len(salvaged)}개 항목 회수"

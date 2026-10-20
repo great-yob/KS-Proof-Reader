@@ -484,10 +484,20 @@ class ProofreadingWorker(QThread):
             #   ④ 캡션 인라인 대량삭제(Figure 1 캡션 통째 삭제). 전부 억제 방향(과교정 0).
             #   상세·실측은 ai_guards 모듈 docstring + memory safety-net-overflag-guards ③~③-d.
             ai_list, _ = ai_guards.filter_overcorrections(ai_list, logger=log)
+            # ⑤의 예외 — 있을 수 없는 연도를 한 자리만 고친 '명백한 연도 오타'('2217년'→'2017년')는
+            #   드롭 대신 검수 카드(2026-10-20 사용자 결정 — 명백하지 않은 숫자 변경은 계속 드롭).
+            ai_list = ai_guards.demote_obvious_year_typo(ai_list, logger=log)
             # 문서 텍스트가 필요한 가드 — 부분조각 확장(소프트→소프트웨어·소규모·저→소규모·저매출·
             #   …소프트→…소프트 스킬): 문서에 이미 온전히 있는 더 긴 표기의 조각을 부풀린 과교정.
             #   조사형 등장('책임연구원으로')도 독립 사용으로 판정한다(책임연→책임연구원 차단).
-            ai_list = ai_guards.filter_redundant_expansions(ai_list, text, logger=log)
+            #   exists_fn: 진짜 잘림 오타('역가입자'→'지역가입자')는 드롭 대신 검수 카드(2026-10-20).
+            ai_list = ai_guards.filter_redundant_expansions(
+                ai_list, text, logger=log, exists_fn=lambda w: lookup_word(w)["exists"])
+            # 글로서리 오적용 드롭 — 앞 청크 글로서리의 'A→B'를 A가 아닌 낱말에 적용한 교정
+            #   ('복지지갑'→'보건복지부', 2026-10-20 장부 실측). 글로서리는 가드보다 먼저 쌓인다.
+            ai_list = ai_guards.drop_glossary_misapplication(
+                ai_list, getattr(engine, "last_glossary", None),
+                exists_fn=lambda w: lookup_word(w)["exists"], logger=log)
             # 환각 '문서 내 일관성' 재띄어쓰기 드롭 — '수급자_사망의심자'→'수급자_사망 의심자'
             #   ("문서 내 일관성 유지" 사유)처럼 띄어 쓴 형태('사망 의심자')가 문서 어디에도
             #   없는데 일관성을 명분으로 분리한 AI 환각([M]이 밑줄 어절이라 못 잡음, 2026-07-21).
@@ -745,7 +755,7 @@ class ProofreadingWorker(QThread):
                 if norm_map:
                     existing = {c.original for c in merged}
                     net = []
-                    n_tie = 0
+                    n_tie = n_unatt = 0
                     for w in doc_eojeols:
                         # 어절 자체 → 없으면 조사 제거형 순으로 매핑 조회
                         for key in (w, _strip_josa(w)):
@@ -792,18 +802,26 @@ class ProofreadingWorker(QThread):
                                 tie = not repeated and (
                                     _nd.is_verb_inflection_homograph(key, w, text, near_tie=True)
                                     or _nd.is_noun_josa_homograph(key, w, text, near_tie=True))
+                                # 미등재 규범 표기 — 등재 외래어를 사전 어디에도 없는 표기법 형태로
+                                #   바꾸는 쌍('위젯'→'위짓' · '팔로워'→'폴로어')은 검수로(사용자 거절 집중).
+                                unattested = (not repeated and not tie
+                                              and _nd.is_unattested_loanword_norm(key, norm))
                                 if tie:
                                     # `[검수]` 접두 = 가드 강등 표지(consistency_pass._guard_demoted가
                                     #   신뢰도 통일에서 되올리지 않는 열쇠).
                                     reason = (f"[검수] 규범표기인 '{norm}' 권장 → 사용자 결정 필요\n"
                                               "— 형태소 분석이 갈리는 자리(활용형·조사 결합으로도 읽힘)")
                                     n_tie += 1
+                                elif unattested:
+                                    reason = (f"[검수] 규범표기인 '{norm}' 권장 → 사용자 결정 필요\n"
+                                              f"— '{norm}'은 사전 표제어가 아닌 표기법 형태 · 실제 쓰임 확인")
+                                    n_unatt += 1
                                 net.append(Correction(
                                     original=w, corrected=corrected,
                                     reason=reason,
                                     source="dict", color=HL_DICT,
                                     category="규범표기",
-                                    confidence="low" if (repeated or tie) else "high",
+                                    confidence="low" if (repeated or tie or unattested) else "high",
                                 ))
                                 existing.add(w)
                             break
@@ -812,10 +830,12 @@ class ProofreadingWorker(QThread):
                         _n_lo = sum(1 for c in net if c.confidence == "low")
                         if len(net) - _n_lo:
                             det_auto.append(("규범표기", len(net) - _n_lo))
-                        if _n_lo - n_tie:
-                            det_review.append(("규범표기(빈출)", _n_lo - n_tie))
+                        if _n_lo - n_tie - n_unatt:
+                            det_review.append(("규범표기(빈출)", _n_lo - n_tie - n_unatt))
                         if n_tie:
                             det_review.append(("규범표기(분석 갈림)", n_tie))
+                        if n_unatt:
+                            det_review.append(("규범표기(미등재 표기)", n_unatt))
             except Exception as e:
                 log(f"  [규범표기] 정규화 스킵: {e}")
 
@@ -1477,9 +1497,12 @@ class ProofreadingWorker(QThread):
                     _ai_origs = [c.original for c in merged
                                  if c.source not in ("ai_polish", "dict_flag") and c.original]
                     from core import consistency_family as _cf
+                    # 인용 구간(남의 제목·참고문헌)은 다수결 표를 던지지 않는다 — 가린 텍스트로 센다.
+                    #   그 속 등장은 검수 패널이 excluded로 둔다(core/citation_spans 헤더).
+                    from core import citation_spans as _cit
                     for minority, majority, n_min, n_maj, basis in \
                             _morph.find_compound_spacing_consistency(
-                                text, exists_fn=_cons_exists, with_basis=True):
+                                _cit.mask(text), exists_fn=_cons_exists, with_basis=True):
                         if minority in existing and minority not in _flag_only:
                             continue
                         clean = re.sub(r"[^가-힣]", "", minority)
@@ -1756,7 +1779,9 @@ class ProofreadingWorker(QThread):
                 if validator and validator.available:
                     import nikl_dict as _nd_jp
                     _jp_exists = lambda w: _nd_jp.lookup_word(w)["exists"]   # noqa: E731
-                jd = _jp.resolve(merged, text, logger=log, exception_set=_jp_exc,
+                # 변이표도 [7]과 같은 가린 텍스트로 센다 — 인용 구간은 저자 표기의 증거가 아니다.
+                from core import citation_spans as _cit
+                jd = _jp.resolve(merged, _cit.mask(text), logger=log, exception_set=_jp_exc,
                                  exists_fn=_jp_exists)
                 # 화면에는 **한 줄로만** 낸다(사용자 지정 2026-07-30). 개별 판정
                 #   (미탐 보완/방향 정정/규칙 카드 검수 강등/이음매 정합/정합 보류/이음매 그룹/

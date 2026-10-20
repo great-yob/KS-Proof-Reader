@@ -373,6 +373,29 @@ def _is_exact_headword(word: str, min_len: int = 2) -> bool:
     return False
 
 
+def is_unattested_loanword_norm(key: str, norm: str) -> bool:
+    """norm_map 쌍이 '등재 외래어 → **어디에도 등재되지 않은** 규범 표기'인가(한 낱말).
+
+    우리말샘 '규범 표기' 칸에는 외래어 표기법을 기계적으로 적용한 형태가 많고, 그중엔 표제어로도
+    없는 형태가 있다('위젯'→'위짓' · '멀티모달'→'멀티모덜' · '팔로워'→'폴로어' · '스크래핑'→'스크레이핑').
+    사용자 결정 기록(event_queue)에서 이 모양이 집중적으로 거절됐다(폴로어 4/4 · 멀티모덜 3/4 —
+    목표어가 등재된 콘셉트·리플릿·메시지·슈퍼마켓은 수락 19~22회). 워커 [5.7]은 이 쌍을 지우지 않고
+    **검수(low)** 로 내린다. norm_map 1,081쌍이 이 모양이고 '루꼴라→루콜라'처럼 옳은 것도 섞여 있다.
+    ⚠ '목표어 미등재' 하나로 판정하지 말 것 — 정상 순화의 목표 복합어(세숫그릇 등) 28.5%가 미등재다
+    (memory overcorrection-batch-doc28-30 H). 원문이 **외래어 표제어**일 때로 좁힌다.
+    """
+    conn = _get_conn()
+    if conn is None or not key or not norm or " " in norm:
+        return False
+    try:
+        if not conn.execute("SELECT 1 FROM words WHERE word=? AND word_type='외래어' LIMIT 1",
+                            (key,)).fetchone():
+            return False
+    except sqlite3.Error:
+        return False
+    return not _is_exact_headword(norm)
+
+
 def is_exact_noun_headword(word: str) -> bool:
     """`word`가 pos='명사'/'대명사'로 **정확히** 등재된 표제어인가(조사 stem 폴백 없음).
 

@@ -236,6 +236,16 @@ def _eligible(c) -> bool:
                 and not _morph.has_zero_width(o))
 
 
+def _ai_respacing(c) -> bool:
+    """AI(ai_typo)의 글자 불변 재띄어쓰기 카드 — ①b의 '규칙 카드 검수 강등'만 받는다."""
+    from core import morph as _morph
+    o, cr = c.original or "", c.corrected or ""
+    return bool(getattr(c, "source", "") == "ai_typo" and o and cr and o != cr
+                and o.replace(" ", "") == cr.replace(" ", "")
+                and not c.consistency_flip
+                and not _morph.is_urlish(o) and not _morph.has_zero_width(o))
+
+
 def _pure_noun(word: str) -> bool:
     """순수 명사 덩어리인가(NNG/NNP만) — 기존 finder와 같은 게이트."""
     from core import morph as _morph
@@ -526,9 +536,12 @@ def resolve(corrections: list, text: str, *, logger=None,
     #     모양에 따라 갈리기도 했다. → 규칙 카드는 지우지도 방향을 바꾸지도 않고, 저자 다수가
     #     원문 표기면 **검수(low)로 내리고 그 근거를 보인다** — finder가 틀렸을 수도('총지급액'의
     #     접두사 '총-'), 저자 용어일 수도('공익법인등' — 법령 용어) 있어 사람이 정한다.
+    #     AI의 순수 재띄어쓰기 카드도 이 **강등만** 받는다(`_ai_respacing`) — ⑪이 결정론이 못 받는
+    #     문법 띄어쓰기('공익법인등'→'공익법인 등')를 AI 카드로 남기면서(2026-10-20), 같은 판정이
+    #     결정론 카드면 검수·AI 카드면 high로 갈리던 것을 맞춘다. 재작성·제거는 하지 않는다.
     dead_ids = set()
     for c in corrections:
-        if not _eligible(c):
+        if not (_eligible(c) or _ai_respacing(c)):
             continue
         word = (c.original or "").replace(" ", "")
         st, winner, n_maj, n_min = verdict(variants.get(word))

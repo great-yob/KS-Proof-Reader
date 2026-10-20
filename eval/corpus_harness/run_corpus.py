@@ -17,6 +17,9 @@ eval/corpus_harness/run_corpus.py — 실원고 코퍼스 결정론 파이프라
   diff A B          두 실행의 카드 비교(내용 집합 + --order 시 순서까지). 바뀐 카드를 전부 출력
   summary NAME      (source, category, confidence) 분포
   events            data/event_queue.db의 사용자 결정을 **현행 finder로 재분류**해 거절률 산출
+  coverage          **추출 충실도**(coverage.py) — 원고 파일을 직접 판독한 문단이 추출 텍스트에 다 있나.
+                    기준선(판정해 둔 후보) 밖의 새 누락 후보만 △. --save-baseline. gate가 함께 돈다
+                    (원고·캐시가 그대로면 지난 결과 재사용).
   check NAME        **계층 간 불변식** 검사(invariants.py) — 원문 실재·[검수]=low·같은 원문 카드 1장 등.
                     기준선과 무관하게 어떤 실행에서도 성립해야 하는 성질이다. gate는 두 방식에 자동으로 돌린다.
   gate              **릴리스 게이트** — AI 켬(캐시 재생·오프라인)·AI 끔 두 방식으로 병렬 실행해
@@ -557,6 +560,77 @@ def _gate_diff(mode: str):
     return differ, rm, add, lines, docs, sum(len(c) for c in a.values())
 
 
+# ── coverage ────────────────────────────────────────────
+_COV_STATE = os.path.join(RUNS, "_coverage.json")
+_COV_BASE = os.path.join(RUNS, "_coverage_base.json")
+
+
+def _coverage_measure() -> dict:
+    """원고별 추출 누락 후보 {tag: {"file", "stamp", "cands": [[키, 자리, 문단], …] | None}}.
+    원고 파일과 원고 캐시가 지난번과 같으면 다시 판독하지 않는다."""
+    import coverage
+    try:
+        with open(_COV_STATE, encoding="utf-8") as fp:
+            old = json.load(fp)
+    except (OSError, ValueError):
+        old = {}
+    names = {_tag(f): f for f in _sources()}
+    out = {}
+    for tag in _docs():
+        f = names.get(tag)
+        if not f:
+            continue
+        src, cp = os.path.join(SRC_DIR, f), os.path.join(CACHE, tag + ".json")
+        stamp = coverage.source_stamp(src) + "#" + coverage.source_stamp(cp)
+        if (old.get(tag) or {}).get("stamp") == stamp:
+            out[tag] = old[tag]
+            continue
+        with open(cp, encoding="utf-8") as fp:
+            text = json.load(fp)["text"]
+        c = coverage.candidates(src, text)
+        out[tag] = {"file": f, "stamp": stamp, "cands": [list(x) for x in c] if c is not None else None}
+    os.makedirs(RUNS, exist_ok=True)
+    with open(_COV_STATE, "w", encoding="utf-8") as fp:
+        json.dump(out, fp, ensure_ascii=False, indent=0)
+    return out
+
+
+def _coverage_new(res: dict) -> list:
+    """기준선에 없는 누락 후보 [(tag, 자리, 문단)]. 기준선이 없으면 None."""
+    try:
+        with open(_COV_BASE, encoding="utf-8") as fp:
+            base = {t: set(v) for t, v in json.load(fp).items()}
+    except (OSError, ValueError):
+        return None
+    return [(t, ctx, txt) for t, r in sorted(res.items()) for k, ctx, txt in (r["cands"] or [])
+            if k not in base.get(t, set())]
+
+
+def _coverage_save(res: dict):
+    with open(_COV_BASE, "w", encoding="utf-8") as fp:
+        json.dump({t: [c[0] for c in (r["cands"] or [])] for t, r in res.items()}, fp, indent=0)
+
+
+def cmd_coverage(args):
+    os.chdir(REPO)
+    res = _coverage_measure()
+    for tag, r in sorted(res.items()):
+        n = "판독 불가(암호·배포용·깨짐)" if r["cands"] is None else f"누락 후보 {len(r['cands'])}문단"
+        print(f"{tag} {n}  {r['file'][:40]}")
+    if args.save_baseline:
+        _coverage_save(res)
+        print(f"[추출] 기준선 저장 — 후보 {sum(len(r['cands'] or []) for r in res.values())}문단")
+        return
+    new = _coverage_new(res)
+    if new is None:
+        print("[추출] 기준선이 없다 — 후보를 판정한 뒤 `run_corpus.py coverage --save-baseline`")
+        sys.exit(2)
+    print(f"[추출] 기준선 밖 새 누락 후보 {len(new)}문단")
+    for t, ctx, txt in new[:40]:
+        print(f"      {t} [{ctx}] {txt[:100]!r}")
+    sys.exit(2 if new else 0)
+
+
 def cmd_gate(args):
     tags = _docs()
     if not tags:
@@ -614,6 +688,7 @@ def cmd_gate(args):
         _write_gate_state(st)
         print(f"[GATE] 기준선 저장 — AI 켬 {stats['ai']['cards']:,}장 · AI 끔 {stats['det']['cards']:,}장"
               f" (커밋 {head})")
+        _coverage_save(_coverage_measure())
         return
     if not all(os.path.isdir(os.path.join(RUNS, "_gate_" + m + "_base")) for m, _l, _f in _GATE_MODES):
         print("[GATE] 기준선이 없다 — 카드를 판정한 뒤 `run_corpus.py gate --save-baseline`")
@@ -633,6 +708,19 @@ def cmd_gate(args):
         if len(lines) > _GATE_SHOW:
             print(f"      … 외 {len(lines) - _GATE_SHOW}줄 — 전부: "
                   f"`run_corpus.py diff _gate_{mode}_base _gate_{mode} --order`")
+    # 추출 충실도 — 원고 파일을 직접 판독한 문단이 추출 텍스트에 다 있나(coverage.py). 원고·캐시가
+    #   그대로면 지난 판독을 재사용해 비용이 없다. 새 누락 후보는 카드 변화와 같은 △(판정 후 서명).
+    new = _coverage_new(_coverage_measure())
+    if new is None:
+        print("[GATE] 추출 충실도 기준선이 없다 — `run_corpus.py coverage --save-baseline`")
+        changed = True
+    elif new:
+        changed = True
+        print(f"[GATE] 추출 충실도 · 기준선 밖 새 누락 후보 {len(new)}문단 — `run_corpus.py coverage`")
+        for t, ctx, txt in new[:_GATE_SHOW]:
+            print(f"      {t} [{ctx}] {txt[:80]!r}")
+    else:
+        print("[GATE] 추출 충실도 · 기준선과 같음")
     sys.exit(2 if changed else 0)
 
 
@@ -661,6 +749,10 @@ def main():
     p.set_defaults(fn=cmd_summary)
     p = sub.add_parser("events")
     p.set_defaults(fn=cmd_events)
+    p = sub.add_parser("coverage")
+    p.add_argument("--save-baseline", action="store_true",
+                   help="현재 누락 후보를 기준선으로(후보를 전부 판정한 뒤에만)")
+    p.set_defaults(fn=cmd_coverage)
     p = sub.add_parser("check")
     p.add_argument("name")
     p.add_argument("--show", type=int, default=40, help="펼칠 위반 사례 수")
