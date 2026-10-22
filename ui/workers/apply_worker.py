@@ -64,7 +64,7 @@ class _BridgeReplay:
         """
         s, sf, prov = self.s, self.sf, self.prov
         of, kf, n = o.translate(_ASCII_FOLD), k.translate(_ASCII_FOLD), len(o)
-        self_matching = o in k          # ⚠ 브리지와 같이 대소문자를 가려 판정한다
+        self_matching = of in kf        # ⚠ 브리지와 같이 대소문자를 접어 판정한다(한/글 찾기와 같은 기준)
         count = skipped = 0
         out = []
         for _ in range(self._MAX_PASSES):

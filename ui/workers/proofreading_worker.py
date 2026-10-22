@@ -1108,6 +1108,25 @@ class ProofreadingWorker(QThread):
                     merged.extend(net_r)
                     det_review.append(("따옴표방향", len(net_r)))
                     log(f"  [문장부호] 따옴표 방향 반대 {len(net_r)}건 추가")
+                # 군더더기 쉼표 — '“…묻다”,와'→'“…묻다”와'(닫는 부호 뒤 조사 앞 쉼표 삭제),
+                #   'Gemini,등'→'Gemini 등'('등' 앞 쉼표를 띄어쓰기로). 쉼표 뒤 띄움 규칙([7])이
+                #   '띄우면 오교정'이라 빼 두는 자리를 여기서 바로잡는다(사용자 확인 2026-10-22).
+                #   쉼표라는 글자를 바꾸므로 띄어쓰기가 아니라 문장부호 검수 카드.
+                from core import spacing_rules as _sr_c
+                net_c = []
+                for orig, fixed, why in _sr_c.find_stray_commas(text):
+                    if orig in existing:
+                        continue
+                    net_c.append(Correction(
+                        original=orig, corrected=fixed,
+                        reason=f"[검수] {why}",
+                        source="punct", color=HL_DICT,
+                        category="문장부호", confidence="low",
+                    ))
+                    existing.add(orig)
+                if net_c:
+                    merged.extend(net_c)
+                    det_review.append(("쉼표", len(net_c)))
             except Exception as e:
                 log(f"  [문장부호] 괄호·따옴표 짝 맞추기 스킵: {e}")
 

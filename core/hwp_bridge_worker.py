@@ -21,6 +21,7 @@ core/hwp_bridge_worker.py — 32비트 HWP COM 브리지 워커
 """
 
 import ctypes
+import difflib
 import html
 import json
 import os
@@ -54,6 +55,10 @@ _INVISIBLE_RE = re.compile(
 )
 
 
+# 영문 대문자 → 소문자(한/글 찾기는 영문 대소문자를 가리지 않는다) — `apply_worker._ASCII_FOLD`와 같은 표.
+_ASCII_FOLD = str.maketrans({chr(c): chr(c + 32) for c in range(65, 91)})
+
+
 def _clean(s: str) -> str:
     """NFC + 불가시 문자 제거 + 양 끝 공백 제거. 빈 문자열은 그대로."""
     if not s:
@@ -61,6 +66,55 @@ def _clean(s: str) -> str:
     s = unicodedata.normalize("NFC", s)
     s = _INVISIBLE_RE.sub("", s)
     return s.strip()
+
+
+def _red_spans(original: str, corrected: str) -> list:
+    """교정본에서 칠할 구간 — 교정문 안의 **바뀐 곳만** [(시작, 끝), …](교정문 좌표·문서 순·겹침 병합).
+
+    교정문 전체를 칠하면 교정본만 보는 사람은 무엇이 틀렸었는지 알 수 없다('기술 개발' 전체가
+    빨가면 띄어쓰기를 고친 건지 글자를 고친 건지 모른다 — 사용자 요청 2026-10-22). 그래서:
+      · 글자를 바꾸거나 넣은 곳 → 그 글자('리플렛'→'리플릿'은 '릿', 괄호 보충은 그 괄호)
+      · 공백만 넣거나 뺀 곳 → **양옆 한 글자씩**(공백은 칠해도 안 보인다)
+          '기술개발'→'기술 개발' = '술 개' · '소재 ('→'소재(' = '재(' · '),센'→'), 센' = ', 센'
+      · 글자를 지운 곳 → 지운 자리 양옆 한 글자씩
+    ⚠ 띄어쓰기만 다르면(공백 뺀 글자열이 같으면) 글자를 하나씩 짝지어 공백열을 견준다 —
+      SequenceMatcher는 같은 글자가 되풀이되는 곳에서 엉뚱하게 정렬할 수 있다.
+    ⚠ `hwp_memo`의 메모 자리 찾기(`memo_scan`)가 **같은 함수**로 빨간 글자 하나를 골라 판정한다
+      — 칠하는 규칙을 바꾸면 그쪽도 함께 바뀐다(한 곳에만 둔 이유).
+    """
+    n = len(corrected)
+    spans = []
+    if re.sub(r"\s", "", original) == re.sub(r"\s", "", corrected):
+        oi = [i for i, ch in enumerate(original) if not ch.isspace()]
+        ci = [j for j, ch in enumerate(corrected) if not ch.isspace()]
+        for k in range(1, len(ci)):
+            if (original[oi[k - 1] + 1:oi[k]] != corrected[ci[k - 1] + 1:ci[k]]):
+                spans.append((ci[k - 1], ci[k] + 1))
+    else:
+        sm = difflib.SequenceMatcher(None, original, corrected, autojunk=False)
+        for tag, _i1, _i2, a, b in sm.get_opcodes():
+            if tag == "equal":
+                continue
+            seg = corrected[a:b]
+            lead = not seg.strip() or seg[0].isspace()
+            trail = not seg.strip() or seg[-1].isspace()
+            if lead:
+                while a > 0 and corrected[a - 1].isspace():
+                    a -= 1
+                a = max(0, a - 1)
+            if trail:
+                while b < n and corrected[b].isspace():
+                    b += 1
+                b = min(n, b + 1)
+            if a < b:
+                spans.append((a, b))
+    merged = []
+    for a, b in sorted(spans):
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    return merged
 
 
 def _ws_strip(s: str) -> str:
@@ -1248,7 +1302,8 @@ class HwpBridge:
                      없으면 예전과 똑같이 동작한다.
 
         방식: 각 항목마다 "Find" 액션으로 다음 매치를 찾고
-        InsertText로 치환, GetSelectedPos/SelectText로 새 글자를 선택해 빨강 적용.
+        InsertText로 치환, GetSelectedPos/SelectText로 새 글자를 선택해 빨강 적용 — 빨강은
+        교정문 안의 **바뀐 곳에만** 남긴다(`_red_spans` · 띄어쓰기는 양옆 한 글자씩).
         GetDefault("AllReplace")로 검색 옵션의 안전한 기본값을 미리 세팅한다.
         """
         self._style_fps = {tuple(s.get("fp") or []) for s in (char_styles or [])}
@@ -1323,7 +1378,17 @@ class HwpBridge:
             # corrected가 original을 부분문자열로 포함하면(괄호 추가류) 찾기-치환이 자기
             #   삽입분을 다시 잡아 무한 증식한다 → 1차 RepeatFind는 랩 감지로, 2차
             #   AllReplace는 폴백 금지로 차단한다. try 밖(폴백)에서도 참조하므로 여기서 정의.
-            self_matching = original in corrected
+            #   ⚠ **영문 대소문자를 접어서** 판정한다 — 한/글 찾기는 대소문자를 가리지 않으므로
+            #     'TRaining'→'Training'(가드 ⑭가 살리는 Shift 오타)도 자기 삽입분을 다시 잡는다.
+            #     가려서 판정하던 때는 같은 자리를 상한(1000곳)까지 거듭 치환했다(실측 2026-10-22,
+            #     실파일 영문 참고문헌 제목 'X Drives'→'X drives' 한 자리 = 1000곳). 교정본 계획
+            #     (`ApplyWorker._BridgeReplay`)도 같은 판정을 쓴다.
+            self_matching = original.translate(_ASCII_FOLD) in corrected.translate(_ASCII_FOLD)
+            # ★바뀐 곳만 칠한다(_red_spans) — 교정문 전체가 아니라. 문단을 넘는 교정문은 좌표
+            #   셈이 성립하지 않아 예전처럼 전체를 칠한다.
+            red_spans = _red_spans(original, corrected) if "\r" not in corrected else []
+            if red_spans == [(0, len(corrected))]:
+                red_spans = []
 
             # ── 1차 경로: FindDlg + RepeatFind + InsertText + Color ──────
             #   HWP 2010~2022에서 검증된 패턴. 본문 텍스트는 안정적으로 잡힘.
@@ -1585,6 +1650,14 @@ class HwpBridge:
                                 ins_end = self.hwp.GetPos()
                             except Exception:
                                 ins_end = None
+                            # 교정문이 [시작, 시작+길이)에 그대로 들어갔음이 확인됐나 — 부분 칠하기와
+                            #   좌표 기록(spots_raw)이 둘 다 이 확인 위에서만 선다.
+                            ins_ok = (match_end is not None and "\r" not in corrected
+                                      and isinstance(ins_end, tuple) and len(ins_end) >= 3
+                                      and tuple(ins_end[:3]) == (
+                                          match_end[0], match_end[1],
+                                          match_end[2] - len(original) + len(corrected)))
+                            part = red_spans if ins_ok else []
 
                             # 방금 삽입한 텍스트 선택
                             selected_ok = False
@@ -1622,15 +1695,27 @@ class HwpBridge:
                             try:
                                 if shape_snap is not None:
                                     # ⚠ 새로 꺼내지 말고 **떠 둔 그 객체**를 되씌운다.
+                                    orig_color = int(shape_snap.TextColor)
                                     if not style_locked:
                                         shape_snap.TextColor = self._APPLY_RED
                                     self.hwp.HAction.Execute("CharShape", shape_snap.HSet)
+                                    if not style_locked and part:
+                                        # 바뀌지 않은 조각만 원래 글자색으로 되돌린다. 전체를 먼저
+                                        #   칠하고 빼는 순서라, 어느 조각이 실패해도 **덜 칠해지는
+                                        #   일은 없다**(더 칠해질 뿐 — 예전 동작 쪽).
+                                        shape_snap.TextColor = orig_color
+                                        self._recolor_outside(match_end, len(original),
+                                                              len(corrected), part, shape_snap)
                                     if style_locked:
                                         # ⚠ 형광펜은 **찾기 직후 첫 서식 액션으로는 먹히지
                                         #   않는다**(실측: 첫 호출은 True를 돌려주고 아무 일도
                                         #   안 한다). 바로 위 CharShape Execute가 그 한 번을
                                         #   소진하므로 여기서는 정상 적용된다 — 순서를 바꾸지 말 것.
-                                        marked_with_pen = self._markpen(self._APPLY_RED)
+                                        if part:
+                                            marked_with_pen = self._markpen_spans(
+                                                match_end, len(original), len(corrected), part)
+                                        else:
+                                            marked_with_pen = self._markpen(self._APPLY_RED)
                                         self._style_marked += 1
                                         # ★형광펜 자리는 **빨갛지 않다** — '교정본+메모'
                                         #   모드의 메모 단계가 `_match_is_red`로 자리를
@@ -1673,11 +1758,7 @@ class HwpBridge:
                             #   경우를 거른다). 못 믿으면 그 문단의 기록을 무효로 돌린다 —
                             #   뒤늦게 엉뚱한 자리에 메모가 붙는 것보다 찾기로 되돌아가는 편이
                             #   낫다(호출 측 폴백).
-                            if (match_end is not None and "\r" not in corrected
-                                    and isinstance(ins_end, tuple) and len(ins_end) >= 3
-                                    and tuple(ins_end[:3]) == (
-                                        match_end[0], match_end[1],
-                                        match_end[2] - len(original) + len(corrected))):
+                            if ins_ok:
                                 spots_raw.append([match_end[0], match_end[1],
                                                   match_end[2] - len(original),
                                                   len(original), len(corrected), count])
@@ -2141,6 +2222,74 @@ class HwpBridge:
         except Exception:
             return False
 
+    def _caret(self):
+        try:
+            p = self.hwp.GetPos()
+            return tuple(p[:3]) if isinstance(p, tuple) and len(p) >= 3 else None
+        except Exception:
+            return None
+
+    def _restore_caret(self, p) -> None:
+        """부분 칠하기 전 커서로 되돌린다 — 다음 찾기가 예전과 같은 자리에서 이어지게
+        (교정본 계획 `ApplyWorker._BridgeReplay`가 그 재개 자리를 전제한다)."""
+        try:
+            self.hwp.HAction.Run("Cancel")
+            if p is not None:
+                self.hwp.SetPos(*p)
+        except Exception:
+            pass
+
+    def _select_in_para(self, lst, para, a, b) -> bool:
+        """(lst, para) 문단의 [a, b) 글자를 고르고 **커서 위치로 확인**한다(치환 전 선택 되살리기와
+        같은 방식 — `SelectText`는 이 환경에서 예외를 던진다)."""
+        try:
+            self.hwp.HAction.Run("Cancel")
+            self.hwp.SetPos(lst, para, a)
+            for _ in range(b - a):
+                self.hwp.HAction.Run("MoveSelRight")
+            now = self.hwp.GetPos()
+            return isinstance(now, tuple) and len(now) >= 3 and tuple(now[:3]) == (lst, para, b)
+        except Exception:
+            return False
+
+    def _recolor_outside(self, match_end, n_orig, n_corr, spans, shape) -> None:
+        """방금 통째로 칠한 교정문에서 `spans` **밖** 조각에 `shape`(원래 글자색)를 되씌운다.
+
+        ⚠ 같은 스냅샷 객체를 쓴다 — 색만 원래 값이라 결과 글자모양이 원래와 같아져 한/글이
+          **원래 글자모양 id를 그대로** 쓴다(빨강을 안 칠한 것과 같다). 조각을 고르지 못하면
+          그 조각은 빨간 채로 둔다(덜 칠하는 쪽으로는 무너지지 않는다).
+        """
+        lst, para, base = match_end[0], match_end[1], match_end[2] - n_orig
+        keep = self._caret()
+        try:
+            last = 0
+            for a, b in list(spans) + [(n_corr, n_corr)]:
+                if last < a and self._select_in_para(lst, para, base + last, base + a):
+                    self.hwp.HAction.Execute("CharShape", shape.HSet)
+                last = b
+        except Exception:
+            pass
+        finally:
+            self._restore_caret(keep)
+
+    def _markpen_spans(self, match_end, n_orig, n_corr, spans) -> bool:
+        """글자 스타일 자리 — 교정문의 `spans` 조각에만 형광펜. 한 조각이라도 고르지 못하면
+        교정문 전체에 칠한다(예전 동작). 형광펜은 지울 길이 마땅치 않아 빨강과 순서가 반대다."""
+        lst, para, base = match_end[0], match_end[1], match_end[2] - n_orig
+        keep = self._caret()
+        try:
+            for a, b in spans:
+                if not self._select_in_para(lst, para, base + a, base + b):
+                    break
+                self._markpen(self._APPLY_RED)
+            else:
+                return True
+            if self._select_in_para(lst, para, base, base + n_corr):
+                return self._markpen(self._APPLY_RED)
+            return False
+        finally:
+            self._restore_caret(keep)
+
     def _consume_pen_para(self, avail, used) -> bool:
         """지금 매치가 **형광펜으로 표시해 둔 문단**인가.
 
@@ -2167,7 +2316,7 @@ class HwpBridge:
             return True
         return key in used
 
-    def _match_is_red(self) -> bool:
+    def _match_is_red(self, red_at=None, n=0) -> bool:
         """지금 찾은 매치(선택 상태)의 글자색이 **교정 표시 빨강**인가.
 
         ★'교정본+메모'(output_mode="hwp_memo") 전용 판정이다. 그 모드는 치환이 끝난
@@ -2183,8 +2332,25 @@ class HwpBridge:
           아니라 **마지막으로 쓴 펜 색**을 돌려준다(실측 2026-09-10: 칠하지 않은 자리에서도
           255가 나왔다). 그 값을 믿으면 모든 자리가 통과해 메모가 엉뚱한 자리에 박힌다 —
           이 함수가 애초에 막으려던 바로 그 사고다. **다시 넣지 말 것.**
+        ★교정본은 교정문의 **바뀐 곳만** 칠한다(`_red_spans`). 그러면 선택 전체의 색은 섞인 값이라
+          빨강으로 읽히지 않으므로, `red_at`(교정문 안 칠한 글자 하나의 위치)이 주어지면 **그 글자
+          하나를 골라** 읽는다. 읽은 뒤 커서를 매치 끝으로 돌려 다음 찾기가 이어지게 한다.
+          `n`은 앵커 길이다.
+          ⚠ 고르지 않고 커서만 두고 읽지 말 것 — 한/글 2010은 선택이 없으면 커서 **앞** 글자의
+            모양을 준다(실측 2026-10-22: 위치 i에서 글자 i−1의 색, 문단 첫머리만 글자 0).
+            그 앞 글자는 칠하지 않은 글자라 우리 자리를 놓친다.
         """
         try:
+            if red_at is not None:
+                cur = self.hwp.GetPos()
+                self.hwp.SetPos(cur[0], cur[1], cur[2] - n + red_at)
+                self.hwp.HAction.Run("MoveSelRight")
+                cset = self.hwp.HParameterSet.HCharShape
+                self.hwp.HAction.GetDefault("CharShape", cset.HSet)
+                red = int(cset.TextColor) == self._APPLY_RED
+                self.hwp.HAction.Run("Cancel")
+                self.hwp.SetPos(cur[0], cur[1], cur[2])
+                return red
             cset = self.hwp.HParameterSet.HCharShape
             self.hwp.HAction.GetDefault("CharShape", cset.HSet)
             return int(cset.TextColor) == self._APPLY_RED
@@ -2223,6 +2389,14 @@ class HwpBridge:
             # ★'교정본+메모' — 앵커가 교정문이라 원래부터 그 표기였던 자리까지 찾힌다.
             #   우리가 고친 자리는 빨갛게 칠해져 있으므로 그것만 받는다(_match_is_red).
             red_only = bool(item.get("red_only"))
+            # 교정본은 교정문의 바뀐 곳만 칠했다 — 칠한 첫 글자 위치(apply와 같은 `_red_spans`).
+            #   `anchor_of`는 그 교정의 원문이다. None이면 교정문 전체가 빨갛다(예전 판정).
+            red_at = None
+            if red_only and "\r" not in anchor:
+                anchor_of = _clean((item.get("anchor_of") or "").replace("\n", "\r"))
+                spans = _red_spans(anchor_of, anchor) if anchor_of else []
+                if spans and spans != [(0, len(anchor))]:
+                    red_at = spans[0][0]
             # ★형광펜으로 표시한 자리의 문단 좌표(apply가 돌려준 것) — 빨강 대신 형광펜을
             #   쓴 자리는 `red_only`에 걸러지므로, 여기 적힌 문단에서 잡히면 우리 자리로 본다.
             pen_paras = [tuple(x[:2]) for x in (item.get("pen_paras") or []) if len(x) >= 2]
@@ -2290,7 +2464,7 @@ class HwpBridge:
                             if cur[0] in self._memo_stories:
                                 continue
                             # ★빨강 필터 — 우리가 고치지 않은 자리는 **등장이 아니다**.
-                            if red_only and not self._match_is_red():
+                            if red_only and not self._match_is_red(red_at, len(anchor)):
                                 if not self._consume_pen_para(pen_paras, pen_used):
                                     continue
                             if reskip_left > 0:     # 앞 패스에서 이미 센 매치

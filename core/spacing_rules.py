@@ -9,9 +9,11 @@ core/spacing_rules.py — 규칙 기반 문장부호·스크립트 경계 띄어
     (소수점 3.14 / 약어 U.S.A·a.m. / node.js·config.py / URL·이메일 / 줄임표 … 제외)
   · 한글↔라틴이 따옴표를 사이에 두고 붙은 **교차-스크립트 경계**만(가"Say → 가 "Say).
     영어 축약(don't)은 직선 아포스트로피라 대상에서 제외한다.
+  · 쉼표 뒤에 글자가 붙은 공백 누락(뒤가 조사·'등'이면 제외 — 쉼표 자체가 군더더기).
 
 공백만 삽입하고 글자는 바꾸지 않는다(환각 0). 검수 카드 특성상 약간의 노이즈는
-사람 검토로 흡수된다.
+사람 검토로 흡수된다. ⚠ 예외 하나 — `find_stray_commas`는 군더더기 쉼표를 지우거나 공백으로 바꾼다
+(그래서 워커가 띄어쓰기가 아니라 문장부호 카드로 낸다).
 """
 import re
 
@@ -75,8 +77,9 @@ def _is_abbrev_dot(tok: str, i: int) -> bool:
 _HANGUL_ABBREV_RE = re.compile(r"(?<![가-힣])[가-힣](?:\.[가-힣]){2,}(?![가-힣])")
 
 
-def _fix_token(tok: str) -> str:
-    inserts = []   # 공백을 삽입할 위치(해당 인덱스 '앞')
+def _fix_token(tok: str, commas=()) -> str:
+    """commas: 뒤를 띄울 쉼표의 토큰 내 위치(_tight_comma_positions가 문단 문맥으로 고른 것)."""
+    inserts = [i + 1 for i in commas]   # 공백을 삽입할 위치(해당 인덱스 '앞')
     n = len(tok)
     _ko_abbr = [(m.start(), m.end()) for m in _HANGUL_ABBREV_RE.finditer(tok)]
     for i in range(1, n - 1):
@@ -123,6 +126,97 @@ def _fix_token(tok: str) -> str:
     for pos in sorted(set(inserts), reverse=True):
         chars.insert(pos, " ")
     return "".join(chars)
+
+
+# ── 쉼표 뒤 띄어쓰기 ────────────────────────────────────────────────────────────
+# 쉼표 뒤는 띄어 쓴다 — 뒤에 글자(한글·라틴)가 바로 붙은 쉼표는 **전부** 후보다(사용자 보고 2026-10-22
+#   '소재 (36건, 25.7%),센서 및 제어 …'). 표 칸·괄호 속 압축 나열('※전기,가스,수도 등'·'(보증금,월차임)')도
+#   잡는다 — 규범상 오류이고 원고당 1~2장 수준이다(사용자 결정 2026-10-22: 처음엔 '같은 나열에 띄운 쉼표가
+#   있을 때만'으로 좁혔으나 한 문단에 쉼표가 하나뿐인 본문 오류 '변수들로,이상'을 놓쳤다).
+#   실측(20원고): 붙은 쉼표+글자 49곳 → 발화 47곳(본문 20 · 압축 나열 27).
+# ⚠ 뒤가 조사·'등'이면 띄우지 않는다 — '묻다”,와'·'Gemini,등'은 쉼표 자체가 군더더기라 띄우면 오교정이다.
+#   자릿점('1,000')·'1,2차'는 뒤가 숫자라 대상이 아니다.
+_TIGHT_COMMA_RE = re.compile(r"(?<=\S),(?=[가-힣A-Za-z])")
+# 열거를 닫는 '등' — 조사가 붙어도 같다('등의'·'등을'). '등급'·'등록'처럼 낱말이 이어지면 아니다.
+_ENUM_END_RE = re.compile(
+    r"(?:등등|등|따위)(?:의|을|를|이|은|는|과|와|에서|에게|에|으로|로|도|만|까지|이나|처럼)?(?=$|[^가-힣])")
+
+
+def _tight_comma_positions(text: str) -> set:
+    """뒤를 띄울 쉼표의 절대 위치 — 쉼표 자체가 군더더기인 자리(find_stray_commas)는 뺀다.
+
+    뒤가 조사처럼 보여도 낱말로도 쓰이는 한 글자(이·가·나·도·만·라)는 앞이 닫는 부호가 아니면 낱말로
+    본다 — '가,나,다'의 '나'·'A,이 경우'의 '이'. 닫는 부호 뒤('“A”,가')는 어느 쪽인지 못 가려 카드를 안 낸다.
+    """
+    out = set()
+    for m in _TIGHT_COMMA_RE.finditer(text):
+        rest = text[m.end():m.end() + 12]
+        if _ENUM_END_RE.match(rest):
+            continue
+        jm = _JOSA_AFTER_QUOTE.match(rest)
+        if jm and (text[m.start() - 1] in _CLOSE_SYM or jm.group(1) not in _AMBIG_JOSA):
+            continue
+        out.add(m.start())
+    return out
+
+
+# ── 군더더기 쉼표 — 위에서 '띄우지 않는다'로 뺀 두 자리를 바로잡는다 ─────────────────
+#   (사용자 확인 2026-10-22) 이 둘은 띄어쓰기가 아니라 **쉼표 자체**가 틀렸다:
+#     ⓐ 닫는 부호 + 쉼표 + 조사  '“…묻다”,와' → '“…묻다”와'   (조사는 인용·괄호에 붙는다 — 쉼표 삭제)
+#     ⓑ 낱말 + 쉼표 + '등'        'Gemini,등'   → 'Gemini 등'   (열거를 닫는 '등' 앞엔 쉼표 대신 띄어 씀)
+#   ⚠ 이 모듈에서 유일하게 **글자(쉼표)를 바꾸는** 규칙이다 → 워커가 문장부호(punct)·low 검수 카드로 낸다.
+#   ⚠ ⓐ는 낱말로도 쓰이는 한 글자 조사(이·가·도·만·나·라)를 뺀다 — '(2024),이 연구는'의 '이'는 관형사라
+#     쉼표를 지우면 오교정이다(그 자리는 띄움이 맞지만 어느 쪽인지 모양으로 못 가르므로 카드를 안 낸다).
+_CLOSE_SYM = "”’\"')]」』》〉"
+_AMBIG_JOSA = frozenset({"이", "가", "도", "만", "나", "라"})
+_STRAY_JOSA_RE = re.compile(r"(?<=[" + re.escape(_CLOSE_SYM) + r"]),(?=[가-힣])")
+_STRAY_ENUM_RE = re.compile(r"(?<=[0-9A-Za-z가-힣)\]]),(?=등|따위)")
+
+
+def find_stray_commas(text: str) -> list:
+    """군더더기 쉼표 후보 [(원문, 교정문, 사유), …](등장 순·중복 제거).
+
+    원문은 앞 낱말(과 닫는 부호)부터 조사·'등'까지다. 같은 원문이 이 규칙이 고치지 않는 자리
+    ('Gemini,등급' 속)에도 있으면 그 원문은 내지 않는다(그 자리까지 바뀌지 않게).
+    """
+    cand = []                                   # (원문 시작, 원문, 교정문, 사유)
+    for m in _STRAY_JOSA_RE.finditer(text):
+        jm = _JOSA_AFTER_QUOTE.match(text, m.end())
+        if not jm or jm.group(1) in _AMBIG_JOSA:
+            continue
+        s = m.start() - 1                       # 닫는 부호
+        while s > 0 and (text[s - 1].isalnum() or text[s - 1] in _CLOSE_SYM) and m.start() - s < 20:
+            s -= 1
+        orig = text[s:jm.end()]
+        cand.append((s, orig, orig.replace(",", "", 1) if orig.count(",") == 1 else None,
+                     "닫는 부호 뒤 조사 앞의 쉼표 — 조사는 앞말에 붙여 씀"))
+    for m in _STRAY_ENUM_RE.finditer(text):
+        s = m.start()
+        while s > 0 and text[s - 1].isalnum() and m.start() - s < 20:
+            s -= 1
+        em = _ENUM_END_RE.match(text, m.end())
+        if not em:
+            continue                            # '등급'·'등록' — 열거의 '등'이 아니다
+        orig = text[s:em.end()]
+        cand.append((s, orig, orig.replace(",", " ", 1) if orig.count(",") == 1 else None,
+                     "열거를 닫는 '등' 앞에는 쉼표 대신 띄어 씀"))
+    starts = {}
+    for s, orig, fixed, _w in cand:
+        starts.setdefault(orig, set()).add(s)
+    out, seen = [], set()
+    for s, orig, fixed, why in sorted(cand):
+        if fixed is None or orig in seen:
+            continue
+        i, ok = text.find(orig), True
+        while i != -1:
+            if i not in starts[orig]:
+                ok = False
+                break
+            i = text.find(orig, i + 1)
+        if ok:
+            seen.add(orig)
+            out.append((orig, fixed, why))
+    return out
 
 
 # ── 한국어 인용부호 띄어쓰기 정규화 ──────────────────────────────────
@@ -274,6 +368,7 @@ def _anchor_of(tok: str, fixed: str):
 def _collect_token_fixes(text: str, fix_fn, skip_fn=None, min_len: int = 1) -> list:
     """공백 토큰 규칙의 공통 수집기 — 앵커를 좁히고 중복을 제거한다.
 
+    fix_fn(토큰, 토큰의 절대 offset) → 토큰 교정문.
     반환: [(원문, 교정문), ...] (문서 등장 순, 중복 제거). 글자 불변만 통과.
     """
     cand = []          # (앵커 절대 offset, 토큰, 토큰 교정문, 앵커, 앵커 교정문)
@@ -281,7 +376,7 @@ def _collect_token_fixes(text: str, fix_fn, skip_fn=None, min_len: int = 1) -> l
         tok = m.group()
         if len(tok) < min_len or (skip_fn and skip_fn(tok)):
             continue
-        fixed = fix_fn(tok)
+        fixed = fix_fn(tok, m.start())
         if fixed == tok or fixed.replace(" ", "") != tok.replace(" ", ""):
             continue                                   # 글자 변경 — 환각 0 불변식
         a, af, off = _anchor_of(tok, fixed)
@@ -317,9 +412,18 @@ def find_punct_spacing(text: str) -> list:
 
     반환: [(원문, 띄어쓴 원문), ...] (등장 순, 중복 제거). 공백만 삽입된 것만.
     원문은 공백 토큰 전체가 아니라 **교정 지점을 감싼 최소 앵커**다(_collect_token_fixes).
+    쉼표 뒤 띄움은 뒤 문맥(조사·'등')을 토큰 밖까지 봐야 해 먼저 골라 두고(_tight_comma_positions)
+    같은 토큰 교정에 합친다 — 한 토큰에 두 규칙이 겹쳐도 카드는 한 장이다.
     """
+    commas = _tight_comma_positions(text)
+
+    def _fix(tok: str, start: int) -> str:
+        if not commas:
+            return _fix_token(tok)
+        return _fix_token(tok, [i for i in range(len(tok)) if start + i in commas])
+
     return _collect_token_fixes(
-        text, _fix_token,
+        text, _fix,
         skip_fn=lambda t: bool(_SKIP_TOKEN.search(t)),
         min_len=3,
     )
@@ -371,6 +475,6 @@ def find_unit_spacing(text: str) -> list:
     """
     return _collect_token_fixes(
         text,
-        lambda t: _UNIT_WON_RE.sub(r"\1 \2", t),
+        lambda t, _s: _UNIT_WON_RE.sub(r"\1 \2", t),
         skip_fn=lambda t: bool(re.search(r"\d,\d", t)),   # 자릿점/오식('12,9') — AI 영역
     )

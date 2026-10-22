@@ -524,6 +524,8 @@ class HwpEditor:
                                            self._MEMO_MAX_OCC)),
                     "red_only":  bool(it.get("red_only")),
                     "pen_paras": it.get("pen_paras") or [],
+                    # 교정본은 바뀐 곳만 칠했다 — 브리지가 원문과 견줘 칠한 글자를 찾는다.
+                    "anchor_of": it.get("anchor_of") or "",
                 })
             done0 = b
 
