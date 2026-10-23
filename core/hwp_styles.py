@@ -1,12 +1,14 @@
 """한/글 문서에서 **글자 스타일**의 글자모양 지문을 읽는다 (COM 없이, 파일만 읽는다).
 
-왜 필요한가 — ★HWP 5.0 파일에는 "이 런은 어떤 글자 스타일이다"라는 참조가 **없다**.
-런의 `charShapeId`가 그 스타일의 `charShape`와 **같을 때만** 글자 스타일로 인식된다.
-그래서 교정 표시로 글자색만 바꿔도 한/글은 '원래 모양 + 빨강'인 **새 글자모양**을 만들어
-그 런에 물리고, id가 달라지는 순간 **글자 스타일이 해제된다**(사용자 보고 2026-09-10,
-실측: 본문강조 cs#48 → 색만 다른 cs#278. 한 파일에서 35곳이 풀렸다).
+왜 필요한가 — 교정 표시로 글자색만 바꿔도 한/글은 '원래 모양 + 빨강'인 **새 글자모양**을
+만들어 그 런에 물린다(사용자 보고 2026-09-10, 실측: 본문강조 cs#48 → 색만 다른 cs#278.
+한 파일에서 35곳). 그때는 "HWP 5.0엔 스타일 참조가 없어 글자모양 id가 같을 때만 스타일"로
+보고 이것을 스타일 해제라 판단했다. ⚠ 그 전제는 **틀렸다**(2026-10-23): 참조는 문단의 영역
+태그(`PARA_RANGE_TAG` 종류 1, 하위 24비트 = 스타일 순번)에 있고 한/글은 소속을 그 태그로
+판정한다 — 상세는 docs/output-and-apply.md '재진단' 절. 이 모듈의 지문은 여전히 '빨강 대신
+형광펜' 자리를 고르는 데 쓰인다(글자모양 id를 원래대로 지키는 것은 그대로 유효하다).
 
-빨강과 글자 스타일 소속은 **글자모양 id 하나를 두고 다투므로 양립할 수 없다**. 그래서
+빨강과 스타일의 글자모양 id는 **양립할 수 없다**(사용자 결정 2026-09-10). 그래서
 `hwp_bridge_worker.apply()`는 스타일이 걸린 자리를 **빨강 형광펜**으로 표시한다 —
 형광펜은 글자모양이 아니라 런 안의 별도 요소(`<MARKPENBEGIN>`)라 글자모양을 건드리지
 않는다(실측 확인). 그 판정에 쓰는 것이 이 모듈이 돌려주는 지문이다.
@@ -420,7 +422,7 @@ def _from_hwpx(file_path, log):
                 "shadow": (_owpml_color(sh.get("color")) if sh is not None else 0),
             }
 
-        out, seen = [], set()
+        out, seen = [], {}
         for st in root.iter():
             if _tag(st) != "style" or (st.get("type") or "").upper() != "CHAR":
                 continue
@@ -429,10 +431,15 @@ def _from_hwpx(file_path, log):
                 continue
             fp = _fingerprint(sh, sh["names"])
             key = tuple(fp)
+            # 스타일 `id`는 .hwp의 스타일 순번과 같은 체계다(= COM `HStyle.Apply`).
+            sid = int(st.get("id")) if (st.get("id") or "").isdigit() else None
             if key in seen:
+                if sid is not None:
+                    seen[key]["ids"].append(sid)
                 continue
-            seen.add(key)
-            out.append({"name": st.get("name") or "", "fp": fp})
+            seen[key] = {"name": st.get("name") or "", "fp": fp,
+                         "ids": [] if sid is None else [sid]}
+            out.append(seen[key])
         return out
     except Exception as exc:
         log(f"[글자 스타일] hwpx 스타일 정보를 읽지 못했습니다({exc}) — 스타일 보호 없이 진행")
@@ -442,7 +449,9 @@ def _from_hwpx(file_path, log):
 def char_style_fingerprints(file_path, logger=None):
     """문서에 정의된 **글자 스타일**들의 글자모양 지문 목록.
 
-    Returns: [{"name": "본문강조", "fp": [...]}, …] — 실패하면 **빈 목록**.
+    Returns: [{"name": "본문강조", "fp": [...], "ids": [스타일 순번, …]}, …] — 실패하면 **빈 목록**.
+    `ids`는 그 지문을 쓰는 글자 스타일들의 순번(DocInfo `HWPTAG_STYLE` 순서 = OWPML 스타일
+    `id` = COM `HStyle.Apply`)이다. 브리지가 '이 글자가 글자 스타일 소속인가'를 판정하는 데 쓴다.
     """
     def log(msg):
         if logger:
@@ -487,8 +496,8 @@ def char_style_fingerprints(file_path, logger=None):
             acc += counts[k]
 
         out = []
-        seen = set()
-        for st in styles:
+        seen = {}
+        for sid, st in enumerate(styles):
             if st["kind"] != _STYLE_KIND_CHAR:
                 continue
             cid = st["char_shape"]
@@ -502,9 +511,10 @@ def char_style_fingerprints(file_path, logger=None):
             fp = _fingerprint(sh, names)
             key = tuple(fp)
             if key in seen:
-                continue            # 같은 글자모양을 쓰는 스타일이 여럿이면 한 번만
-            seen.add(key)
-            out.append({"name": st["name"], "fp": fp})
+                seen[key]["ids"].append(sid)    # 같은 글자모양을 쓰는 스타일이 여럿이면 한 줄에
+                continue
+            seen[key] = {"name": st["name"], "fp": fp, "ids": [sid]}
+            out.append(seen[key])
         return out
     except Exception as exc:
         log(f"[글자 스타일] 스타일 정보를 읽지 못했습니다({exc}) — 스타일 보호 없이 진행")

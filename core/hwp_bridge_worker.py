@@ -117,6 +117,28 @@ def _red_spans(original: str, corrected: str) -> list:
     return merged
 
 
+def _edit_ops(src: str, dst: str) -> list:
+    """src를 dst로 바꾸는 **최소 편집** [(i1, i2, j1, j2), …](문서 순) — src[i1:i2]를 dst[j1:j2]로.
+
+    교정본이 원고의 서식을 지키는 근거다(`HwpBridge._apply_in_place`): 여기 들지 않은 글자는
+    한/글에서 **한 번도 건드리지 않으므로** 글자모양도 글자 스타일 소속도 그대로 남는다.
+    ⚠ 띄어쓰기만 다르면 `_red_spans`와 같이 글자를 하나씩 짝지어 **공백열만** 바꾼다 —
+      SequenceMatcher는 되풀이 글자에서 엉뚱한 글자를 지웠다 넣어 그 글자의 서식을 다시 쓴다.
+    """
+    if re.sub(r"\s", "", src) == re.sub(r"\s", "", dst):
+        oi = [i for i, ch in enumerate(src) if not ch.isspace()]
+        ci = [j for j, ch in enumerate(dst) if not ch.isspace()]
+        if not oi:
+            return [(0, len(src), 0, len(dst))] if src != dst else []
+        # 글자 사이 공백열 + 맨 앞·맨 뒤(정리된 문자열이라 보통 비어 있다)
+        cuts = ([(0, oi[0], 0, ci[0])]
+                + [(oi[k - 1] + 1, oi[k], ci[k - 1] + 1, ci[k]) for k in range(1, len(oi))]
+                + [(oi[-1] + 1, len(src), ci[-1] + 1, len(dst))])
+        return [(a1, a2, b1, b2) for a1, a2, b1, b2 in cuts if src[a1:a2] != dst[b1:b2]]
+    sm = difflib.SequenceMatcher(None, src, dst, autojunk=False)
+    return [(i1, i2, j1, j2) for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag != "equal"]
+
+
 def _ws_strip(s: str) -> str:
     """공백을 전부 없앤 비교용 표현(각주 라인 ↔ 문단 텍스트 포함 관계 판정에 쓴다).
 
@@ -500,7 +522,13 @@ class HwpBridge:
         # 문서에 정의된 글자 스타일의 글자모양 지문(apply가 명령마다 새로 받는다).
         #   비어 있으면 스타일 보호 없이 예전처럼 빨강 글자만 쓴다.
         self._style_fps = set()
+        self._style_fp_quick = set()
         self._style_marked = 0
+        # 문서에 정의된 글자 스타일의 번호(= `HStyle.Apply`) — 최소 편집이 소속을 되살릴 때 쓴다.
+        self._char_style_ids = set()
+        self._style_lost = 0
+        self._pen_in_style = 0
+        self._inplace_fallback = 0
 
     def _dispatch_hwp(self, file_path):
         """확장자에 맞는 HWP 버전을 우선 Dispatch.
@@ -1308,7 +1336,15 @@ class HwpBridge:
         """
         self._style_fps = {tuple(s.get("fp") or []) for s in (char_styles or [])}
         self._style_fps.discard(())
+        # 지문의 싼 앞거름 — (한글 글꼴, 크기, 굵기, 기울임). 위치는 `_charshape_fingerprint`의
+        #   구성(글꼴 7 · 장평 7 · 자간 7 · 상대크기 7 · 글자위치 7 · 크기 · 속성 …)을 따른다.
+        self._style_fp_quick = {(fp[0], fp[35], (fp[36] >> 1) & 1, fp[36] & 1)
+                                for fp in self._style_fps if len(fp) > 36}
+        self._char_style_ids = {int(i) for s in (char_styles or []) for i in (s.get("ids") or [])}
         self._style_marked = 0          # 이번 명령에서 형광펜으로 표시한 자리 수
+        self._style_lost = 0            # 새 글자의 글자 스타일 소속을 되살리지 못한 자리 수
+        self._pen_in_style = 0          # 글자 스타일 구간 안에 형광펜을 칠한 자리 수(.hwpx 경고용)
+        self._inplace_fallback = 0      # 최소 편집을 못 하고 통째 치환한 자리 수
         stats  = {"dict": 0, "ai_typo": 0, "ai_polish": 0, "fail": 0}
         detail = []
 
@@ -1570,15 +1606,22 @@ class HwpBridge:
                             #   ⚠⚠⚠ **찾기 선택 위에서 읽으면 안 된다.** 그 상태의
                             #     `GetDefault("CharShape")`는 문서에 따라 글꼴 이름이 빈
                             #     섞인 값을 돌려준다(실측 2026-09-10 한전 문서: 문단 끝에
-                            #     걸린 매치 3곳 중 2곳이 그랬다). 커서를 **매치 시작**에
-                            #     두고 읽어야 한다 — 한/글은 커서 **뒤쪽** 글자의 모양을
-                            #     돌려주므로 시작=매치의 첫 글자다(매치 끝에 두면 다음
-                            #     런의 모양이 온다. 실측으로 start·start+1만 맞았다).
-                            #     읽은 뒤에는 `MoveSelRight`로 선택을 그대로 되살린다
+                            #     걸린 매치 3곳 중 2곳이 그랬다). **매치 첫 글자 하나만
+                            #     골라** 읽는다 — 한 글자는 섞일 수 없다.
+                            #     ⚠ 커서만 두고 읽지 말 것: 한/글 2010은 선택이 없으면 커서
+                            #     **앞** 글자의 모양을 준다(위치 i → 글자 i−1, 문단 첫머리만
+                            #     글자 0). 매치가 문단 중간의 **런 경계**에서 시작하면 앞 런의
+                            #     모양을 떠서 교정문에 되씌우게 된다(실측 2026-10-23 05.hwp
+                            #     참고문헌 이탤릭 제목: 기울임이 지워지고 스타일 판정도 빗나가
+                            #     형광펜 대신 빨강). 예전 검증 표본은 모두 문단 첫머리라
+                            #     드러나지 않았다. `_match_is_red`도 같은 이유로 골라 읽는다.
+                            #     읽은 뒤에는 `MoveSelRight`로 선택을 마저 넓힌다
                             #     (`SelectText`는 이 환경에서 예외를 던져 쓸 수 없다).
                             shape_snap = None
                             style_locked = False
                             match_end = None
+                            doc_text = None    # 문서에 실제로 있는 매치 글자(최소 편집 경로의 전제)
+                            inplace_why = "매치 위치 셈 불가"   # 최소 편집을 못 한 사유(진단 로그)
                             try:
                                 p = self.hwp.GetPos()      # 찾기 직후 커서 = 매치 끝
                             except Exception:
@@ -1589,8 +1632,11 @@ class HwpBridge:
                                     and p[2] - len(original) >= 0):
                                 match_end = (p[0], p[1], p[2])
                                 start_pos = p[2] - len(original)
+                                moved = 0      # 이미 고른 글자 수 — 아래 선택 넓히기가 이어받는다
                                 try:
                                     self.hwp.SetPos(p[0], p[1], start_pos)
+                                    self.hwp.HAction.Run("MoveSelRight")
+                                    moved = 1
                                     cset = self.hwp.HParameterSet.HCharShape
                                     self.hwp.HAction.GetDefault("CharShape", cset.HSet)
                                     fp = self._charshape_fingerprint(cset)
@@ -1606,7 +1652,7 @@ class HwpBridge:
                                 #     오염된다. 확인에 실패하면 같은 매치를 다시 찾아 세운다.
                                 restored = False
                                 try:
-                                    for _ in range(len(original)):
+                                    for _ in range(len(original) - moved):
                                         self.hwp.HAction.Run("MoveSelRight")
                                     now = self.hwp.GetPos()
                                     restored = (isinstance(now, tuple) and len(now) >= 3
@@ -1615,6 +1661,7 @@ class HwpBridge:
                                     restored = False
                                 if not restored:
                                     shape_snap = None
+                                    inplace_why = "선택 되살리기 재탐색"
                                     try:
                                         self.hwp.SetPos(p[0], p[1], start_pos)
                                         restored = bool(self.hwp.HAction.Execute(
@@ -1625,123 +1672,156 @@ class HwpBridge:
                                         err_msg = ("글자모양 확인 뒤 원문 선택을 되살리지 "
                                                    "못했습니다 — 이 항목은 적용하지 않습니다")
                                         break
-
-                            # 선택의 시작 좌표 저장 (빠른 색상 적용용)
-                            sel_start = None
-                            try:
-                                r = self.hwp.GetSelectedPos()
-                                if isinstance(r, tuple) and len(r) >= 7:
-                                    sel_start = (r[1], r[2], r[3])
-                                elif isinstance(r, tuple) and len(r) >= 6:
-                                    sel_start = (r[0], r[1], r[2])
-                            except Exception:
-                                sel_start = None
-
-                            # 선택된 원문을 새 텍스트로 치환
-                            iset = self.hwp.HParameterSet.HInsertText
-                            self.hwp.HAction.GetDefault("InsertText", iset.HSet)
-                            iset.Text = corrected
-                            self.hwp.HAction.Execute("InsertText", iset.HSet)
-
-                            # 삽입 직후 커서(= 삽입 텍스트 '끝') 기록 — self_matching일 때
-                            #   다음 검색을 이 뒤에서 재개해 삽입분 내부를 다시 잡지 않게 한다.
-                            ins_end = None
-                            try:
-                                ins_end = self.hwp.GetPos()
-                            except Exception:
-                                ins_end = None
-                            # 교정문이 [시작, 시작+길이)에 그대로 들어갔음이 확인됐나 — 부분 칠하기와
-                            #   좌표 기록(spots_raw)이 둘 다 이 확인 위에서만 선다.
-                            ins_ok = (match_end is not None and "\r" not in corrected
-                                      and isinstance(ins_end, tuple) and len(ins_end) >= 3
-                                      and tuple(ins_end[:3]) == (
-                                          match_end[0], match_end[1],
-                                          match_end[2] - len(original) + len(corrected)))
-                            part = red_spans if ins_ok else []
-
-                            # 방금 삽입한 텍스트 선택
-                            selected_ok = False
-                            if sel_start is not None:
-                                try:
-                                    end_pos = self.hwp.GetPos()
-                                    if isinstance(end_pos, tuple) and len(end_pos) >= 3:
-                                        self.hwp.SelectText(
-                                            sel_start[0], sel_start[1], sel_start[2],
-                                            end_pos[0],   end_pos[1],   end_pos[2],
-                                        )
-                                        selected_ok = True
-                                except Exception:
-                                    selected_ok = False
-
-                            if not selected_ok:
-                                for _ in range(len(corrected)):
-                                    try:
-                                        self.hwp.HAction.Run("MoveSelLeft")
-                                    except Exception:
-                                        break
-
-                            # ★교정 표시 — 자리마다 두 갈래다.
-                            #   · 보통 자리: 떠 둔 글자모양 + 빨강 글자색을 한 번에 되씌운다.
-                            #   · **글자 스타일이 걸린 자리**: 글자색을 바꾸면 한/글이
-                            #     '원래 모양 + 빨강'인 새 글자모양을 만들어 물리는데,
-                            #     HWP는 런의 글자모양 id가 스타일의 것과 **같을 때만**
-                            #     그 글자 스타일로 인식하므로 그 순간 **스타일이 해제된다**
-                            #     (사용자 보고 2026-09-10). 빨강과 스타일 소속은 같은 필드
-                            #     하나를 두고 다투므로 **양립 불가**다. 그래서 글자모양은
-                            #     원래대로 되씌우기만 하고 표시는 **빨강 형광펜**으로 한다 —
-                            #     형광펜은 글자모양이 아니라 런 안의 별도 요소라
-                            #     (`<MARKPENBEGIN>`) 스타일을 건드리지 않는다(실측 확인).
-                            marked_with_pen = False
-                            try:
-                                if shape_snap is not None:
-                                    # ⚠ 새로 꺼내지 말고 **떠 둔 그 객체**를 되씌운다.
-                                    orig_color = int(shape_snap.TextColor)
-                                    if not style_locked:
-                                        shape_snap.TextColor = self._APPLY_RED
-                                    self.hwp.HAction.Execute("CharShape", shape_snap.HSet)
-                                    if not style_locked and part:
-                                        # 바뀌지 않은 조각만 원래 글자색으로 되돌린다. 전체를 먼저
-                                        #   칠하고 빼는 순서라, 어느 조각이 실패해도 **덜 칠해지는
-                                        #   일은 없다**(더 칠해질 뿐 — 예전 동작 쪽).
-                                        shape_snap.TextColor = orig_color
-                                        self._recolor_outside(match_end, len(original),
-                                                              len(corrected), part, shape_snap)
-                                    if style_locked:
-                                        # ⚠ 형광펜은 **찾기 직후 첫 서식 액션으로는 먹히지
-                                        #   않는다**(실측: 첫 호출은 True를 돌려주고 아무 일도
-                                        #   안 한다). 바로 위 CharShape Execute가 그 한 번을
-                                        #   소진하므로 여기서는 정상 적용된다 — 순서를 바꾸지 말 것.
-                                        if part:
-                                            marked_with_pen = self._markpen_spans(
-                                                match_end, len(original), len(corrected), part)
-                                        else:
-                                            marked_with_pen = self._markpen(self._APPLY_RED)
-                                        self._style_marked += 1
-                                        # ★형광펜 자리는 **빨갛지 않다** — '교정본+메모'
-                                        #   모드의 메모 단계가 `_match_is_red`로 자리를
-                                        #   고르므로 그대로 두면 이 자리만 메모를 잃는다.
-                                        #   그래서 **문단 좌표**를 적어 넘긴다. 글자 위치는
-                                        #   뒤이은 치환에 밀리지만 **문단 번호는 밀리지
-                                        #   않는다**(치환은 문단을 만들거나 없애지 않는다).
-                                        if match_end is not None:
-                                            pen_paras.append([match_end[0], match_end[1]])
+                                elif "\r" not in corrected:
+                                    # ★최소 편집 경로의 전제 — 선택한 매치 글자를 **문서에서** 읽는다.
+                                    #   찾기는 영문 대소문자를 가리지 않아 원문과 다를 수 있다('training'
+                                    #   을 'TRaining' 카드가 잡는다) — 교정문과 견줄 것은 문서 쪽이다.
+                                    doc_text = self._block_text()
+                                    if doc_text is None or len(doc_text) != len(original):
+                                        inplace_why = (f"매치 글자 읽기 실패({doc_text!r} · "
+                                                       f"{getattr(self, '_scan_note', None)!r})")
+                                        doc_text = None
                                 else:
-                                    # 글자모양을 읽지 못한 자리(혼합 선택 등) — 예전 경로.
-                                    cset = self.hwp.HParameterSet.HCharShape
-                                    self.hwp.HAction.GetDefault("CharShape", cset.HSet)
-                                    cset.TextColor = self._APPLY_RED
-                                    self.hwp.HAction.Execute("CharShape", cset.HSet)
-                            except Exception:
+                                    inplace_why = "문단을 넘는 교정문"
+
+                            # ★최소 편집 경로 — 바뀐 글자만 고치고, 새 글자에 원래 글자의 글자모양·
+                            #   글자 스타일을 되씌운다(`_apply_in_place` — 한 매치 안에 서식이 여럿이어도
+                            #   각자 그대로 남는다). 위치를 확인하지 못한 매치(조판 부호를 걸침·문단을
+                            #   넘는 교정문·선택 되살리기 재탐색)만 아래 예전 경로(통째 치환)로 간다.
+                            in_place = None
+                            if doc_text is not None:
+                                in_place = self._apply_in_place(
+                                    match_end[0], match_end[1], start_pos, doc_text, corrected,
+                                    red_spans if doc_text == original
+                                    else _red_spans(doc_text, corrected))
+                                inplace_why = "원래 글자 모양 읽기 실패"
+                            if in_place is not None:
+                                marked_with_pen = in_place
+                                ins_ok = True
+                                ins_end = (match_end[0], match_end[1], start_pos + len(corrected))
+                                if marked_with_pen:
+                                    self._style_marked += 1
+                                    pen_paras.append([match_end[0], match_end[1]])
+                            else:
+                                # ⚠ 이 경로는 매치 안의 서식이 첫 글자 모양 하나로 덮이고 글자 스타일
+                                #   소속이 풀릴 수 있다 — 자리를 세어 호출부가 화면에 낸다.
+                                self._inplace_fallback += 1
+                                _send_log(f"[적용진단] 서식 보존 치환 불가({inplace_why}) — "
+                                          f"통째 치환: '{original}'")
+                                # 선택의 시작 좌표 저장 (빠른 색상 적용용)
+                                sel_start = None
                                 try:
-                                    self.hwp.HAction.Run("CharShapeTextColorRed")
+                                    r = self.hwp.GetSelectedPos()
+                                    if isinstance(r, tuple) and len(r) >= 7:
+                                        sel_start = (r[1], r[2], r[3])
+                                    elif isinstance(r, tuple) and len(r) >= 6:
+                                        sel_start = (r[0], r[1], r[2])
+                                except Exception:
+                                    sel_start = None
+
+                                # 선택된 원문을 새 텍스트로 치환
+                                iset = self.hwp.HParameterSet.HInsertText
+                                self.hwp.HAction.GetDefault("InsertText", iset.HSet)
+                                iset.Text = corrected
+                                self.hwp.HAction.Execute("InsertText", iset.HSet)
+
+                                # 삽입 직후 커서(= 삽입 텍스트 '끝') 기록 — self_matching일 때
+                                #   다음 검색을 이 뒤에서 재개해 삽입분 내부를 다시 잡지 않게 한다.
+                                ins_end = None
+                                try:
+                                    ins_end = self.hwp.GetPos()
+                                except Exception:
+                                    ins_end = None
+                                # 교정문이 [시작, 시작+길이)에 그대로 들어갔음이 확인됐나 — 부분 칠하기와
+                                #   좌표 기록(spots_raw)이 둘 다 이 확인 위에서만 선다.
+                                ins_ok = (match_end is not None and "\r" not in corrected
+                                          and isinstance(ins_end, tuple) and len(ins_end) >= 3
+                                          and tuple(ins_end[:3]) == (
+                                              match_end[0], match_end[1],
+                                              match_end[2] - len(original) + len(corrected)))
+                                part = red_spans if ins_ok else []
+
+                                # 방금 삽입한 텍스트 선택
+                                selected_ok = False
+                                if sel_start is not None:
+                                    try:
+                                        end_pos = self.hwp.GetPos()
+                                        if isinstance(end_pos, tuple) and len(end_pos) >= 3:
+                                            self.hwp.SelectText(
+                                                sel_start[0], sel_start[1], sel_start[2],
+                                                end_pos[0],   end_pos[1],   end_pos[2],
+                                            )
+                                            selected_ok = True
+                                    except Exception:
+                                        selected_ok = False
+
+                                if not selected_ok:
+                                    for _ in range(len(corrected)):
+                                        try:
+                                            self.hwp.HAction.Run("MoveSelLeft")
+                                        except Exception:
+                                            break
+
+                                # ★교정 표시(예전 경로 — 통째 치환이라 매치 안의 서식이 첫 글자
+                                #   모양 하나로 덮이고, 런 전체를 덮으면 글자 스타일 태그도 지워진다.
+                                #   위치를 확인하지 못한 매치만 여기로 온다) — 자리마다 두 갈래다.
+                                #   · 보통 자리: 떠 둔 글자모양 + 빨강 글자색을 한 번에 되씌운다.
+                                #   · **글자 스타일이 걸린 자리**: 글자색을 바꾸면 한/글이
+                                #     '원래 모양 + 빨강'인 새 글자모양을 만들어 물린다 — 스타일의
+                                #     글자모양 id와 갈라진다(사용자 결정 2026-09-10: 스타일 자리는
+                                #     **빨강 형광펜**). 형광펜은 글자모양이 아니라 런 안의 별도
+                                #     요소라(`<MARKPENBEGIN>`) 글자모양을 건드리지 않는다.
+                                marked_with_pen = False
+                                try:
+                                    if shape_snap is not None:
+                                        # ⚠ 새로 꺼내지 말고 **떠 둔 그 객체**를 되씌운다.
+                                        orig_color = int(shape_snap.TextColor)
+                                        if not style_locked:
+                                            shape_snap.TextColor = self._APPLY_RED
+                                        self.hwp.HAction.Execute("CharShape", shape_snap.HSet)
+                                        if not style_locked and part:
+                                            # 바뀌지 않은 조각만 원래 글자색으로 되돌린다. 전체를 먼저
+                                            #   칠하고 빼는 순서라, 어느 조각이 실패해도 **덜 칠해지는
+                                            #   일은 없다**(더 칠해질 뿐 — 예전 동작 쪽).
+                                            shape_snap.TextColor = orig_color
+                                            self._recolor_outside(match_end, len(original),
+                                                                  len(corrected), part, shape_snap)
+                                        if style_locked:
+                                            # ⚠ 형광펜은 **찾기 직후 첫 서식 액션으로는 먹히지
+                                            #   않는다**(실측: 첫 호출은 True를 돌려주고 아무 일도
+                                            #   안 한다). 바로 위 CharShape Execute가 그 한 번을
+                                            #   소진하므로 여기서는 정상 적용된다 — 순서를 바꾸지 말 것.
+                                            if part:
+                                                marked_with_pen = self._markpen_spans(
+                                                    match_end, len(original), len(corrected), part)
+                                            else:
+                                                marked_with_pen = self._markpen(self._APPLY_RED)
+                                            self._style_marked += 1
+                                            # ★형광펜 자리는 **빨갛지 않다** — '교정본+메모'
+                                            #   모드의 메모 단계가 `_match_is_red`로 자리를
+                                            #   고르므로 그대로 두면 이 자리만 메모를 잃는다.
+                                            #   그래서 **문단 좌표**를 적어 넘긴다. 글자 위치는
+                                            #   뒤이은 치환에 밀리지만 **문단 번호는 밀리지
+                                            #   않는다**(치환은 문단을 만들거나 없애지 않는다).
+                                            if match_end is not None:
+                                                pen_paras.append([match_end[0], match_end[1]])
+                                    else:
+                                        # 글자모양을 읽지 못한 자리(혼합 선택 등) — 예전 경로.
+                                        cset = self.hwp.HParameterSet.HCharShape
+                                        self.hwp.HAction.GetDefault("CharShape", cset.HSet)
+                                        cset.TextColor = self._APPLY_RED
+                                        self.hwp.HAction.Execute("CharShape", cset.HSet)
+                                except Exception:
+                                    try:
+                                        self.hwp.HAction.Run("CharShapeTextColorRed")
+                                    except Exception:
+                                        pass
+
+                                # 선택 해제
+                                try:
+                                    self.hwp.HAction.Run("Cancel")
                                 except Exception:
                                     pass
-
-                            # 선택 해제
-                            try:
-                                self.hwp.HAction.Run("Cancel")
-                            except Exception:
-                                pass
 
                             # self_matching(괄호 추가류) — 커서를 삽입 텍스트 '뒤'로 옮겨
                             #   다음 RepeatFind가 방금 넣은 부분문자열을 앞으로 다시 잡아
@@ -1883,7 +1963,10 @@ class HwpBridge:
             _send_log(f"[글자 스타일] 원고 글자 스타일을 지키려고 빨강 글자 대신 "
                       f"형광펜으로 표시 {self._style_marked}곳")
         return {"stats": stats, "detail": detail,
-                "style_marked": self._style_marked}
+                "style_marked": self._style_marked,
+                "style_lost": self._style_lost,
+                "pen_in_style": self._pen_in_style,
+                "inplace_fallback": self._inplace_fallback}
 
     # ══════════════════════════════════════════════════════════
     # ▌메모 달기 (결과물 축 output_mode="memo" · "hwp_memo")
@@ -2289,6 +2372,283 @@ class HwpBridge:
             return False
         finally:
             self._restore_caret(keep)
+
+    # ══════════════════════════════════════════════════════════
+    # ▌최소 편집 치환 — 원고의 서식·글자 스타일을 한 글자도 풀지 않는다
+    # ══════════════════════════════════════════════════════════
+    #
+    # 사용자 지시 2026-10-23: "원본의 글자 스타일이 절대 풀리지 않게" · "한 문장에 볼드·볼드+이탤릭·
+    # 볼드+밑줄·밑줄·이탤릭이 섞여 있어도 각각 그대로 유지한 채 교정 글자만 치환".
+    # 매치 전체를 `InsertText` 한 번으로 덮으면 둘 다 불가능하다 — 새 글자는 전부 **커서 앞 글자**의
+    # 모양·글자 스타일 소속을 물려받고(실측), 런 전체를 덮으면 글자 스타일 태그(`PARA_RANGE_TAG`
+    # 종류 1)가 통째로 지워진다. 그래서 **바뀐 글자만** 고치고(`_edit_ops`), 새 글자에는 그 자리
+    # 원래 글자의 소속과 글자모양을 되씌운다. 고치지 않은 글자는 한/글에서 한 번도 건드리지 않는다.
+
+    def _insert_text(self, text) -> None:
+        iset = self.hwp.HParameterSet.HInsertText
+        self.hwp.HAction.GetDefault("InsertText", iset.HSet)
+        iset.Text = text
+        self.hwp.HAction.Execute("InsertText", iset.HSet)
+
+    def _block_text(self):
+        """지금 선택한 블록의 글자 — 문서에 실제로 있는 그대로. 못 읽으면 None.
+
+        `InitScan`의 범위 0x00ff = 선택 블록. 읽은 뒤에도 선택과 커서는 그대로다(실측 2026-10-23).
+        ⚠ 일반 텍스트(상태 2)가 아닌 조각(문단 넘김·컨트롤 출입)이 끼면 None — 한 문단 안의
+          글자만 이어진 매치가 아니면 최소 편집의 좌표 셈이 성립하지 않는다.
+        """
+        # ⚠ 인자 6개를 다 준다 — 동적 디스패치(브리지 서브프로세스)에서는 줄인 형식이
+        #   'DISP_E_BADPARAMCOUNT'로 실패한다(실측 2026-10-23: 형식 정보가 캐시된 단독 시험에선
+        #   2개로도 되어 놓쳤다). `get_text`와 같은 폴백 순서.
+        self._scan_note = []        # 진단용 — 읽은 조각의 (상태, 글자)
+        for args in ((0x00, 0x00ff, 0, 0, 0, 0), (0x00, 0x00ff)):
+            try:
+                self._scan_note.append(("init", self.hwp.InitScan(*args)))
+                break
+            except Exception as exc:
+                self._scan_note.append(("init", repr(exc)))
+        else:
+            return None
+        out = []
+        try:
+            for _ in range(256):
+                state, text = self.hwp.GetText()
+                self._scan_note.append((state, text))
+                if state in (0, 1):
+                    return "".join(out)
+                if state != 2:
+                    return None
+                out.append(text)
+            return None
+        except Exception as exc:
+            self._scan_note.append(("err", repr(exc)))
+            return None
+        finally:
+            try:
+                self.hwp.ReleaseScan()
+            except Exception:
+                pass
+
+    def _style_id_sel(self):
+        """지금 선택의 스타일 번호(`HStyle.Apply`) — 글자 스타일 소속이면 그 번호, 아니면 문단 스타일.
+
+        한/글은 소속을 글자모양 id가 아니라 **글자 스타일 태그**로 판정한다(실측 2026-10-23 —
+        빨강으로 글자모양이 바뀐 글자도 태그 안이면 그 글자 스타일로 보고한다).
+        """
+        try:
+            sset = self.hwp.HParameterSet.HStyle
+            self.hwp.HAction.GetDefault("Style", sset.HSet)
+            return int(sset.Apply)
+        except Exception:
+            return None
+
+    def _char_format(self, lst, para, pos):
+        """(lst, para) 문단 pos 글자 하나의 (글자모양 스냅샷, 스타일 번호). 못 고르면 None.
+
+        ⚠ 한 글자를 **골라** 읽는다 — 커서만 두면 한/글 2010은 커서 **앞** 글자의 모양을 준다.
+        ⚠ 스냅샷은 매번 새로 꺼낸 파라미터셋 객체라 여러 개를 함께 들고 각각 되씌울 수 있다(실측).
+          되씌울 때는 **그 객체 그대로** Execute한다(새로 꺼내면 빈 셋 — apply 주석 ③).
+        """
+        if not self._select_in_para(lst, para, pos, pos + 1):
+            return None
+        try:
+            cset = self.hwp.HParameterSet.HCharShape
+            self.hwp.HAction.GetDefault("CharShape", cset.HSet)
+        except Exception:
+            return None
+        # 글자 스타일이 없는 문서는 소속을 읽을 까닭이 없다(스타일 번호 읽기가 가장 비싼 호출이다).
+        return cset, (self._style_id_sel() if self._char_style_ids else None)
+
+    def _style_fp_hit(self, cset) -> bool:
+        """이 글자모양이 글자 스타일 지문과 같은가(형광펜으로 칠할 자리인가).
+
+        지문은 COM 속성 50여 개라 글자마다 다 읽으면 느리다(실측: 교정 한 곳에 100ms 넘게 늘었다).
+        한글 글꼴·크기·굵기·기울임 네 칸으로 먼저 거르고, 거기서 맞을 때만 전부 읽는다.
+        ⚠ 한글 글꼴 이름이 비면(섞인 값) True — 그 스냅샷에 빨강을 되씌우면 서식이 무너진다.
+        """
+        try:
+            face = cset.FaceNameHangul
+            if not face:
+                return True
+            if not self._style_fps:
+                return False
+            quick = (face, int(cset.Height), int(cset.Bold) & 1, int(cset.Italic) & 1)
+        except Exception:
+            return True
+        if quick not in self._style_fp_quick:
+            return False
+        fp = self._charshape_fingerprint(cset)
+        return fp is None or fp in self._style_fps
+
+    def _restore_format(self, lst, para, a, b, fmt) -> bool:
+        """새로 넣은 [a, b) 글자에 출처 글자의 **글자 스타일 소속**과 **글자모양**을 되씌운다.
+        소속까지 출처와 같아졌으면 True.
+
+        ① 소속이 출처와 다르면(이웃 런을 물려받음) 글자 스타일을 풀고(`StyleClearCharStyle` — 글자
+           모양도 문단 기본으로 돌아간다), 출처가 글자 스타일이면 그 스타일을 다시 건다(`Style` —
+           글자 스타일은 **선택에만** 걸린다. 실측: 태그·글자모양·형광펜이 모두 산다).
+        ② 마지막에 출처 스냅샷을 되씌운다 — 글자모양 id까지 원래와 같아진다(스타일 정의와 다르게
+           고쳐 쓴 글자도 그대로).
+        ⚠ **문단 스타일** 번호를 `Style`로 걸면 문단 전체가 바뀐다 — 문서가 정의한 글자 스타일
+          번호(`_char_style_ids`)일 때만 건다. 동작마다 선택을 다시 세운다(선택 없이 `Style`을
+          부르면 문단에 걸린다).
+        """
+        cset, sid = fmt
+        if not self._select_in_para(lst, para, a, b):
+            raise RuntimeError("새로 넣은 글자를 고르지 못했습니다")
+        ok = True
+        if sid is not None and self._style_id_sel() != sid:
+            self.hwp.HAction.Run("StyleClearCharStyle")
+            if sid in self._char_style_ids:
+                if not self._select_in_para(lst, para, a, b):
+                    raise RuntimeError("새로 넣은 글자를 고르지 못했습니다")
+                sset = self.hwp.HParameterSet.HStyle
+                self.hwp.HAction.GetDefault("Style", sset.HSet)
+                sset.Apply = sid
+                self.hwp.HAction.Execute("Style", sset.HSet)
+            ok = self._style_id_sel() == sid
+            if not self._select_in_para(lst, para, a, b):
+                raise RuntimeError("새로 넣은 글자를 고르지 못했습니다")
+        self.hwp.HAction.Execute("CharShape", cset.HSet)
+        return ok
+
+    def _paint_in_place(self, lst, para, start, n, spans, known) -> bool:
+        """최소 편집을 마친 교정문 [start, start+n)의 `spans` 조각을 칠한다. 형광펜을 썼으면 True.
+
+        글자마다 **그 글자의 모양·소속**으로 고른다 — 한 매치에 서식이 여럿이어도 각자 지킨다.
+          · 글자 스타일 소속(스타일 번호)이거나 글자 스타일 지문과 같은 글자 → 빨강 형광펜
+            (글자모양을 건드리지 않는다 — 사용자 결정 2026-09-10)
+          · 그 밖 → 그 글자 자신의 스냅샷에 글자색만 빨강(굵기·기울임·밑줄은 그대로)
+          · 모양을 읽지 못한 글자 → 형광펜(글자모양을 건드리지 않는 쪽으로 무너진다)
+        `known`({교정문 위치: (스냅샷, 스타일 번호)})은 이미 아는 글자다 — 새로 넣은 글자는 방금
+        출처 모양을 되씌웠고, 남긴 글자 중 출처로 읽어 둔 것도 있다. 글자 하나 읽기가 COM 호출
+        10여 번이라(실측: 칠하기가 최소 편집 시간의 60%) 아는 글자는 다시 읽지 않는다.
+        """
+        cells = []
+        in_style = False
+        hit = {}                        # 같은 스냅샷 객체의 지문 판정은 한 번만
+        for a, b in spans:
+            for c in range(a, min(b, n)):
+                f = known.get(c) or self._char_format(lst, para, start + c)
+                if f is None:
+                    cells.append((c, None, True))
+                    continue
+                cset, sid = f
+                if sid in self._char_style_ids:
+                    in_style = True
+                    cells.append((c, cset, True))
+                else:
+                    if id(cset) not in hit:
+                        hit[id(cset)] = self._style_fp_hit(cset)
+                    cells.append((c, cset, hit[id(cset)]))
+        pen = primed = False
+        k = 0
+        while k < len(cells):
+            c, cset, locked = cells[k]
+            if not locked:
+                e = k       # 같은 스냅샷을 쓰는 이웃 글자(새 글자와 그 출처 등)는 한 번에
+                while (e + 1 < len(cells) and not cells[e + 1][2] and cells[e + 1][1] is cset
+                       and cells[e + 1][0] == cells[e][0] + 1):
+                    e += 1
+                if self._select_in_para(lst, para, start + c, start + cells[e][0] + 1):
+                    cset.TextColor = self._APPLY_RED
+                    self.hwp.HAction.Execute("CharShape", cset.HSet)
+                    primed = True
+                k = e + 1
+                continue
+            e = k           # 이어지는 형광펜 글자는 한 번에 칠한다
+            while e + 1 < len(cells) and cells[e + 1][2] and cells[e + 1][0] == cells[e][0] + 1:
+                e += 1
+            if not primed and cset is not None:
+                # ⚠ 형광펜은 **찾기 직후 첫 서식 액션으로는 먹히지 않는다**(실측) — 그 글자의
+                #   모양을 그대로 한 번 되씌워 그 한 번을 소진한다(글자모양은 변하지 않는다).
+                if self._select_in_para(lst, para, start + c, start + c + 1):
+                    self.hwp.HAction.Execute("CharShape", cset.HSet)
+                    primed = True
+            if self._select_in_para(lst, para, start + c, start + cells[e][0] + 1):
+                self._markpen(self._APPLY_RED)
+                pen = True
+            k = e + 1
+        if pen and in_style:
+            # ⚠ 한/글 2010의 `.hwpx` 저장기는 글자 스타일 구간 안의 형광펜을 **버린다**(실측
+            #   2026-10-23 — .hwp엔 남는다). 호출부가 .hwpx 원고일 때 경고하도록 센다.
+            self._pen_in_style += 1
+        return pen
+
+    def _apply_in_place(self, lst, para, start, doc_text, corrected, spans):
+        """★매치 [start, start+len(doc_text))를 교정문으로 — **바뀐 글자만** 고친다.
+
+        ① 바뀌는 글자마다 출처(원래 글자)를 정해 고치기 **전에** 모양·소속을 떠 둔다 — 바꾼
+           글자는 그 자리의 원래 글자, 끼워 넣은 글자는 앞 글자(매치 첫머리면 첫 글자).
+        ② 뒤에서부터 고친다(앞쪽 좌표가 밀리지 않는다). 고칠 때마다 새 글자에 출처의 소속·모양을
+           되씌운다(`_restore_format`).
+        ③ 결과를 문서에서 다시 읽어 교정문과 견준다 → 바뀐 곳만 칠한다 → 커서는 교정문 **뒤**
+           (다음 찾기가 여기서 이어진다 — 교정본 계획 `ApplyWorker._BridgeReplay`의 전제).
+
+        Returns: 형광펜을 썼으면 True, 아니면 False. **손대기 전에** 포기하면 None(호출부가 예전
+          경로로 간다). ⚠ 고치기 시작한 뒤의 실패는 예외로 올린다 — 반쯤 고친 자리에 통째 치환을
+          또 돌리면 두 번 고친다. 호출부의 except가 그 항목을 멈추고 좌표를 무효로 돌린다.
+        """
+        plan, fmts = [], {}
+        for i1, i2, j1, j2 in _edit_ops(doc_text, corrected):
+            if i2 > i1:
+                srcs = [i1 + min(k, i2 - i1 - 1) for k in range(j2 - j1)]
+            else:
+                srcs = [i1 - 1 if i1 > 0 else 0] * (j2 - j1)
+            for s in srcs:
+                if s not in fmts:
+                    f = self._char_format(lst, para, start + s)
+                    if f is None:
+                        return None
+                    fmts[s] = f
+            plan.append((i1, i2, j1, corrected[j1:j2], srcs))
+
+        # 칠하기가 다시 읽지 않도록 교정문 위치 → 이미 아는 모양(새 글자 = 출처 · 남긴 글자 중
+        #   출처로 읽어 둔 것). 남긴 글자는 한 번도 건드리지 않으므로 읽어 둔 모양 그대로다.
+        known, pi, pj = {}, 0, 0
+        for i1, i2, j1, new, srcs in plan + [(len(doc_text), len(doc_text), len(corrected), "", [])]:
+            for t in range(j1 - pj):
+                if pi + t in fmts:
+                    known[pj + t] = fmts[pi + t]
+            for t, s in enumerate(srcs):
+                known[j1 + t] = fmts[s]
+            pi, pj = i2, j1 + len(new)
+
+        lost = 0
+        for i1, i2, _j1, new, srcs in reversed(plan):
+            at = start + i1
+            if i2 > i1:
+                if not self._select_in_para(lst, para, at, start + i2):
+                    raise RuntimeError("고칠 글자를 고르지 못했습니다")
+                if new:
+                    self._insert_text(new)
+                else:
+                    self.hwp.HAction.Run("Delete")
+            else:
+                self.hwp.HAction.Run("Cancel")
+                self.hwp.SetPos(lst, para, at)
+                self._insert_text(new)
+            if self._caret() != (lst, para, at + len(new)):
+                raise RuntimeError("고친 뒤 커서가 예상 자리에 없습니다")
+            k = 0
+            while k < len(new):         # 출처가 같은 새 글자끼리 묶어 되씌운다
+                e = k
+                while e + 1 < len(new) and srcs[e + 1] == srcs[k]:
+                    e += 1
+                if not self._restore_format(lst, para, at + k, at + e + 1, fmts[srcs[k]]):
+                    lost += 1
+                k = e + 1
+
+        n = len(corrected)
+        if not (self._select_in_para(lst, para, start, start + n)
+                and self._block_text() == corrected):
+            raise RuntimeError("고친 결과가 교정문과 다릅니다")
+        pen = (self._paint_in_place(lst, para, start, n, spans or [(0, n)], known)
+               if plan else False)
+        self._restore_caret((lst, para, start + n))
+        if lost:
+            self._style_lost += 1
+        return pen
 
     def _consume_pen_para(self, avail, used) -> bool:
         """지금 매치가 **형광펜으로 표시해 둔 문단**인가.

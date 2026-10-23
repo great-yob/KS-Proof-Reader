@@ -289,6 +289,9 @@ class HwpEditor:
         stats_total  = {"dict": 0, "ai_typo": 0, "ai_polish": 0, "fail": 0}
         detail_total = []
         style_marked = 0        # 글자 스타일 보존 위해 형광펜으로 표시한 자리 수
+        style_lost = 0          # 새 글자의 글자 스타일 소속을 되살리지 못한 자리 수(0이어야 정상)
+        pen_in_style = 0        # 글자 스타일 구간 안에 칠한 형광펜 자리 수(.hwpx 경고용)
+        inplace_fallback = 0    # 서식 보존 치환(최소 편집)을 못 하고 통째 치환한 자리 수
         total = len(corr_data)
         done  = 0
 
@@ -320,6 +323,9 @@ class HwpEditor:
                 stats_total[k] = stats_total.get(k, 0) + v
             detail_total.extend(result.get("detail") or [])
             style_marked += int(result.get("style_marked") or 0)
+            style_lost += int(result.get("style_lost") or 0)
+            pen_in_style += int(result.get("pen_in_style") or 0)
+            inplace_fallback += int(result.get("inplace_fallback") or 0)
             done += len(batch)
             if progress_cb is not None:
                 progress_cb(done, total)
@@ -329,6 +335,22 @@ class HwpEditor:
         if style_marked and self.logger:
             self.logger(f"  [글자 스타일] 원고 글자 스타일을 지키려고 빨강 글자 대신 "
                         f"형광펜으로 표시 {style_marked}곳")
+        # ★원고 글자 스타일은 풀리면 안 된다(사용자 지시 2026-10-23) — 되살리지 못한 자리는
+        #   숨기지 않고 화면에 낸다(브리지는 최소 편집 뒤 소속을 다시 읽어 확인한다).
+        if style_lost and self.logger:
+            self.logger(f"  [글자 스타일] 교정 글자의 원래 글자 스타일을 되살리지 못한 자리 "
+                        f"{style_lost}곳 · 확인 필요")
+        # 최소 편집을 못 한 자리(위치를 확인하지 못한 매치)는 예전처럼 통째 치환된다 — 그 자리의
+        #   서식은 첫 글자 모양 하나로 덮이고 글자 스타일이 풀릴 수 있다. 사유는 원문 로그에.
+        if inplace_fallback and self.logger:
+            self.logger(f"  [글자 스타일] 서식 보존 치환을 못 하고 통째로 바꾼 자리 "
+                        f"{inplace_fallback}곳 · 확인 필요")
+        # ⚠ 한/글 2010의 `.hwpx` 저장기는 글자 스타일 구간 안의 형광펜을 버린다(실측 2026-10-23,
+        #   .hwp엔 남는다). 교정본은 원고와 같은 형식으로 저장되므로 .hwpx 원고면 그 자리는
+        #   **표시 없이** 남는다 — 조용히 잃지 않게 화면에 낸다.
+        if pen_in_style and self.logger and self.file_path.lower().endswith(".hwpx"):
+            self.logger(f"  [글자 스타일] .hwpx 교정본에는 글자 스타일 구간의 형광펜 "
+                        f"{pen_in_style}곳이 저장되지 않음 · 한/글 2010 한계")
         self.last_style_marked = style_marked
         self._resolve_spots(detail_total)
         return stats_total, detail_total
