@@ -1489,6 +1489,26 @@ class ProofreadingWorker(QThread):
                         ))
                         existing.add(orig)
 
+                    # 띄어 쓴 조사 붙이기 — '스타트업 뿐 아니라'→'스타트업뿐 아니라', '가지기 보다는'→
+                    #   '가지기보다는', '수 밖에'→'수밖에'. 조사가 아니라 **왼쪽 말의 범주**를 문맥에서 읽어
+                    #   판정한다(체언·명사형 뒤 = 조사 붙임 / 관형형 뒤 = 의존명사 띄움 — morph 주석).
+                    #   문법상 확정이라 high. 부사로도 읽히는 꼬리 없는 '보다'·'마저'와 분석이 갈리는
+                    #   자리는 검수(low). AI가 이미 이 구간을 고쳤으면 스킵(원문 포함 관계).
+                    _jj_cov = [c.original for c in merged if c.source != "ai_polish" and c.original]
+                    for orig, joined in _morph.find_josa_join(text):
+                        if orig in existing or any(orig in co for co in _jj_cov):
+                            continue
+                        review = _morph.josa_join_needs_review(text, orig)
+                        sp_cards.append(Correction(
+                            original=orig, corrected=joined,
+                            reason=("[검수] 조사 붙여쓰기 → 사용자 검토 필요\n— 조사면 앞말에 붙이고,"
+                                    " 부사('보다'=더욱)나 의존명사로 쓰였으면 그대로 둡니다" if review else
+                                    "조사는 앞말에 붙여 씀\n— 체언·명사형 뒤 '뿐·까지·보다' 등은 조사"),
+                            source="spacing", color=HL_TYPO,
+                            category="띄어쓰기", confidence="low" if review else "high",
+                        ))
+                        existing.add(orig)
+
                     # 복합명사 띄어쓰기 일관성 — 실무 교정 관행: 복합명사는 옳고 그름을
                     #   따지기보다 저자가 더 자주 쓴 표기로 통일한다(예: '정책보고서'(다수)와
                     #   '정책 보고서'(소수) 혼재 → 소수형을 다수형으로). 복합명사 '분리'는 위
@@ -1687,24 +1707,76 @@ class ProofreadingWorker(QThread):
                 else:
                     self.step_changed.emit("analyze", "실단어 오타 탐지 중…")
                     cands = _rw.find_candidates(text, stop_event=self._stop, logger=log)
-                    # 이미 다른 레이어가 손댄 어절은 제외 — 같은 자리에 카드가 두 장
-                    #   생기면 적용 단계에서 등장 인덱스가 어긋난다([8] 참조).
-                    taken = set()
+                    # 이미 다른 레이어가 손댄 어절 — 같은 자리에 카드가 두 장 생기면 적용 단계에서
+                    #   등장 인덱스가 어긋난다([8] 참조). 그래서 **카드를 더하지 않는다.** 다만 예전처럼
+                    #   검증 전에 통째로 버리지도 않는다 — 그 어절을 차지한 카드가 이 finder와 다른 답을
+                    #   냈다면 finder의 방향이 그 자리의 유일한 반대 의견이다(2026-10-23 코퍼스: 20원고에서
+                    #   '확인 권장'만 있던 '대응학'(→대응할)·'테스크포스'(→태스크포스), AI가 '영유아'로 고친
+                    #   '아동의 영육 형태'(→양육)가 검증 전에 사라졌다). 검증을 통과하면:
+                    #     ① 방향 없는 카드(안전망 dict_flag · 글자를 안 바꾸는 띄어쓰기 카드)가 그 어절 하나만
+                    #        다룬 자리 → 그 카드를 실단어 카드로 **바꿔 끼운다**(같은 원문 카드는 계속 한 장).
+                    #     ② AI 카드가 다른 방향으로 고친 자리 → AI 카드를 검수(low)로 내리고 사유에 다른 후보를
+                    #        적는다(지우지 않는다 — 어느 쪽이 맞는지는 사람이 본다).
+                    #   그 밖의 카드(사전·규범 결정론, 일관성·이음매 묶음)가 차지한 어절은 예전처럼 제외한다.
+                    #   ⚠ 어느 경로든 실단어 불변식(low · 검수 전용 · AI 검증 필수)은 그대로다.
+                    owners = {}
                     for c in merged:
                         if c.source == "ai_polish":
                             continue
-                        taken.update(re.findall(r"[가-힣]+", c.original))
-                    cands = [r for r in cands if r["original"] not in taken]
+                        for run in dict.fromkeys(re.findall(r"[가-힣]+", c.original)):
+                            owners.setdefault(run, []).append(c)
+
+                    def _directionless(c, word):
+                        if re.findall(r"[가-힣]+", c.original) != [word]:
+                            return False
+                        return c.source == "dict_flag" or (
+                            c.source == "spacing" and not c.consistency_flip
+                            and not c.junction_group)
+
+                    # 같은 방향을 이미 낸 카드가 있는 낱말은 다른 후보를 보지 않는다('위료비'의 2등 '연료비').
+                    agreed = {r["original"] for r in cands
+                              if any(r["corrected"] in c.corrected
+                                     for c in owners.get(r["original"], ()))}
+                    kept = []
+                    for r in cands:
+                        own = owners.get(r["original"])
+                        if not own:
+                            kept.append(r)
+                        elif r["original"] not in agreed and all(
+                                _directionless(c, r["original"]) or c.source == "ai_typo"
+                                for c in own):
+                            kept.append(r)
+                    cands = kept
                     if cands:
                         log(f"  [실단어] 후보 {len(cands)}건 — AI 검증 요청")
                         ok = engine.verify_realword(cands, logger=log,
                                                     stop_event=self._stop)
                         rw_cards = []
                         seen_rw = set()
+                        replaced, demoted = [], []
                         for r in ok:
                             if r["original"] in seen_rw:
                                 continue
                             seen_rw.add(r["original"])
+                            own = owners.get(r["original"], [])
+                            ai_own = [c for c in own if c.source == "ai_typo"]
+                            if ai_own:
+                                # 같은 문맥에서 finder 교정이 AI 교정보다 뚜렷이 자연스러울 때만 내린다 —
+                                #   finder는 같은 길이 치환만 만들어, 정답이 글자 수가 다른 AI 교정
+                                #   ('대응학'→'대응하기')을 길이 맞는 오답('대응할')으로 끌어내릴 수 있다.
+                                for c in ai_own:
+                                    if not _rw.outscores(text, r["original"], r["corrected"],
+                                                         c.original, c.corrected):
+                                        continue
+                                    why = (c.reason or "").strip()
+                                    c.reason = (("" if why.startswith("[검수]") else "[검수] ")
+                                                + why + f"\n— 문맥 검증의 다른 후보: "
+                                                f"'{r['original']}'→'{r['corrected']}'")
+                                    c.confidence = "low"
+                                    demoted.append(c)
+                                continue
+                            if own:
+                                replaced.extend(own)
                             rw_cards.append(Correction(
                                 original=r["original"], corrected=r["corrected"],
                                 reason="[검수] 문맥상 어색한 낱말 — 오타 의심(검토 필요)",
@@ -1712,6 +1784,16 @@ class ProofreadingWorker(QThread):
                                 category="맞춤법",
                                 confidence="low",   # ⚠ 고정. 위 금지선 참조.
                             ))
+                        if replaced:
+                            _gone = {id(c) for c in replaced}
+                            merged[:] = [c for c in merged if id(c) not in _gone]
+                            log(f"  [실단어] 방향 없는 카드 {len(replaced)}건 → 실단어 카드로 대체")
+                            for c in replaced:
+                                log(f"      · {c.source} '{c.original}'")
+                        if demoted:
+                            log(f"  [실단어] 다른 카드와 방향이 갈린 자리 {len(demoted)}건 — 검수로 내림")
+                            for c in demoted:
+                                log(f"      · '{c.original}'→'{c.corrected}'")
                         if rw_cards:
                             merged.extend(rw_cards)
                             det_review.append(("실단어 오타", len(rw_cards)))

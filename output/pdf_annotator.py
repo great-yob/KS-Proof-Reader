@@ -153,40 +153,63 @@ def _search_all(pdf, tps, needle):
     """PDF 전체에서 원문을 찾아 문서 순(쪽 → 쪽 안 순서) `_Match` 목록으로.
 
     반환 (매치 목록, 표기가 달라 버린 수). 후자는 조용히 사라지면 안 되므로 센다.
+
+    ★하나도 못 찾았고 원문에 공백이 없으면 **라틴·부호 경계에 공백을 넣어 다시 찾는다.**
+      pdfium은 한글 사이의 줄바꿈은 넘어 찾지만('그 만\\r\\n큼의'), 공백 없는 라틴·부호 경계의
+      줄바꿈은 넘지 못한다 — 표 칸 'Microseparometer\\r\\n,P'가 'Microseparometer,P'로는 0곳,
+      'Microseparometer ,P'로는 1곳이었다(2026-10-23 E2E · 05.hwp 18쪽). 다시 찾은 매치도 아래
+      `_spacing_ok`를 그대로 거치므로 그 자리가 **줄바꿈**일 때만 남고 진짜 공백이면 버린다.
     """
-    out, spacing_dropped = [], 0
-    for i, tp in enumerate(tps):
-        try:
-            s = tp.search(needle, match_case=False, match_whole_word=False)
-        except Exception:
-            continue
-        try:
-            while True:
-                r = s.get_next()
-                if r is None:
-                    break
-                idx, cnt = r
-                # ★검색은 공백을 무시하므로 **잡은 글자를 직접 확인**한다(위 주석).
-                try:
-                    actual = tp.get_text_range(idx, cnt)
-                except Exception:
-                    actual = needle          # 확인 불가 — 예전대로 통과시킨다
-                if not _spacing_ok(actual, needle):
-                    spacing_dropped += 1
-                    continue
-                try:
-                    n = tp.count_rects(idx, cnt)
-                    rect = tp.get_rect(0) if n else None
-                except Exception:
-                    rect = None
-                if rect:
-                    out.append(_Match(i, rect, exact=(actual == needle)))
-        finally:
+    def collect(query, seen):
+        found, dropped = [], 0
+        for i, tp in enumerate(tps):
             try:
-                s.close()
+                s = tp.search(query, match_case=False, match_whole_word=False)
             except Exception:
-                pass
-    return out, spacing_dropped
+                continue
+            try:
+                while True:
+                    r = s.get_next()
+                    if r is None:
+                        break
+                    idx, cnt = r
+                    if (i, idx) in seen:
+                        continue
+                    seen.add((i, idx))
+                    # ★검색은 공백을 무시하므로 **잡은 글자를 직접 확인**한다(위 주석).
+                    try:
+                        actual = tp.get_text_range(idx, cnt)
+                    except Exception:
+                        actual = needle          # 확인 불가 — 예전대로 통과시킨다
+                    if not _spacing_ok(actual, needle):
+                        dropped += 1
+                        continue
+                    try:
+                        n = tp.count_rects(idx, cnt)
+                        rect = tp.get_rect(0) if n else None
+                    except Exception:
+                        rect = None
+                    if rect:
+                        found.append((i, idx, _Match(i, rect, exact=(actual == needle))))
+            finally:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+        return found, dropped
+
+    seen = set()
+    found, spacing_dropped = collect(needle, seen)
+    if not found and not any(ch.isspace() for ch in needle):
+        for k in range(1, len(needle)):
+            a, b = needle[k - 1], needle[k]
+            if "가" <= a <= "힣" and "가" <= b <= "힣":
+                continue
+            more, dropped = collect(needle[:k] + " " + needle[k:], seen)
+            found += more
+            spacing_dropped += dropped
+        found.sort(key=lambda t: (t[0], t[1]))
+    return [m for _i, _idx, m in found], spacing_dropped
 
 
 def _drop_running_heads(matches):

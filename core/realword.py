@@ -72,6 +72,7 @@ from .models import (
     REALWORD_TYPO_COST,
     REALWORD_TYPO_COST_MAX,
     REALWORD_TYPO_GAP_MIN,
+    REALWORD_OVERRIDE_GAP,
 )
 
 # 한글 런 어절 — 저장소 전역 관례(붙임형/띄어쓴형/검수 패널이 공유하는 기준).
@@ -213,10 +214,66 @@ def find_candidates(text: str,
     if stop_event is not None and stop_event.is_set():
         return []
 
+    # ── 6. 관형형이 매달린 교정형은 버린다 ─────────────────────────────
+    #   같은 길이 치환만 만들므로 정답이 글자 수가 다르면 길이가 맞는 오답이 대신 오른다 — '고립 문제에
+    #   대응학 위하여'의 정답은 '대응하기'(한 글자 늘어남)인데 '대응할'(+12.9)이 후보가 됐고 AI 검증까지
+    #   통과했다(2026-10-23). 관형형 어미(ETM) 뒤에는 체언이 와야 한다 — '대응할 위하여'는 비문이다.
+    #   코퍼스 20원고 후보 110건 중 이 모양은 그 1건뿐이었다.
+    picked = [r for r in picked if not _modifier_dangles(kiwi, r)]
+
     out = picked[:REALWORD_MAX_CANDIDATES]
     if len(picked) > REALWORD_MAX_CANDIDATES:
         log(f"  [실단어] 후보 상한 {REALWORD_MAX_CANDIDATES}건 도달 — 이후 절단")
     return out
+
+
+def _modifier_dangles(kiwi, r) -> bool:
+    """후보 r의 교정형이 문맥에서 관형형(ETM)으로 끝나는데 바로 뒤가 체언이 아닌가(비문)."""
+    ctx = r.get("context") or ""
+    m = re.search(rf"(?<![가-힣]){re.escape(r['original'])}(?![가-힣])", ctx)
+    if not m:
+        return False
+    s2 = ctx[:m.start()] + r["corrected"] + ctx[m.end():]
+    try:
+        toks = kiwi.analyze(s2, top_n=1)[0][0]
+    except Exception:
+        return False
+    a, b = m.start(), m.start() + len(r["corrected"])
+    inside = [t for t in toks if a <= t.start < b]
+    after = [t for t in toks if t.start >= b]
+    return bool(inside and inside[-1].tag == "ETM" and after
+                and not (after[0].tag.startswith("N") or after[0].tag in ("XR", "SL", "SN", "SH")))
+
+
+def outscores(text: str, word: str, cand: str, ai_original: str, ai_corrected: str) -> bool:
+    """같은 문맥에서 finder 교정(word→cand)이 AI 교정(ai_original→ai_corrected)보다
+    REALWORD_OVERRIDE_GAP 이상 자연스러운가 — [7.5]가 AI 카드를 검수로 내릴지 정한다.
+
+    문맥은 AI 원문의 첫 등장 앞뒤 60자. finder 쪽은 AI 원문 안의 그 어절만 바꾼다(AI의 다른 수정은
+    넣지 않는다 — 그만큼 finder에 불리하니 내리는 쪽으로 기울지 않는다). 판단할 수 없으면 False.
+    """
+    kiwi = None
+    try:
+        from .morph import _get_kiwi
+        kiwi = _get_kiwi()
+    except Exception:
+        pass
+    p = text.find(ai_original) if (kiwi and ai_original) else -1
+    if p < 0:
+        return False
+    m = re.search(rf"(?<![가-힣]){re.escape(word)}(?![가-힣])", ai_original)
+    if not m:
+        return False
+    lo, hi = max(0, p - 60), min(len(text), p + len(ai_original) + 60)
+    head, tail = text[lo:p], text[p + len(ai_original):hi]
+    with_ai = head + ai_corrected + tail
+    with_fd = head + ai_original[:m.start()] + cand + ai_original[m.end():] + tail
+    try:
+        s_ai = kiwi.analyze(with_ai, top_n=1)[0][1]
+        s_fd = kiwi.analyze(with_fd, top_n=1)[0][1]
+    except Exception:
+        return False
+    return s_fd - s_ai >= REALWORD_OVERRIDE_GAP
 
 
 # ── 오타 채널(경로 B) ───────────────────────────────────────────────────

@@ -1628,6 +1628,171 @@ def eojida_join_near_tie(orig: str) -> bool:
                for toks, sc in alts)
 
 
+# ── 띄어 쓴 조사 붙이기 (스타트업 뿐 아니라 → 스타트업뿐 아니라) ─────────────────
+# 조사는 앞말에 붙여 쓴다(한글 맞춤법 제41항). 일반 조사 JOIN은 2026-06-29에 실패로 보류됐다
+#   ([[validation-delta-and-spacing-backstop]] ⑩) — 실패 셋 중 (a)가 근본이었다: kiwi는 **조사 자신의
+#   품사를 띄어쓰기에 따라 뒤집는다**('뿐'을 붙이면 JX, 떼면 NNB). 그래서 이 규칙은 조사를 읽지 않고
+#   **왼쪽 어절의 마지막 형태소**를 문맥(core.doc_analysis)에서 읽는다 — 체언·닫는 부호·명사형 '-기'
+#   뒤면 조사(붙임), 관형형(ETM) 뒤면 의존명사(띄움 — '할 뿐'·'커지는 만큼'은 맞게 띄어 쓴 것).
+#   (b) 문장부호 넘어 붙이기('한다. 이를')는 왼쪽이 낱말·닫는 부호로 끝날 때만 봐서, (c) 복합명사
+#   과결합('친환경 성과')은 오른쪽이 **조사 머리 + 정해 둔 꼬리**일 때만 봐서 원천 차단한다.
+# 실측(2026-10-23, 20원고 269만 자): 띄어 쓴 진짜 오류 약 26곳, 현행 카드가 덮은 곳 0.
+#
+# 머리 → (허용 꼬리, 허용하는 왼쪽 범주). 범주는 _josa_left_class 참조.
+#   ⚠ 뺀 조사와 이유(실측·동형이의 — 넣지 말 것):
+#     '밖에' — 체언 뒤 7/7이 위치 명사('문 밖에'·'거리 밖에'). 의존명사 '수' 뒤만 조사('수 밖에').
+#     '대로' — 大路('테헤란 대로'). '마다' — '마다하다'('궂은일 마다 않고'). '만'·'도'·'의'·'로'·
+#     '은'·'가' — 萬·道·醫·爐·銀·邊 같은 단독 낱말. '을'·'를'·'으로'는 josa_rules.find_orphan_josa 몫.
+_JOIN_N = frozenset({"N", "CLOSE"})
+_JOIN_WIDE = frozenset({"N", "CLOSE", "ETN", "J", "EC_JI"})
+_JOSA_JOIN_HEADS = {
+    "까지":   (("", "는", "도", "의", "만", "가", "를", "라도", "나", "에"), _JOIN_WIDE),
+    "부터":   (("", "는", "도", "가", "의", "라도"), _JOIN_WIDE),
+    "조차":   (("", "도", "는"), _JOIN_WIDE),
+    "마저":   (("", "도", "는"), _JOIN_WIDE),
+    "처럼":   (("", "은", "는", "도", "만"), frozenset({"N", "CLOSE", "ETN"})),
+    "보다":   (("", "는", "도"), frozenset({"N", "CLOSE", "ETN"})),
+    "에게":   (("", "는", "도", "서", "서는", "만", "로"), _JOIN_N),
+    "한테":   (("", "는", "도", "서", "만"), _JOIN_N),
+    "에서":   (("", "는", "도", "의", "부터", "만"), _JOIN_N),
+    "뿐":     (("", "만", "만이", "만은", "만도", "이다", "이며", "이고", "인", "이었다"), _JOIN_N),
+    "만큼":   (("", "은", "는", "도", "의", "이나", "만"), frozenset({"N", "CLOSE", "DEM"})),
+    "라는":   (("",), _JOIN_N),
+    "이라는": (("",), _JOIN_N),
+    "라고":   (("", "는", "도"), _JOIN_N),
+    "이라고": (("", "는", "도"), _JOIN_N),
+    "밖에":   (("", "는", "도"), frozenset({"SU"})),
+}
+# 오른쪽 어절 = 머리 + 꼬리 + (붙은 문장부호). 긴 머리부터 맞춘다('이라는'이 '라는'보다 먼저).
+_JOSA_JOIN_RE = re.compile(
+    r"(" + "|".join(sorted(_JOSA_JOIN_HEADS, key=len, reverse=True)) + r")([가-힣]*)([^\s가-힣]*)")
+# 왼쪽 어절이 이 글자로 끝나면 닫는 부호 뒤 — 조사는 부호에 붙여 쓴다('‘관리’ 라는'·'(…) 보다').
+_JOIN_CLOSE = ")]}」』’”'\"》〉>"
+# 대명 관형사·지시어 + '만큼'은 한 낱말이다(그만큼·이만큼·저만큼).
+_JOIN_DEM = frozenset({"그", "이", "저"})
+# '-는지/-ㄴ지/-을지' 연결어미 뒤 보조사('존재하는지 조차' → '존재하는지조차').
+_JOIN_EC_JI = frozenset({"는지", "ㄴ지", "은지", "을지", "ㄹ지", "던지"})
+# 머리만 있고 꼬리가 없을 때 부사로도 읽히는 것 — '보다'(더욱: '운영상 보다 현실적인')·'마저'(남김없이).
+#   명사형 '-기' 뒤 '보다'는 비교라 확정이다('가지기 보다는'은 꼬리가 있고 '하기 보다'도 비교).
+_JOIN_ADVERB_HEADS = frozenset({"보다", "마저"})
+
+
+def _josa_left_class(A: str, head: str, toks) -> str:
+    """조사 앞 어절 A의 범주 — A 자리의 문맥 읽기(toks: A 안에서 시작하는 형태소)의 마지막 형태소로.
+
+    N(체언·외국어·숫자·한자) · CLOSE(닫는 부호) · ETN(명사형 '-기/-음') · J(조사 — '에 까지'·'로 부터') ·
+    EC_JI('-는지') · DEM('그/이/저 만큼') · SU(의존명사 '수') · ETM(관형형 — 의존명사 앞이라 띄움) · 그 밖 ''.
+    """
+    if A[-1] in _JOIN_CLOSE:
+        return "CLOSE"
+    if head == "만큼" and A in _JOIN_DEM:
+        return "DEM"
+    if not toks:
+        return ""
+    last = max(toks, key=lambda t: t.start + t.len)
+    tag = last.tag
+    if A == "수" and tag == "NNB":
+        return "SU"
+    if tag.startswith("N") or tag in ("SL", "SN", "SH", "XSN"):
+        return "N"
+    if tag == "ETN":
+        return "ETN"
+    if tag.startswith("J"):
+        return "J"
+    if tag == "EC" and last.form in _JOIN_EC_JI:
+        return "EC_JI"
+    if tag == "ETM":
+        return "ETM"
+    return ""
+
+
+def _josa_join_sites(text: str):
+    """띄어 쓴 조사 후보 자리 — (A, B, 머리, 꼬리, A 시작 위치, A 끝 위치) 등장 순."""
+    pos = 0
+    for line in text.split("\n"):
+        toks = list(re.finditer(r"\S+", line))
+        for i in range(len(toks) - 1):
+            a, b = toks[i], toks[i + 1]
+            if b.start() - a.end() != 1:                   # 정확히 공백 1칸
+                continue
+            A, B = a.group(), b.group()
+            m = _JOSA_JOIN_RE.fullmatch(B)
+            if not m:
+                continue
+            head, tail = m.group(1), m.group(2)
+            if tail not in _JOSA_JOIN_HEADS[head][0]:
+                continue
+            # 왼쪽은 낱말(한글·영문·숫자) 또는 닫는 부호로 끝나야 한다 — 쉼표·마침표 뒤는 다른 마디다.
+            if not (A[-1].isalnum() or A[-1] in _JOIN_CLOSE):
+                continue
+            if is_urlish(A) or has_zero_width(A) or has_zero_width(B):
+                continue
+            yield A, B, head, tail, pos + a.start(), pos + a.end()
+        pos += len(line) + 1
+
+
+def find_josa_join(text: str) -> list:
+    """띄어 쓴 조사를 앞말에 붙인 후보 [(original, joined), …] — 'A B' → 'AB'(공백만 지운다).
+
+    오른쪽 어절 B가 조사 머리(_JOSA_JOIN_HEADS) + 정해 둔 꼬리이고, 왼쪽 어절 A의 마지막 형태소가
+    **그 원고의 모든 등장(최대 4)에서** 그 머리가 허용하는 범주로 읽힐 때만 낸다. 범주 판정은 공유
+    문맥 읽기(1순위) — 어절 단독 분석은 '신호일 뿐'(신호+이+ㄹ)을 체언으로 오독한다.
+    자동 적용 여부는 josa_join_needs_review가 정한다. 미설치/실패 시 [].
+    """
+    if not text or _get_kiwi() is None:
+        return []
+    doc = _doc(text)
+    if doc is None:
+        return []
+    verdict, order = {}, []
+    for A, B, head, _tail, s, e in _josa_join_sites(text):
+        orig = A + " " + B
+        if orig not in verdict:
+            verdict[orig] = [True, 0, A + B]
+            order.append(orig)
+        v = verdict[orig]
+        if not v[0] or v[1] >= 4:
+            continue
+        v[1] += 1
+        toks = doc.reading(s, e)
+        if _josa_left_class(A, head, toks or ()) not in _JOSA_JOIN_HEADS[head][1]:
+            v[0] = False                                     # 한 등장이라도 아니면 낸 적 없음
+    return [(o, verdict[o][2]) for o in order if verdict[o][0]]
+
+
+def josa_join_needs_review(text: str, orig: str) -> bool:
+    """find_josa_join 카드를 자동 적용하지 말고 검수(low)로 둘 자리인가.
+
+    ① 꼬리 없는 '보다'·'마저'가 명사형 '-기' 아닌 말 뒤 — 부사로도 읽힌다('운영상 보다 현실적인'은
+       비교가 아니라 '더욱'). 실측 체언 뒤 '보다' 4 정탐 : 2 부사.
+    ② 왼쪽 범주가 근접 대안 읽기(doc_analysis.TIE_DELTA)에서 갈린다 — kiwi가 거의 같은 확신으로
+       관형형으로도 읽는 자리('…일 뿐'). 지우지 않고 내린다(분석 확신도 원칙).
+    """
+    A, sep, B = (orig or "").partition(" ")
+    m = _JOSA_JOIN_RE.fullmatch(B) if sep else None
+    if not m:
+        return True
+    head, tail = m.group(1), m.group(2)
+    allowed = _JOSA_JOIN_HEADS.get(head, ((), frozenset()))[1]
+    doc = _doc(text)
+    if doc is None:
+        return True
+    n = 0
+    for a2, b2, _h, _t, s, e in _josa_join_sites(text):
+        if a2 != A or b2 != B:
+            continue
+        if n >= 4:
+            break
+        n += 1
+        reads = doc.readings(s, e)
+        classes = {_josa_left_class(A, head, r) for r in reads}
+        if head in _JOIN_ADVERB_HEADS and not tail and classes != {"ETN"}:
+            return True
+        if any(c not in allowed for c in classes):
+            return True
+    return False
+
+
 def find_compound_spacing_consistency(text: str, *, min_len: int = 4, max_len: int = 14,
                                       exists_fn=None, with_basis: bool = False) -> list:
     """복합명사의 띄어쓰기 혼재를 **저자 다수 표기로 통일**하는 후보를 만든다.
