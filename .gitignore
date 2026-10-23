@@ -28,6 +28,8 @@ korean-ambiguity-data/
 
 # ── 고객 원고·산출물 (개인정보/저작물) ─────────────────
 교정샘플/
+# 검토 저장본(core/review_session) — 원고 전문이 담긴다. 개발 PC에선 cache_dir()=레포 data/.
+data/review_sessions/
 *_교정본.hwp
 *_교정본.hwpx
 *_정오표.xlsx

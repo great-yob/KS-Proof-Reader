@@ -505,7 +505,11 @@ class _Riser(QWidget):
             anim.start()
 
         if delay > 0:
-            QTimer.singleShot(delay, run)
+            # ⚠ 문맥 객체(self)를 함께 준다 — 등장 지연 중에 화면이 다시 그려지면(다시 적용 ·
+            #   결과물 추가 · 테마 전환) 이 위젯은 지워지는데, 맨 클로저 타이머는 그래도 울려
+            #   지워진 객체에 애니메이션을 만들다 RuntimeError를 낸다. 문맥을 주면 함께 취소된다.
+            #   (`anim.start` 같은 QObject의 바운드 메서드는 PySide가 이미 그렇게 묶는다.)
+            QTimer.singleShot(delay, self, run)
         else:
             run()
 

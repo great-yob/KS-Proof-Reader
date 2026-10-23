@@ -9,8 +9,10 @@ ui/main_window.py — 단일 워크스페이스 셸
 core/ 엔진과 워커 시그널 계약은 변경하지 않고 그대로 소비한다.
 """
 
+import copy
 import os
 import sys
+import time
 import ctypes
 
 try:
@@ -37,6 +39,7 @@ from ui.workers.proofreading_worker import ProofreadingWorker
 from ui.workers.apply_worker import ApplyWorker
 from ui.styles import theme
 from core import ConfigLoader
+from core import review_session
 
 
 # ── 프레임리스 창 컨트롤(Win32 NCHITTEST) 상수 ───────────────
@@ -123,8 +126,29 @@ class MainWindow(QMainWindow):
         self._pending_warnings = []
         # 1차 적용에 넘긴 등장별 결정 스냅숏 — 추가 산출물이 **같은 결정**을 쓰게 한다.
         self._applied_occ_rows = None
+        # 같은 적용에 넘긴 교정 목록의 **깊은 사본**. 적용 뒤에도 검토 화면에서 결정을 바꿀 수
+        #   있으므로(다시 적용) 살아 있는 목록을 넘기면 결과물 추가가 1차 결과와 다른 결정을
+        #   쓰게 되고, 적용 워커 스레드가 도는 중에 카드 클릭이 그 dict를 바꾸게 된다.
+        self._applied_corrections = None
         self._sync_workers = []   # 공유 용어 뇌 동기화 워커(단명, fire-and-forget)
         self._phase = "setup"
+
+        # ★검토 저장 — 분석이 끝난 원고의 검토 상태를 원고별로 자동 저장한다
+        #   (core/review_session). 앱이 꺼지거나 초기화해도 같은 원고로 다시 시작하면
+        #   AI를 다시 부르지 않고 이어서 한다(사용자 요구 2026-10-23).
+        self._session_id = ""        # 지금 검토 중인 원고의 지문("" = 저장하지 않음)
+        self._pending_sid = ""       # 분석 중인 원고의 지문 — 분석이 끝나면 위로 옮긴다
+        self._session_applied = False   # 이 검토로 결과물을 한 번이라도 만들었나
+        self._session_save_failed = False
+        self._detected = 0           # 분석이 낸 교정 항목 수(복원 때 레일 표시)
+        # 이 검토의 결정을 학습 큐에 이미 적었나 — 다시 적용할 때 같은 결정을 두 번 세지 않는다.
+        self._events_recorded = False
+        self._resume_prompting = False
+        # 카드를 연달아 누르는 동안 매번 쓰지 않는다 — 마지막 조작 뒤 한 번.
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(1500)
+        self._save_timer.timeout.connect(self._save_session)
 
         self._build_ui()
         self._setup_dwm_style()   # Win11 라운드 모서리 + 테두리 + 그림자
@@ -144,6 +168,9 @@ class MainWindow(QMainWindow):
         self._update_dialog = None
         self._update_prompted = False  # 이번 실행에서 모달을 이미 띄웠는가
         self._start_update_check()
+
+        # 지난 실행에서 검토하다 만 원고가 있으면 이어서 할지 묻는다(창이 뜬 뒤에).
+        QTimer.singleShot(400, self._offer_last_session)
 
     # ══════════════════════════════════════════════
     # DWM 네이티브 스타일 — 라운드 모서리 · 테두리선 · 그림자
@@ -301,6 +328,7 @@ class MainWindow(QMainWindow):
         self.setup_panel.options_changed.connect(self._refresh_setup_footer)
 
         self.review_panel.counts_changed.connect(self._on_review_counts)
+        self.review_panel.counts_changed.connect(self._schedule_session_save)
         self.review_panel.consistency_counts_changed.connect(self._on_consistency_counts)
 
         self.result_panel.extra_output_requested.connect(self._start_extra_output)
@@ -340,9 +368,14 @@ class MainWindow(QMainWindow):
         elif phase == "review":
             self.rail.set_phase("review")
             # 푸터 primary는 counts_changed가 갱신
-            self.footer.set_idle("교정 제안 검토 중")
-            self._on_review_counts(
-                *self._count_review())
+            # ⚠ 표기 일관성 단계 도중에 완료 화면을 다녀오면 그 단계로 돌아온다 — 교정 카드
+            #   집계(_on_review_counts)는 그 단계에서 아무것도 하지 않으므로 푸터가 비게 된다.
+            if self.review_panel.in_consistency_mode():
+                self.footer.set_idle("표기 일관성 검토 중")
+                self._on_consistency_counts(*self.review_panel.get_consistency_counts())
+            else:
+                self.footer.set_idle("교정 제안 검토 중")
+                self._on_review_counts(*self._count_review())
         elif phase == "result":
             self.rail.complete_all()
             self.footer.set_idle("교정 완료")
@@ -439,6 +472,27 @@ class MainWindow(QMainWindow):
     def _start_analysis(self):
         if not self._file_path or not self.setup_panel.scopes_selected():
             return
+        # ★이 원고의 저장된 검토가 있으면 **AI를 부르기 전에** 묻는다 — 재분석은 호출 비용과
+        #   시간을 다시 쓴다. 판정은 파일 내용의 지문이라 경로가 바뀌어도 같은 원고로 알아본다.
+        sid = review_session.fingerprint(self._file_path)
+        m = review_session.meta(sid) if sid else None
+        if m is not None:
+            choice = self._ask_resume(m)
+            if choice is None:          # Esc — 아무것도 하지 않는다(새 분석으로 읽으면 안 된다)
+                return
+            if choice == "yes":
+                # 결과물 축만 지금 고른 값을 따른다 — 분석 옵션은 저장된 검토의 것이다.
+                self._resume_session(sid, self._file_path,
+                                     output_opts=self.setup_panel.get_options())
+                return
+        # 이전 원고의 미뤄 둔 저장을 마치고 끊는다 — 분석 중엔 저장할 검토가 없다.
+        #   이전 실행의 결과도 비운다(남아 있으면 새 검토가 '다시 적용'으로 보인다).
+        self._flush_session_save()
+        self._session_id = ""
+        self._pending_sid = sid
+        self._result = {}
+        self._applied_occ_rows = None
+        self._applied_corrections = None
         self._options = self.setup_panel.get_options()
         # ★사용자 첨부 사전 — 설정 패널이 아니라 첨부 칸이 출처라 여기서 합류시킨다.
         #   값이 비면 워커가 이 계층을 통째로 건너뛴다(= 기존 교정 로직 그대로).
@@ -521,7 +575,7 @@ class MainWindow(QMainWindow):
                                    os.path.basename(self._file_path),
                                    full_text=self._extracted_text,
                                    footnote_lines=self._footnote_lines)
-                                   
+            self._begin_session(detected)
             self._start_apply()
             return
 
@@ -545,6 +599,184 @@ class MainWindow(QMainWindow):
         self.running_panel.set_animating(False)
         self.footer.set_idle(f"분석 완료 · 교정 {detected}건")
         self.footer.set_primary("교정 검토 시작", variant="success_solid", visible=True, show_reset=True)
+        # 로그까지 다 쌓은 뒤에 저장한다 — 이어서 할 때 분석 로그도 그대로 돌아온다.
+        self._begin_session(detected)
+
+    # ══════════════════════════════════════════════
+    # 검토 저장 · 이어서 하기 (core/review_session)
+    # ══════════════════════════════════════════════
+    #   ★분석이 끝난 순간부터 검토 상태를 원고별로 자동 저장한다 — 사용자가 '저장'을
+    #     누를 필요가 없다. 앱이 꺼져도(강제 종료 포함, 마지막 조작 1.5초 이내만 잃는다)
+    #     초기화하고 다른 원고를 먼저 해도, 같은 원고로 다시 시작하면 이어서 한다.
+    #   ⚠ 분석 옵션은 저장된 검토의 것을 쓴다(그 옵션으로 만든 제안이다). 결과물 축만
+    #     이어서 할 때 고른 값을 따른다(`_OUTPUT_OPTS`).
+    _OUTPUT_OPTS = ("output_mode", "gen_errata", "errata_only")
+
+    def _begin_session(self, detected: int):
+        self._detected = detected
+        self._session_id = self._pending_sid
+        self._session_applied = False
+        self._session_save_failed = False
+        self._events_recorded = False
+        self._save_session()
+
+    def _schedule_session_save(self, *_):
+        if self._session_id and self._phase in ("review", "apply_running", "result"):
+            self._save_timer.start()
+
+    def _flush_session_save(self):
+        """미뤄 둔 저장을 지금 한다(초기화·종료 직전)."""
+        if self._save_timer.isActive():
+            self._save_session()
+
+    def _save_session(self):
+        self._save_timer.stop()
+        sid = self._session_id
+        if not sid or not self.review_panel.get_corrections():
+            return
+        try:
+            from version import APP_VERSION
+        except Exception:
+            APP_VERSION = ""
+        pending, accepted, total = self.review_panel.get_counts()
+        payload = {
+            "app_version":        APP_VERSION,
+            "options":            self._options,
+            "text":               self._extracted_text,
+            "page_count":         self._page_count,
+            "footnote_lines":     self._footnote_lines,
+            "detected":           self._detected,
+            "consistency_done":   self._consistency_done,
+            "consistency_logged": self._consistency_logged,
+            "events_recorded":    self._events_recorded,
+            "applied":            self._session_applied,
+            "review":             self.review_panel.export_state(),
+            "log":                self.activity.export_entries(),
+        }
+        meta = {"path": self._file_path, "file_name": os.path.basename(self._file_path),
+                "pending": pending, "accepted": accepted, "total": total,
+                "applied": self._session_applied}
+        err = review_session.save(sid, payload, meta)
+        if err and not self._session_save_failed:
+            # 한 번만 알린다 — 카드를 누를 때마다 같은 실패를 쌓지 않는다.
+            self._session_save_failed = True
+            self.activity.log(f"[작업 저장] 저장 실패 · 이어서 하기 불가 ({err})", level="err")
+
+    @staticmethod
+    def _when(ts) -> str:
+        try:
+            return time.strftime("%m/%d %H:%M", time.localtime(float(ts)))
+        except (TypeError, ValueError, OverflowError, OSError):
+            return "알 수 없음"
+
+    def _ask_resume(self, m: dict):
+        """같은 원고로 분석을 시작할 때 — "yes"(이어서) / "no"(새로 분석) / None(취소)."""
+        from ui.widgets.review_panel import LightConfirmDialog
+        total = int(m.get("total") or 0)
+        done = total - int(m.get("pending") or 0)
+        state = " · 교정 적용까지 마침" if m.get("applied") else ""
+        return LightConfirmDialog.choose(
+            self, "저장된 검토 작업",
+            f"이 원고를 검토하던 작업이 저장돼 있습니다.\n"
+            f"저장 {self._when(m.get('saved_at'))} · 결정 {done} / {total}곳{state}\n\n"
+            f"이어서 하면 AI를 다시 호출하지 않습니다.\n"
+            f"새로 분석하면 저장된 검토는 새 분석 결과로 바뀝니다.",
+            yes_text="이어서 검토", no_text="새로 분석")
+
+    def _offer_last_session(self):
+        """앱 시작 때 — 지난번에 검토하다 만 원고가 있으면 이어서 할지 한 번 묻는다.
+
+        ⚠ 같은 저장본으로는 **한 번만** 묻는다(`prompted_for`) — '나중에'를 누른 사용자에게
+          실행할 때마다 다시 묻지 않는다. 그 뒤 그 원고로 분석을 시작하면 그때 다시 묻는다.
+        ⚠ 원고가 그 자리에 없거나 내용이 바뀌었으면 묻지 않는다(얹을 문서가 없다).
+        """
+        if self._phase != "setup" or self._file_path:
+            return                      # 사용자가 이미 다른 일을 시작했다
+        try:
+            review_session.prune()
+            metas = [m for m in review_session.list_meta() if not m.get("applied")]
+        except Exception:
+            return
+        if not metas:
+            return
+        m = metas[0]
+        if m.get("prompted_for") == m.get("saved_at"):
+            return
+        path = m.get("path") or ""
+        if not path or not os.path.isfile(path) or review_session.fingerprint(path) != m.get("sid"):
+            return
+        review_session.update_meta(m["sid"], prompted_for=m.get("saved_at"))
+        from ui.widgets.review_panel import LightConfirmDialog
+        total = int(m.get("total") or 0)
+        done = total - int(m.get("pending") or 0)
+        self._resume_prompting = True
+        try:
+            ok = LightConfirmDialog.ask(
+                self, "이어서 검토하기",
+                f"지난번에 검토하던 원고가 있습니다.\n\n"
+                f"{m.get('file_name') or os.path.basename(path)}\n"
+                f"저장 {self._when(m.get('saved_at'))} · 결정 {done} / {total}곳\n\n"
+                f"이어서 하면 AI를 다시 호출하지 않습니다.\n"
+                f"나중에 같은 원고로 분석을 시작해도 이어서 할 수 있습니다.",
+                yes_text="이어서 검토", no_text="나중에")
+        finally:
+            self._resume_prompting = False
+        if ok and self._phase == "setup":
+            self._resume_session(m["sid"], path)
+
+    def _resume_session(self, sid: str, path: str, output_opts: dict = None) -> bool:
+        """저장된 검토를 되살려 검토 화면으로 간다. 실패하면 저장본을 지우고 설정에 남는다."""
+        self._flush_session_save()      # 지금 검토 중이던 다른 원고가 있으면 마저 저장
+        payload = review_session.load(sid)
+        opts = dict((payload or {}).get("options") or {})
+        if output_opts:
+            for k in self._OUTPUT_OPTS:
+                if k in output_opts:
+                    opts[k] = output_opts[k]
+        try:
+            if payload is None:
+                raise ValueError("저장본을 읽을 수 없습니다")
+            self.review_panel.restore_state(
+                payload["review"], opts,
+                full_text=payload.get("text") or "",
+                footnote_lines=payload.get("footnote_lines"))
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            review_session.delete(sid)
+            self.activity.log(f"[작업 복원] 실패 · 저장본 폐기 ({exc})", level="err")
+            self._warn_popup("저장된 검토를 불러오지 못했습니다",
+                             "저장본이 손상됐거나 이 원고와 맞지 않아 지웠습니다.\n"
+                             "분석을 다시 시작해 주세요.")
+            return False
+
+        self._file_path = path
+        self.file_panel.set_file(path)
+        self._options = opts
+        self._extracted_text = payload.get("text") or ""
+        self._page_count = payload.get("page_count")
+        self._footnote_lines = list(payload.get("footnote_lines") or [])
+        self._detected = int(payload.get("detected") or 0)
+        self._consistency_done = bool(payload.get("consistency_done"))
+        self._consistency_logged = bool(payload.get("consistency_logged"))
+        self._events_recorded = bool(payload.get("events_recorded"))
+        self._session_applied = bool(payload.get("applied"))
+        self._corrections = self.review_panel.get_corrections()
+        self._result = {}
+        self._applied_occ_rows = None
+        self._applied_corrections = None
+        self._session_id = sid
+        self._session_save_failed = False
+
+        self.activity.restore_entries(payload.get("log"))
+        pending, _accepted, total = self.review_panel.get_counts()
+        self.activity.log(f"[작업 복원] 저장된 검토 불러옴 · 결정 {total - pending} / {total}곳")
+        self.rail.reset()
+        if self._page_count:
+            self.rail.set_step_result("setup", f"{self._page_count:,}페이지")
+        self.rail.set_step_result("analyze", f"교정 제안 : {self._detected}건")
+        self.running_panel.set_title("분석 완료")
+        self.running_panel.set_animating(False)
+        self._show_phase("review")
+        return True
 
     # ── 검토 카운트 → 푸터/레일 ──────────────────
     def _on_review_counts(self, pending: int, accepted: int, total: int):
@@ -582,8 +814,16 @@ class MainWindow(QMainWindow):
                                         visible=True, show_reset=True)
                 self.footer.set_recheck(False)
                 return
+        # ★이미 결과물을 만든 뒤 검토로 돌아온 경우 — 바꾼 결정으로 **다시 적용**한다
+        #   (사용자 요구 2026-10-23). 같은 이름의 산출물을 새로 만든다.
+        verb = "교정 적용"
+        if self._result:
+            verb = "다시 적용"
+            self.footer.set_status(
+                f"적용 뒤 검토 수정 중 — 바뀐 결정 {self._decisions_changed()}곳 · "
+                f"수락 : {accepted} / {total}항목 · 대기 : {pending}항목")
         # 대기 항목이 있어도 버튼은 활성 — 누르면 _start_apply가 미선택을 막고 에러 팝업.
-        self.footer.set_primary(f"✓  교정 적용 ({accepted}항목)", variant="action_pink",
+        self.footer.set_primary(f"✓  {verb} ({accepted}항목)", variant="action_pink",
                                 enabled=total > 0, visible=True, show_reset=True)
         # 1차 통일 뒤에도 **아직 결정하지 않은** 계열·낱말이 남으면 2단계 재검토를 보조
         #   버튼으로 연다. ⚠ 남은 '갈림' 전체를 세면 안 된다 — 사용자가 '그대로 두기'로
@@ -591,6 +831,23 @@ class MainWindow(QMainWindow):
         #   교정이 끝나지 않는 화면이 된다(사용자 보고 2026-08-04).
         left = self.review_panel.consistency_pending_count() if self._consistency_done else 0
         self.footer.set_recheck(bool(left), left)
+
+    def _decisions_changed(self) -> int:
+        """마지막 적용 이후 바뀐 결정 수(보이는 등장 단위). 교정값을 고친 교정은 그 등장을
+        전부 센다 — 치환되는 문자열이 바뀌었으니 그 자리들의 결과가 달라진다."""
+        rows_before = {(r["ci"], r["occ"]): r["status"] for r in (self._applied_occ_rows or [])}
+        before = self._applied_corrections or []
+        now = self.review_panel.get_corrections()
+        n = 0
+        for r in self.review_panel.get_occurrence_rows():
+            if r["excluded"] or r["shadowed"]:
+                continue
+            ci = r["ci"]
+            if (ci >= len(before) or ci >= len(now)
+                    or rows_before.get((ci, r["occ"])) != r["status"]
+                    or before[ci].get("corrected") != now[ci].get("corrected")):
+                n += 1
+        return n
 
     # ── 표기 일관성 단계 ─────────────────────────
     def _on_consistency_counts(self, pending: int, done: int, total: int):
@@ -690,6 +947,9 @@ class MainWindow(QMainWindow):
         panel_cors = self.review_panel.get_corrections()
         if panel_cors:
             self._corrections = panel_cors
+        # 결과물을 이미 만든 뒤 검토에서 결정을 바꿔 다시 적용하는가.
+        reapply = bool(self._result)
+        self._flush_session_save()
 
         # 현재 검토 화면(review)에 있다면 running_panel로 전환하지 않고 화면을 유지한다.
         if self._phase == "review":
@@ -699,9 +959,16 @@ class MainWindow(QMainWindow):
             self.running_panel.set_animating(True)
             self._show_phase("running")
 
+        self.rail.clear_error("done")      # 지난 적용 실패 표시 — 다시 시도하는 중이다
         self.rail.set_phase("done")
         self.footer.set_busy("교정 적용 중…", "적용 중")
         self.activity.log("교정 적용을 시작합니다…")
+        if reapply:
+            # ⚠ 화면 로그 규약: [태그] + 수치, ' — ' 금지(34자 넘으면 그 앞에서 잘린다).
+            self.activity.log("[재적용] 바뀐 결정으로 결과물을 다시 만듭니다 · 같은 이름 파일 덮어씀")
+            n_extra = len(self._result.get("extra_outputs") or [])
+            if n_extra:
+                self.activity.log(f"[재적용] 결과물 추가분 {n_extra}건은 이전 결정 기준 · 필요하면 다시 추가")
 
         # 공유 용어 뇌(DO-3) — 검토/auto_apply 결정을 용어 단위 학습 이벤트로 로컬 큐에
         #   적재한다. 순수 부수효과(실패해도 적용에 영향 0, 문맥 스니펫 미저장).
@@ -714,10 +981,13 @@ class MainWindow(QMainWindow):
         #   ⚠ 스냅숏으로 들고 있는다 — 결과 화면의 '결과물 추가'가 **같은 결정**을
         #     써야 하는데, 그때 패널을 다시 물으면 그 사이 상태가 달라졌을 수 있다.
         self._applied_occ_rows = self.review_panel.get_occurrence_rows()
+        # 같은 순간의 교정 목록 **사본** — 워커가 도는 동안·결과 화면에서 결과물을 추가할 때
+        #   검토 화면의 조작이 끼어들지 않게 한다(__init__ 주석). ci 순서는 그대로다.
+        self._applied_corrections = copy.deepcopy(self._corrections)
         # ★검수 패널이 등장을 찾은 추출 텍스트도 넘긴다 — 교정본의 skip 번호를 브리지가
         #   실제로 만날 매치 순서로 정하는 데 쓴다(ApplyWorker._plan_by_replay). 빠지면
         #   종전 보정으로 돌아가 '앞 교정이 만든 원문'에 번호가 밀린다.
-        self._apply_worker = ApplyWorker(self._file_path, self._corrections,
+        self._apply_worker = ApplyWorker(self._file_path, self._applied_corrections,
                                          self._options,
                                          occ_rows=self._applied_occ_rows,
                                          full_text=self._extracted_text,
@@ -725,7 +995,7 @@ class MainWindow(QMainWindow):
         self._apply_worker.progress.connect(self._on_worker_progress)
         self._apply_worker.log_message.connect(self.activity.log)
         self._apply_worker.finished.connect(self._on_apply_done)
-        self._apply_worker.error.connect(self._on_error)
+        self._apply_worker.error.connect(self._on_apply_error)
         self._apply_worker.warning.connect(self._on_worker_warning)
         self._pending_warnings = []
         self._apply_worker.start()
@@ -737,13 +1007,19 @@ class MainWindow(QMainWindow):
 
         ⚠ 공유 뇌 기여자(관리자 + 지정자, 2026-10-16)가 아니면 **기록부터 하지 않는다** —
           교정 전문 인력이 아닌 사용자의 결정은 합의 집계의 노이즈이고, 서버도 거부한다.
+        ⚠ 한 검토에서 **한 번만** 적는다 — 다시 적용(결정 변경)·이어서 하기 뒤의 적용이 같은
+          결정을 다시 적으면 합의 집계에서 한 사람의 표가 두 번 세진다. 이미 서버로 간 표는
+          되돌릴 수 없으므로 고친 결정 대신 첫 결정이 남는 쪽을 택한다.
         """
+        if self._events_recorded:
+            return
         try:
             from core import auth
             if not auth.can_contribute():
                 return
         except Exception:
             return
+        self._events_recorded = True
         try:
             from core import event_queue
             n = event_queue.record_corrections(
@@ -936,7 +1212,7 @@ class MainWindow(QMainWindow):
             char_count = len(self._extracted_text.replace("\n", "").replace(" ", ""))
         self.result_panel.show_result(
             result, self.activity.get_proofreading_log(),
-            corrections=self._corrections,
+            corrections=self._applied_corrections or self._corrections,
             char_count=char_count,
             page_count=getattr(self, "_page_count", None),
             file_name=os.path.basename(self._file_path) if self._file_path else "")
@@ -982,7 +1258,24 @@ class MainWindow(QMainWindow):
             self.rail.set_step_result("done", f"적용 : {applied}건")
         self.running_panel.set_animating(False)
         self._show_phase("result")
+        self._session_applied = True
+        self._save_session()
         self._flush_warnings()
+
+    def _on_apply_error(self, message: str):
+        """교정 적용 실패·취소 — 검토 결정은 그대로 두고 **검토 화면으로** 돌아간다.
+
+        ⚠ 예전엔 분석 실패와 같은 `_on_error`로 설정 화면에 돌아갔다. 적용의 재시도는
+          '다시 적용'인데(예: 같은 이름의 교정본이 한/글에 열려 있어 저장 실패), 설정
+          화면에선 그 길이 새 분석뿐이라 검토를 처음부터 다시 해야 했다.
+        ⚠ 이전 적용 결과(`self._result`)는 지우지 않는다 — 저장에 실패하면 디스크의 파일은
+          이전 것 그대로다(브리지 save_as는 덮어쓰지 못하면 예외를 내고, 정오표는 그 뒤에 쓴다).
+        """
+        self.activity.log(message, level="err")
+        self.rail.set_error("done")
+        self.running_panel.set_animating(False)
+        QMessageBox.critical(self, "오류", message)
+        self._show_phase("review" if self.review_panel.get_corrections() else "setup")
 
     # ══════════════════════════════════════════════
     # 결과물 추가 — 검토를 다시 거치지 않고 산출물을 하나 더
@@ -1016,7 +1309,10 @@ class MainWindow(QMainWindow):
                              "결과물을 추가하려면 원본 한글 파일이 그대로 있어야 합니다.\n"
                              "파일이 이동·삭제되었는지 확인해 주세요.")
             return
-        if not self._corrections:
+        # ★1차 적용에 넘긴 **사본**을 쓴다(불변식②) — 적용 뒤 검토 화면에서 결정을 바꿨어도
+        #   그것은 '다시 적용'의 몫이고, 결과물 추가는 지금 화면의 결과와 같은 결정이어야 한다.
+        cors = self._applied_corrections or self._corrections
+        if not cors:
             self._warn_popup("교정 결과 없음", "재사용할 교정 결과가 없습니다.")
             return
 
@@ -1060,15 +1356,17 @@ class MainWindow(QMainWindow):
         self._phase = "extra_running"
         # ⚠ 화면 로그 규약: 수치는 괄호 밖에 — `_condense`가 괄호 절을 통째로 지운다
         #   (실측: '… 재사용 (교정 412건)' → '건'이 사라진 채 표시됨).
-        self.activity.log(f"[추가] {label} 생성 시작 · 교정 {len(self._corrections)}건 "
+        self.activity.log(f"[추가] {label} 생성 시작 · 교정 {len(cors)}건 "
                           f"재사용 · 검토 생략")
+        if self._applied_corrections is not None and self._decisions_changed():
+            self.activity.log("[추가] 적용 뒤 바꾼 결정은 빠짐 · 반영하려면 검토에서 다시 적용")
         self.result_panel.set_extra_busy(mode, f"{label} 만드는 중… \n"
                                                f"진행률은 아래 상태바에 표시됩니다")
         self.footer.set_busy(f"{label} 생성 중…", "생성 중")
 
         self._cleanup_worker("_extra_worker")
         self._extra_worker = ApplyWorker(
-            src, self._corrections, opts,
+            src, cors, opts,
             occ_rows=self._applied_occ_rows,
             # 1차 실행이 뜬 쪽 번호를 그대로 — 같은 원본의 같은 장면이다.
             known_pages=self._result.get("pages_by_original") or {},
@@ -1266,11 +1564,21 @@ class MainWindow(QMainWindow):
                 w.request_stop()
 
     def _reset(self):
+        # 검토 중이던 원고는 저장돼 있다 — 미뤄 둔 저장만 마저 하고 비운다(사용자 요구
+        #   2026-10-23: 진행 중에 다른 원고를 먼저 해야 할 때 초기화가 작업을 날렸다).
+        self._flush_session_save()
+        saved_unfinished = bool(self._session_id) and not self._session_applied
+        self._session_id = ""
+        self._pending_sid = ""
+        self._session_applied = False
+        self._events_recorded = False
+        self._detected = 0
         self._cleanup_worker("_worker")
         self._cleanup_worker("_apply_worker")
         self._cleanup_worker("_extra_worker")
         self._extra_mode = ""
         self._applied_occ_rows = None
+        self._applied_corrections = None
         self._file_path = ""
         self._dict_path = ""
         self._options = {}
@@ -1288,21 +1596,33 @@ class MainWindow(QMainWindow):
         self.activity.clear()
         self.rail.reset()
         self._show_phase("setup")
+        if saved_unfinished:
+            self.footer.set_idle("이전 원고의 검토를 저장했습니다 — 같은 원고로 다시 시작하면 이어서 할 수 있습니다")
 
     # ── 레일 클릭(설정으로 복귀해 재실행) ────────
     def _on_rail_click(self, key: str):
         if self._phase in ("running", "apply_running", "extra_running"):
             return
-            
+
         # 바디 내용만 교체 (푸터와 레일의 진행상태는 마지막 단계 유지)
         if key == "setup":
             self.main_stage.setCurrentIndex(0)
         elif key == "analyze" and self._corrections:
             self.main_stage.setCurrentIndex(1)
         elif key == "review" and self._corrections:
-            self.main_stage.setCurrentIndex(2)
+            if self._phase == "result":
+                # ★완료 뒤 검토로 돌아오면 **검토 단계로 되돌린다**(사용자 요구 2026-10-23).
+                #   예전엔 화면만 바꾸고 단계는 '완료'로 남아 푸터에 초기화만 있었다 —
+                #   카드를 바꿀 수는 있는데 다시 적용할 길이 없었다.
+                self._show_phase("review")
+            else:
+                self.main_stage.setCurrentIndex(2)
         elif key == "done" and self._result:
-            self.main_stage.setCurrentIndex(3)
+            if self._phase == "review":
+                # 다시 적용하지 않고 돌아간다 — 화면의 결과물은 마지막 적용 그대로다.
+                self._show_phase("result")
+            else:
+                self.main_stage.setCurrentIndex(3)
 
     # ══════════════════════════════════════════════
     # 테마 / 설정
@@ -1447,6 +1767,10 @@ class MainWindow(QMainWindow):
         if self._update_dialog is not None and self._update_dialog.isVisible():
             self._update_dialog.raise_()
             return
+        # '이어서 검토하기' 안내가 떠 있는 동안엔 미룬다 — 모달 위에 모달이 겹친다.
+        if self._resume_prompting:
+            QTimer.singleShot(1500, self._open_update_dialog)
+            return
         # ⚠ 교정·적용이 도는 중엔 설치를 권하지 않는다 — 앱 교체는 재시작을
         #   동반하므로 진행 중인 작업이 통째로 날아간다(updater 설계 규율).
         if self._phase in ("running", "apply_running"):
@@ -1514,6 +1838,7 @@ class MainWindow(QMainWindow):
             setattr(self, attr_name, None)
 
     def closeEvent(self, event):
+        self._flush_session_save()      # 마지막 조작까지 저장하고 닫는다
         self._cleanup_worker("_worker")
         self._cleanup_worker("_apply_worker")
         self._cleanup_worker("_extra_worker")

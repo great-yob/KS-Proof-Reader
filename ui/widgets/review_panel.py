@@ -572,16 +572,18 @@ class LightConfirmDialog(QDialog):
         btns.setContentsMargins(0, 0, 0, 0)
         btns.setSpacing(8)
         btns.addStretch()
+        # 어느 버튼으로 닫혔나 — Esc·닫기는 None으로 남는다(`choose` 참조).
+        self.choice = None
         no_btn = QPushButton(no_text)
         no_btn.setObjectName("lcdNo")
         no_btn.setCursor(Qt.PointingHandCursor)
         no_btn.setAutoDefault(False)
-        no_btn.clicked.connect(self.reject)
+        no_btn.clicked.connect(lambda: (setattr(self, "choice", "no"), self.reject()))
         yes_btn = QPushButton(yes_text)
         yes_btn.setObjectName("lcdYes")
         yes_btn.setCursor(Qt.PointingHandCursor)
         yes_btn.setDefault(True)
-        yes_btn.clicked.connect(self.accept)
+        yes_btn.clicked.connect(lambda: (setattr(self, "choice", "yes"), self.accept()))
         btns.addWidget(no_btn)
         btns.addWidget(yes_btn)
         lay.addLayout(btns)
@@ -618,6 +620,20 @@ class LightConfirmDialog(QDialog):
         ok = dlg.exec() == QDialog.Accepted
         dlg.deleteLater()
         return ok
+
+    @classmethod
+    def choose(cls, parent, title: str, message: str,
+               yes_text: str = "확인", no_text: str = "취소"):
+        """두 버튼이 **둘 다 행동**일 때 — "yes" / "no" / None(Esc·닫기 = 아무것도 안 함).
+
+        `ask`는 '아니오'와 Esc를 구분하지 않는다. 두 버튼이 '이어서 검토'와 '새로 분석'처럼
+        각자 일을 시키면 Esc가 그중 하나(새 분석 = AI 재호출)로 읽히면 안 된다.
+        """
+        dlg = cls(parent, title, message, yes_text, no_text)
+        dlg.exec()
+        choice = dlg.choice
+        dlg.deleteLater()
+        return choice
 
 
 class ReviewPanel(QWidget):
@@ -692,6 +708,7 @@ class ReviewPanel(QWidget):
         self._fam_blocked = []     # 다른 계열의 표기를 깨뜨려 손대지 않은 낱말(적용 후 보고)
         self._fam_broken = []      # 2차~: 사용자가 알고 다른 계열을 가른 낱말(적용 후 보고)
         self._fam_round = 0        # 표기 일관성 검토 회차(2단계 재검토)
+        self._fam_resume = None    # 표기 일관성 단계에 들어오기 직전 상태(검토 저장용)
         self._batch_flip = False
         # 미리보기 재렌더 병합 타이머(_refresh_preview(defer=True) 참조) — _refresh_preview가
         #   무조건 참조하므로 UI보다 먼저 만든다.
@@ -1452,6 +1469,13 @@ class ReviewPanel(QWidget):
     # ══════════════════════════════════════════════
     def load(self, corrections, options, file_name="", full_text="",
              footnote_lines=None):
+        self._reset_document(options, full_text, footnote_lines)
+        self._corrections = self._sort_by_position(corrections)
+        self._build_occurrences()
+        self._show_document()
+
+    def _reset_document(self, options, full_text, footnote_lines):
+        """새 문서를 받기 전 문서 단위 상태를 비운다(load·restore_state 공용)."""
         self._full_text = full_text or ""
         # 각주에서 실려 온 줄의 **문자 오프셋 구간**. HWP 추출은 각주 텍스트를 본문 문장
         #   한가운데에 실어 오므로(…'TLS 1.3' / [각주] / '을 적용해…'), 표시를 구분하지
@@ -1461,27 +1485,106 @@ class ReviewPanel(QWidget):
         #   ⚠ `footnote_lines`에는 **실제 각주만** 넣을 것(워커의 `note_lines`는 글상자·
         #   표·목차까지 포함하는 다른 목록이다 — 그걸 넘기면 표지가 온 문서에 붙는다).
         self._note_ranges = self._note_ranges_from_lines(footnote_lines)
-        self._corrections = self._sort_by_position(corrections)
         self._options = options
         self._active_filter = None        # 새 문서 — 카테고리 필터 초기화
         self._active_occ_id = None
         self._flip_cache.clear()          # 본문이 바뀌었다 — 등장 수 캐시 무효
+        # 이음매 그룹 캐시는 교정 목록 **길이**로만 무효화된다(_junction_members) — 새 문서의
+        #   교정 수가 우연히 같으면 이전 문서의 교정 dict를 그룹으로 돌려준다.
+        self._jmap_n = -1
+        # 표기 일관성 단계 도중에 초기화하고 새 문서를 받으면 그리드가 계열 카드 모드로 남는다.
+        if self._fam_mode:
+            self._fam_mode = False
+            self._families, self._fam_all, self._fam_cards = [], [], []
+            self._set_grid_title("교정 제안", self._CARD_STOPS)
+            self._show_chips(True)
         self._fam_round = 0               # 새 문서 — 표기 일관성 회차·결정 기록 초기화
         self._fam_word_choices, self._fam_decided = {}, {}
         self._fam_words, self._word_cards = [], []
         self._fam_blocked, self._fam_broken = [], []
+        self._fam_resume = None
         self._search_timer.stop()
         self._search_input.clear()        # 새 문서 — 이전 파일의 검색어는 무의미
         self._search_query = ""
         self._search_hits, self._search_idx = {}, -1
         self._update_search_ui()
-        self._build_occurrences()
+
+    def _show_document(self):
         self._rebuild_cards()
         self._refresh_preview(keep_scroll=False)   # 새 문서는 맨 위에서 시작
         self._emit_counts()
         # 첫 표시 시 3단 1:1:1 강제(기본 창 크기에서도) + 검색줄 높이 정렬.
         QTimer.singleShot(0, self._equalize_splitter)
         QTimer.singleShot(0, self._align_search_row)
+
+    # ── 검토 저장 · 이어서 하기 (core/review_session) ──────────
+    _OCC_TRANSIENT = ("c", "uid")   # 복원 때 다시 잇는 참조·실행마다 새로 매기는 번호
+
+    def export_state(self) -> dict:
+        """검토 상태 스냅숏 — `restore_state`가 그대로 되살린다.
+
+        ★등장(occurrence)을 **그대로** 내보낸다. 본문에서 다시 찾아 만들면 auto/by_user
+          (반복 전파 규칙)·excluded/shadowed가 처음 상태로 돌아가 사용자의 부분 결정이
+          사라진다(`_apply_unify`의 '전체 재구성 금지'와 같은 이유).
+        ⚠ 교정 목록의 순서가 곧 등장의 `ci`다 — 복원은 다시 정렬하지 않는다.
+        ⚠ 표기 일관성 단계 **도중**이면 그 단계에 들어가기 직전 상태를 내보낸다. 단계 안의
+          결정은 '적용'을 눌러야 교정에 반영되므로 반쯤 고른 계열 카드는 저장하지 않는다.
+        ⚠ 살아 있는 객체를 그대로 담아 돌려준다 — 호출부가 곧바로 직렬화할 것.
+        """
+        if self._fam_mode and self._fam_resume is not None:
+            fam = self._fam_resume
+        else:
+            fam = {"round": self._fam_round, "decided": self._fam_decided,
+                   "word_choices": self._fam_word_choices,
+                   "blocked": self._fam_blocked, "broken": self._fam_broken}
+        return {
+            "corrections": self._corrections,
+            "occ": [{k: v for k, v in o.items() if k not in self._OCC_TRANSIENT}
+                    for o in self._occ],
+            "fam": fam,
+        }
+
+    def restore_state(self, state: dict, options, full_text="", footnote_lines=None):
+        """`export_state` 스냅숏으로 검토 화면을 되살린다.
+
+        스냅숏이 본문과 맞지 않으면 **패널을 건드리기 전에** ValueError를 낸다 — 틀린 자리에
+        결정을 얹느니 저장본을 버리고 새로 분석하는 편이 낫다(호출부가 안내한다).
+        """
+        text = full_text or ""
+        cors = list(state.get("corrections") or [])
+        occs = []
+        for raw in state.get("occ") or []:
+            ci = raw.get("ci")
+            if not isinstance(ci, int) or not 0 <= ci < len(cors):
+                raise ValueError("등장의 교정 번호가 목록 밖입니다")
+            o = dict(raw)
+            p = o.get("pos")
+            orig = cors[ci].get("original", "")
+            if p is not None and text[p:p + len(orig)] != orig:
+                raise ValueError("등장 위치가 본문과 맞지 않습니다")
+            o["c"] = cors[ci]
+            occs.append(o)
+        if cors and not occs:
+            raise ValueError("등장 목록이 비어 있습니다")
+
+        self._reset_document(options, text, footnote_lines)
+        self._corrections = cors
+        self._occ = []
+        for o in occs:
+            o["uid"] = self._new_uid()
+            self._occ.append(o)
+        self._ov_pairs = None
+        self._reindex_occ()
+        fam = state.get("fam") or {}
+        self._fam_round = int(fam.get("round") or 0)
+        self._fam_decided = dict(fam.get("decided") or {})
+        self._fam_word_choices = dict(fam.get("word_choices") or {})
+        self._fam_blocked = list(fam.get("blocked") or [])
+        self._fam_broken = list(fam.get("broken") or [])
+        # 파생값(교정 상태·skip_occurrences·겹침 합성)은 등장 상태에서 다시 계산한다 —
+        #   저장된 값과 같아야 정상이고, 계산식이 하나뿐이라 어긋날 길이 없다.
+        self._derive_all()
+        self._show_document()
 
     def get_corrections(self) -> list:
         return self._corrections
@@ -2872,6 +2975,12 @@ class ReviewPanel(QWidget):
         _cf.align_proposals(fams, all_fams)
         for f in fams:
             f["choice"] = f["proposal"]
+        # 검토 저장(export_state)용 — 이 단계에 들어오기 **직전** 상태. 아래에서 회차가 오르고
+        #   가드 기록이 비워지며, 낱말 선택은 '적용'을 누르기 전에도 쌓인다.
+        self._fam_resume = {"round": self._fam_round, "decided": dict(self._fam_decided),
+                            "word_choices": dict(self._fam_word_choices),
+                            "blocked": list(self._fam_blocked),
+                            "broken": list(self._fam_broken)}
         self._families = fams
         self._fam_all = all_fams
         # 이미 결정한 계열은 다시 묻지 않는다 — 재검토 버튼이 영원히 n건을 달고 있으면

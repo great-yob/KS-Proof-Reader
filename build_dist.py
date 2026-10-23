@@ -70,6 +70,9 @@ _EXCLUDE_PATTERNS = (
     # 빌드 PC에 로그인한 사내 세션(refresh_token, DPAPI 암호화) — 배포본에 절대 금지.
     #   stage_data가 *.db만 복사해 지금은 걸리지 않지만, 규칙으로 못 박아 둔다.
     ".ks_session",
+    # 검토 저장본(core/review_session) — **고객 원고 전문**이 담긴다. stage_data는 data/의
+    #   *.db와 지정 폴더만 옮겨 지금은 걸리지 않지만, 규칙으로 못 박아 둔다.
+    "review_sessions",
 )
 
 
@@ -495,7 +498,7 @@ def verify(outdir: Path) -> bool:
         print("  ✗ 유출 금지 파일이 배포본에 포함됨:")
         for p in leaked:
             print(f"      {p}")
-    for sub in ("교정샘플", "korean-ambiguity-data"):
+    for sub in ("교정샘플", "korean-ambiguity-data", "review_sessions"):
         hits = list(outdir.rglob(sub))
         if hits:
             ok = False

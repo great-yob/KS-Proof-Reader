@@ -513,11 +513,27 @@ class ActivityPanel(QFrame):
     # 로그 API
     # ══════════════════════════════════════════════
     def log(self, msg: str, level: str = None):
+        self._ingest(time.strftime("%H:%M:%S"), msg, level)
+
+    def export_entries(self) -> list:
+        """원문 로그 그대로 — 검토 저장(core/review_session)이 함께 보관한다."""
+        return list(self._entries)
+
+    def restore_entries(self, entries):
+        """저장해 둔 원문 로그를 **당시 시각 그대로** 다시 쌓는다(화면 요약도 같은 규칙으로)."""
+        self.clear()
+        for e in entries or []:
+            try:
+                ts, lvl, msg = e
+            except (TypeError, ValueError):
+                continue
+            self._ingest(str(ts), msg, lvl)
+
+    def _ingest(self, ts: str, msg: str, level: str = None):
         msg = (msg or "").rstrip()
         if not msg:
             return
         lvl = level or _infer_level(msg)
-        ts = time.strftime("%H:%M:%S")
         self._entries.append((ts, lvl, msg))      # 원문 보존(완료 보고서·디버깅용)
 
         shown = _condense(msg, lvl)

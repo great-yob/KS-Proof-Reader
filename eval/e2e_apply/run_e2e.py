@@ -9,8 +9,11 @@ eval/e2e_apply/run_e2e.py — 적용 경로 실기 E2E (실제 MainWindow + 실�
   ① 분석(AI 제외 — 결정론 계층만이라 런마다 같은 카드) → ② 검토: **진짜 `_set_status`**로
   4장마다 1장 거절(팝업만 '예'로 대체) → ③ 표기 일관성 단계 → ④ 교정본 적용 →
   ⑤ **교정본 재추출 대조** — 기대 문서(원문에서 '보이는 수락 등장'만 카드 값으로 바꾼 것)와
-  한 글자라도 다르면 실패 → ⑥ 결과물 추가(빨간색+메모 · 메모본 · PDF) → ⑦ 테마 토글 →
-  ⑧ 업데이트 대화상자(미루면 받은 파일 삭제 · 적용하면 보존).
+  한 글자라도 다르면 실패 → ⑥ 결과물 추가(빨간색+메모 · 메모본 · PDF) → ⑥.5 **다시 적용**
+  (완료 뒤 레일 '검토' → 수락 3장 거절 → 다시 적용 → 덮어쓴 교정본을 새 결정의 기대 문서와
+  대조 — 절대 판정) → ⑦ 테마 토글 → ⑧ 업데이트 대화상자(미루면 받은 파일 삭제 · 적용하면 보존).
+  검토 저장본(core/review_session)은 작업 폴더 안에만 쓴다 — 개발자의 실제 저장본과 섞이지 않고
+  '이어서 검토?' 안내가 뜨지 않는다.
 
 판정:
   · 절대 실패 — 미처리 예외 · 시간 초과 · 교정본 대조 불일치 · 업데이트 대화상자 검사
@@ -115,6 +118,15 @@ def _drive(src: str, work: str, m: dict) -> None:
     mw.MainWindow._start_session_restore = lambda self: None
     mw.MainWindow._start_update_check = lambda self: None
     mw.MainWindow._start_sync = lambda self, mode: None
+    # 검토 저장본(core/review_session)은 작업 폴더 안에만 — 개발자의 실제 저장본을 읽지도
+    #   덮지도 않는다. 매 실행이 빈 폴더라 '이어서 검토?' 안내가 뜨지 않고 늘 새로 분석한다
+    #   (같은 원고 사본을 매번 쓰므로, 공유 폴더면 두 번째 실행부터 안내 모달에서 멈춘다).
+    from core import review_session
+    _sess_dir = os.path.join(work, "_review_sessions")
+    os.makedirs(_sess_dir, exist_ok=True)
+    from pathlib import Path
+    review_session.sessions_dir = lambda: Path(_sess_dir)
+    mw.MainWindow._offer_last_session = lambda self: None
     # 모달 자동 응답 — 사람이 '예'를 누른 것과 같은 경로를 탄다
     rpmod.LightConfirmDialog.ask = classmethod(lambda cls, *a, **k: True)
     rpmod.ReviewPanel._warn_popup = lambda self, *a, **k: None
@@ -240,6 +252,62 @@ def _drive(src: str, work: str, m: dict) -> None:
         for key in ("memoed", "memo_blocked", "annotated", "pdf_missing", "unmarked"):
             m[f"{mode}.{key}"] = ex.get(key)
 
+    # ⑥.5 다시 적용 — 완료 뒤 레일 '검토' → 수락 카드 몇 장을 거절로 → 다시 적용 →
+    #   덮어쓴 교정본을 **새 결정**의 기대 문서와 대조(사용자 요구 2026-10-23).
+    w._on_rail_click("review")
+    pump(0.8)
+    m["reapply_phase_ok"] = (w._phase == "review"
+                             and "다시 적용" in w.footer._primary.text())
+    flipped = 0
+    for occ in list(rp._occ):
+        if flipped >= 3:
+            break
+        c = occ["c"]
+        # 통일·이음매 카드는 한 장이 여러 낱말을 움직인다 — 여기선 낱장 결정만 뒤집는다.
+        if (occ.get("shadowed") or occ["status"] != "accepted" or occ.get("pos") is None
+                or c.get("consistency_flip") or c.get("junction_group")
+                or c.get("source") == "dict_flag"):
+            continue
+        card = card_for(occ)
+        if card is not None:
+            rp._set_status(occ, card, "rejected")
+            pump(0.05)
+            flipped += 1
+    pump(0.5)
+    m["reapply_changed"] = w._decisions_changed()
+    w._on_primary()
+    pump(0.8)
+    if rp.in_consistency_mode():         # 뒤집은 결정으로 계열이 새로 갈렸으면 ③과 같이
+        for f in list(rp._families):
+            rp._set_family_status(f, "accepted")
+        for wd in list(getattr(rp, "_fam_words", [])):
+            d = "spaced" if wd.get("n_spaced", 0) >= wd.get("n_joined", 0) else "joined"
+            rp._set_word_choice(wd, d)
+        w._on_primary()
+        pump(1.0)
+        w._on_primary()
+    if wait(lambda: w._phase == "result"
+            and not (w._apply_worker is not None and w._apply_worker.isRunning()),
+            900, "다시 적용"):
+        pump(1.5)
+        r2 = w._result or {}
+        exp2, _ov2, _ch2 = _expected_text(w._extracted_text, w._applied_occ_rows or [],
+                                          w._applied_corrections or [], occurrence_skipped)
+        hwp2 = r2.get("hwp_path") or ""
+        if hwp2 and os.path.isfile(hwp2):
+            ed = HwpEditor(hwp2, logger=lambda *_: None)
+            try:
+                ed.open()
+                actual2 = unicodedata.normalize("NFC", ed.get_text())
+            finally:
+                try:
+                    ed.close()
+                except Exception:
+                    pass
+            m["reapply_diff"], m["reapply_lines"] = _diff_count(exp2, actual2)
+        else:
+            m["reapply_diff"], m["reapply_lines"] = -1, 0
+
     # ⑦ 테마 토글(전 위젯 refresh_theme)
     w._toggle_theme()
     pump(1.0)
@@ -319,6 +387,11 @@ def _diff_count(expected: str, actual: str):
 # ══════════════════════════════════════════════════════
 # ▌판정 — 부모 프로세스
 # ══════════════════════════════════════════════════════
+# 기준선과 비교하지 않는 키 — 실행 정보이거나, 그 자체로 절대 판정하는 값.
+_NO_BASELINE = ("timeouts", "exceptions", "exception_heads", "secs", "update_dialog_ok",
+                "reapply_phase_ok", "reapply_changed", "reapply_diff", "reapply_lines")
+
+
 def judge(m: dict, base: dict | None):
     fails, changes = [], []
     if m.get("exceptions"):
@@ -336,13 +409,22 @@ def judge(m: dict, base: dict | None):
         fails.append(f"검토 후 대기 카드 {m['pending']}장이 남았다")
     if m.get("update_dialog_ok") is False:
         fails.append("업데이트 대화상자: 미루기→삭제 / 적용→보존 검사 실패")
-    keys = [k for k in m if k not in ("timeouts", "exceptions", "exception_heads", "secs",
-                                      "update_dialog_ok")]
+    # 다시 적용(⑥.5) — 절대 판정이라 기준선 비교에서는 뺀다(_NO_BASELINE).
+    if m.get("reapply_phase_ok") is False:
+        fails.append("완료 뒤 레일 '검토'가 검토 단계('다시 적용')로 돌아가지 않았다")
+    if not m.get("reapply_changed"):
+        fails.append("다시 적용: 뒤집은 결정이 0곳 — 재적용 대조가 아무것도 검사하지 않았다")
+    if m.get("reapply_diff") is None:
+        fails.append("다시 적용 대조를 못 했다")
+    elif m["reapply_diff"]:
+        fails.append(f"다시 적용한 교정본이 바뀐 결정과 다르다: {m['reapply_diff']}구간 · "
+                     f"{m['reapply_lines']}줄")
+    keys = [k for k in m if k not in _NO_BASELINE]
     if base is None:
         changes.append("기준선 없음 — 확인 후 --save-baseline")
     else:
         for k in sorted(set(keys) | set(base)):
-            if k in ("timeouts", "exceptions", "exception_heads", "secs", "update_dialog_ok"):
+            if k in _NO_BASELINE:
                 continue
             o, n = base.get(k), m.get(k)
             if o == n:

@@ -284,6 +284,10 @@ class StepperRail(QFrame):
             self._errors.add(key)
             self._apply_state(key, "error")
 
+    def clear_error(self, key: str):
+        """오류 표시만 거둔다 — 상태는 다음 set_phase/complete_all이 다시 칠한다."""
+        self._errors.discard(key)
+
     def complete_all(self):
         """작업 종료 시 이전 단계들은 완료 상태로, '완료' 단계는 활성 상태로 둔다."""
         self._phase = "done"
