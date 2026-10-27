@@ -398,6 +398,11 @@ CREATE TABLE snapshots (
 - **★검증(실측):**
   - **RLS(실사용자 임포nate, 롤백):** 6/6 PASS — 일반직원 본인 INSERT 허용·타인 user_id INSERT 거부·candidates
     가시 0행·snapshots SELECT 허용; admin은 is_curator=true·candidates SELECT 허용.
+    ⚠ 위 INSERT 검증은 평범한 INSERT였다 — 실제 push 는 `ON CONFLICT (event_id) DO NOTHING`이라 **SELECT
+    정책도 새 행을 통과시켜야** 하는데 SELECT 가 큐레이터 전용이어서, 기여자 업로드가 전부 42501(403)로
+    막혀 있었다(2026-10-27 발견, 서버엔 관리자 이벤트만 쌓임). `userdict_events_select_own`(본인 행 SELECT)
+    으로 해결 — `server/supabase/migrations/20261027_userdict_events_select_own.sql`. RLS 검증은 클라이언트가
+    보내는 **그 모양의 쿼리**로 할 것.
   - **집계+스냅샷 파이프라인(합성표 → 롤백):** 7/7 PASS — 3수락→pending(agr 1.0)·3수락1거절→context_dependent·
     2수락(<K)→후보없음·3거절→exception(term=original)·active 승인 후 build→ver1/pairs1/exc1/payload nonstd=플랫홈.
   - **클라이언트(graceful·monkeypatch·라이브):** push 2건 정확 payload(user_id/org_id 없음·event_id 있음·
