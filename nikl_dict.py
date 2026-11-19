@@ -396,6 +396,23 @@ def is_unattested_loanword_norm(key: str, norm: str) -> bool:
     return not _is_exact_headword(norm)
 
 
+def is_loanword_headword(word: str) -> bool:
+    """`word`가 **외래어로만** 등재된 표제어인가(고유어·한자어·혼종어 동형이 있으면 False).
+
+    josa_rules.find_number_josa가 '시즌 3를'(쓰리를)처럼 앞말과 함께 숫자를 영어로 읽을 수 있는
+    자리를 가르는 데 쓴다. '그림'은 고유어·외래어(grim) 동형이라 외래어로 보지 않는다.
+    """
+    conn = _get_conn()
+    if conn is None or not word:
+        return False
+    try:
+        types = {t for (t,) in conn.execute(
+            "SELECT DISTINCT word_type FROM words WHERE word=?", (word,)).fetchall()}
+    except sqlite3.Error:
+        return False
+    return "외래어" in types and not (types & {"고유어", "한자어", "혼종어"})
+
+
 def is_exact_noun_headword(word: str) -> bool:
     """`word`가 pos='명사'/'대명사'로 **정확히** 등재된 표제어인가(조사 stem 폴백 없음).
 

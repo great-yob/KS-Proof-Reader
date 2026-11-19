@@ -1348,6 +1348,68 @@ def fix_paren_josa_agreement(ai_list: list, document_text: str, logger=None) -> 
 
 
 # ══════════════════════════════════════════════════════════
+# ▌닫는 부호 안으로 옮긴 조사 — 부호 위치 복원 (드롭 아님)
+# ══════════════════════════════════════════════════════════
+# AI가 조사를 고치면서 **닫는 괄호·따옴표 안으로** 옮긴다(2026-11-19 합성 문서 실측 — seed
+#   결정론이라 매번 같다): '(표 2)을' → '(표 2를)'. 조사 판단(을→를)은 AI 몫이지만 괄호를
+#   조사 뒤로 미는 것은 저자의 괄호 내용을 바꾸는 오교정이고, high라 자동 적용 대상이었다.
+#   조사가 괄호 안으로 들어가야 맞는 경우는 없다 — 반대 방향('신설(변경과) 관련된'→'신설(변경)과',
+#   코퍼스 실측)이 저자 오류를 바로잡는 정상 교정이라 **이 방향만** 다룬다.
+# 처리: 부호를 원래 자리(조사 앞)로 되돌리고 AI의 조사 선택은 둔다 → '(표 2)를'. 그러면 AI가
+#   처음부터 괄호를 지켜 낸 카드와 같아져, 뒤의 fix_paren_josa_agreement(괄호 앞 체언 호응 ·
+#   번호 라벨은 AI 판단 존중)가 평소처럼 처리한다. ⚠ 반드시 그 함수 **앞**에서 부를 것.
+#   복원하니 원문과 같아지면(AI가 부호 위치만 옮김) 드롭한다.
+_MOVE_CLOSERS = frozenset(")）]〕】}’”」』》〉\"'")
+
+
+def restore_closer_outside_josa(ai_list: list, logger=None) -> list:
+    """AI가 닫는 부호 안으로 옮긴 조사를 부호 밖으로 되돌린다(제자리 수정 + 무의미 카드 드롭).
+
+    발동: ai_typo/ai_polish이고 원문→교정문 단일 변경 구간이 정확히 `닫는부호+조사` →
+    `조사'+같은 닫는부호`(조사는 이/가·을/를·은/는·과/와·로/으로)이며, 뒤가 한글이 아닐 것.
+    """
+    if not ai_list:
+        return ai_list
+    out, fixed_n, dropped = [], 0, 0
+    for c in ai_list:
+        o, cr = c.original or "", c.corrected or ""
+        d = _single_diff(o, cr) if (c.source in ("ai_typo", "ai_polish") and o and cr) else None
+        if not d:
+            out.append(c)
+            continue
+        prefix, old, new, suffix = d
+        if not (len(old) >= 2 and len(new) >= 2 and old[0] in _MOVE_CLOSERS and new[-1] == old[0]
+                and old[1:] in _SWAP_JOSA and new[:-1] in _SWAP_JOSA
+                and not (suffix and "가" <= suffix[0] <= "힣")):
+            out.append(c)
+            continue
+        josa = new[:-1]
+        # 따옴표·낫표('‘지연’을'·'『토지』를') 뒤 조사는 그 안 마지막 글자에 붙는다 — 괄호와 달리 뒤에
+        #   받침 보정 단계(fix_paren_josa_agreement는 괄호만)가 없으니 여기서 맞춘다. 괄호는 호응
+        #   대상(괄호 앞 체언 · 번호 라벨)을 그 함수가 가리므로 손대지 않는다.
+        if old[0] not in _CLOSE_TO_OPEN and prefix and "가" <= prefix[-1] <= "힣":
+            from core.josa_rules import reconcile_josa
+            if josa == "로":
+                josa = "로" if (ord(prefix[-1]) - 0xAC00) % 28 in (0, 8) else "으로"
+            else:
+                josa = reconcile_josa(prefix[-1], josa)
+        new_cr = prefix + old[0] + josa + suffix
+        if new_cr == o:
+            dropped += 1        # 조사는 그대로, 부호 위치만 옮긴 교정 — 교정할 것이 없다
+            continue
+        c.corrected = new_cr
+        c.reason = ((c.reason or "").rstrip()
+                    + f" (부호 위치 복원 — 조사 '{josa}'는 닫는 '{old[0]}' 밖에 둔다)")
+        fixed_n += 1
+        out.append(c)
+    if logger and fixed_n:
+        logger(f"  → 닫는 부호 안으로 옮긴 조사 위치 복원 {fixed_n}건 (저자 괄호·따옴표 내용 보존)")
+    if logger and dropped:
+        logger(f"  → 부호 위치만 옮긴 AI 교정 {dropped}건 제외 (조사를 닫는 부호 안으로 이동)")
+    return out
+
+
+# ══════════════════════════════════════════════════════════
 # ▌모호(헤지) 사유 AI 교정 강등 — 확신 없는 판단은 자동 적용 금지
 # ══════════════════════════════════════════════════════════
 # AI가 스스로 확신하지 못하는 교정은 reason에 헤지 표현을 남긴다:

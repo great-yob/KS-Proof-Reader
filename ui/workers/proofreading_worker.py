@@ -521,6 +521,9 @@ class ProofreadingWorker(QThread):
             # 괄호 뒤 조사 받침 호응 보정 — AI가 조사 교체(격 판단)는 맞게 잡고 받침 형태를
             #   틀린 경우('가시성(visibility)가'→AI '…를') 괄호 앞 체언(가시성, 받침 ㅇ)에
             #   호응시켜 '을'로 보정(find_paren_josa와 동일 원칙의 결정론 fix-up, 2026-07-06).
+            #   ⚠ 그 앞에서 AI가 닫는 부호 **안으로** 옮긴 조사('(표 2)을'→'(표 2를)')를 부호 밖으로
+            #   되돌린다(2026-11-19) — 되돌려야 아래 보정이 그 카드를 '괄호 뒤 조사 교체'로 알아본다.
+            ai_list = ai_guards.restore_closer_outside_josa(ai_list, logger=log)
             ai_list = ai_guards.fix_paren_josa_agreement(ai_list, text, logger=log)
             # 모호(헤지) 사유 강등 — AI가 "…로 보이나 … 권장함"처럼 확신 없는 판단을 남긴
             #   교정은 무조건 low 검수 카드로(자동 적용 금지, 사용자 지시 2026-07-03).
@@ -952,6 +955,26 @@ class ProofreadingWorker(QThread):
                 from core import josa_rules as _jr
                 existing = {c.original for c in merged}
                 net = []
+                # ★AI 카드가 결정론과 **같은 교정**(원문·교정문 모두 같음)이면 그 자리는 결정론 카드가
+                #   맡는다(2026-11-19) — 건너뛰지 않고 그 AI 카드를 결정론 카드로 바꿔 끼운다.
+                #   받침이 어긋난 조사는 kiwi가 조사로 못 읽어(1글자 NNG) ㉕가 AI의 같은 교정을 '문법
+                #   재구성'으로 low 강등한다. ㉕ 주석대로 받침 호응은 결정론 몫인데, 예전엔 원문이 이미
+                #   있다는 이유로 결정론이 빠져 **AI를 켜면 high가 low로 떨어졌다**(코퍼스: 운영비을·
+                #   비행부대을·사례관리팀와 — AI 끔 high / AI 켬 low). 교정이 **다르면** 지금처럼 AI가 먼저다.
+                _ai_same = {}
+                for _i, _c in enumerate(merged):
+                    if _c.source == "ai_typo":
+                        _ai_same.setdefault((_c.original, _c.corrected), _i)
+                _taken = set()
+
+                def _take_over(orig, fixed):
+                    """AI가 같은 교정을 냈으면 그 카드를 결정론이 맡는다(True) — 끝에서 지운다."""
+                    i = _ai_same.get((orig, fixed))
+                    if i is None or i in _taken:
+                        return False
+                    _taken.add(i)
+                    return True
+
                 # AI(ai_typo)가 같은 조사 지점을 이미 교정했으면 스킵 — AI는 격 변경
                 #   ('가'→'을')까지 판단하고 받침 형태는 fix_paren_josa_agreement가 이미
                 #   보정했으므로, 받침만 맞추는 이 카드가 겹치면 충돌(검수 겹침 shadow·
@@ -964,10 +987,11 @@ class ProofreadingWorker(QThread):
                         if _p >= 0:
                             _ai_spans.append((_p, _p + len(_c.original)))
                 for orig, fixed in _jr.find_paren_josa(text):
-                    if orig in existing:
+                    _took = _take_over(orig, fixed)
+                    if orig in existing and not _took:
                         continue
                     _p = text.find(orig)
-                    if _p >= 0 and _ai_spans:
+                    if not _took and _p >= 0 and _ai_spans:
                         _j = _p + len(orig) - 1     # 조사(마지막 글자) 위치
                         if any(s <= _j < e for s, e in _ai_spans):
                             continue
@@ -983,7 +1007,7 @@ class ProofreadingWorker(QThread):
                 #   kiwi 가드(앞 체언·어미 제외)로 '있는'·'가을' 등 거짓양성을 막는다(실문서 0 검증).
                 net_bj_review = []
                 for orig, fixed in _jr.find_batchim_josa(text):
-                    if orig in existing:
+                    if orig in existing and not _take_over(orig, fixed):
                         continue
                     # '과→와' 방향만 검수 카드 — 받침 없는 체언 뒤의 '과'는 오탈자('항공유과 비교')와
                     #   낱말 끝음절 '과(課·科)'(문장 속 부서명 '디지털정부과 담당자')가 같은 모양이고,
@@ -1007,12 +1031,48 @@ class ProofreadingWorker(QThread):
                         category="맞춤법", confidence="high",
                     ))
                     existing.add(orig)
+                # 숫자 뒤 조사 — '1를'→'1을'(숫자의 한자어 읽음에 호응, 2026-11-19 사용자 피드백).
+                #   find_batchim_josa는 한글 음절의 받침만 읽어 숫자 뒤를 못 본다. AI가 그 조사 자리를
+                #   이미 다뤘으면 건너뛴다(괄호 조사와 같은 원칙 — 등장은 부분 문자열이라 **모든** 등장).
+                #   앞말이 외래어라 영어로 읽힐 수 있고 받침이 갈리면('시즌 3를') low 검수(사용자 결정).
+                _ai_cover = set()
+                for _c in merged:
+                    if _c.source == "ai_typo" and _c.original:
+                        _p = text.find(_c.original)
+                        while _p >= 0:
+                            _ai_cover.update(range(_p, _p + len(_c.original)))
+                            _p = text.find(_c.original, _p + 1)
+                net_num, net_num_review = [], []
+                for orig, fixed, conf, sino, en_off in _jr.find_number_josa(
+                        text, covered_fn=_ai_cover.__contains__):
+                    if orig in existing and not _take_over(orig, fixed):
+                        continue
+                    _jong = _jr._jongseong(sino[-1])
+                    _bat = ("받침 없음" if _jong == 0 else "ㄹ받침" if _jong == 8 else "받침 있음")
+                    _new = next((j for j in ("으로", "로", "은", "는", "이", "가", "을", "를", "과", "와")
+                                 if fixed.endswith(j)), "")      # 표시용 — 교정 조사
+                    if conf == "low":
+                        net_num_review.append(Correction(
+                            original=orig, corrected=fixed,
+                            reason=f"[검수] 숫자 읽음에 조사를 호응 ('…{sino}' {_bat}→{_new})\n"
+                                   f"— 앞말과 함께 영어로 읽는다면('…{en_off}') 그대로 둡니다",
+                            source="dict", color=HL_DICT,
+                            category="맞춤법", confidence="low",
+                        ))
+                    else:
+                        net_num.append(Correction(
+                            original=orig, corrected=fixed,
+                            reason=f"[맞춤법] 숫자 읽음에 조사를 호응 ('…{sino}' {_bat}→{_new})",
+                            source="dict", color=HL_DICT,
+                            category="맞춤법", confidence="high",
+                        ))
+                    existing.add(orig)
                 # 단독으로 떨어진 조사 붙이기 — '수요 를'→'수요를', '세종 으로'→'세종으로'.
                 #   '을/를/으로'는 단독 단어가 될 수 없어 떨어져 있으면 100% 붙여야 할
                 #   조사다(미탐 보고 2회 — 수요 를 2026-06-30, 세종 으로 2026-07-03).
                 #   '으로'는 앞 체언 받침에 호응(학교 으로→학교로). 결정론 → high.
                 for orig, fixed in _jr.find_orphan_josa(text):
-                    if orig in existing:
+                    if orig in existing and not _take_over(orig, fixed):
                         continue
                     net.append(Correction(
                         original=orig, corrected=fixed,
@@ -1026,7 +1086,7 @@ class ProofreadingWorker(QThread):
                 #   결정론 백스톱(2026-07-02). 삭제 교정이라 저신뢰 '검수 카드'로만 노출.
                 net_dup = []
                 for orig, fixed in _jr.find_duplicate_comitative_josa(text):
-                    if orig in existing:
+                    if orig in existing and not _take_over(orig, fixed):
                         continue
                     net_dup.append(Correction(
                         original=orig, corrected=fixed,
@@ -1036,12 +1096,24 @@ class ProofreadingWorker(QThread):
                         category="맞춤법", confidence="low",
                     ))
                     existing.add(orig)
+                # 결정론이 맡은 AI 카드를 지운다 — ⚠ 인덱스는 이 단계 시작 때 잡은 것이라 아래
+                #   extend **전에** 지울 것(이 단계는 그 사이 merged를 바꾸지 않는다).
+                if _taken:
+                    merged[:] = [c for i, c in enumerate(merged) if i not in _taken]
+                    log(f"  → 결정론 조사 규칙과 같은 AI 교정 {len(_taken)}건 규칙 카드로 대체 "
+                        "(AI를 끈 실행과 같은 카드)")
                 if net:
                     merged.extend(net)
                     det_auto.append(("받침조사", len(net)))
                 if net_bj_review:
                     merged.extend(net_bj_review)
                     det_review.append(("받침조사", len(net_bj_review)))
+                if net_num:
+                    merged.extend(net_num)
+                    det_auto.append(("숫자조사", len(net_num)))
+                if net_num_review:
+                    merged.extend(net_num_review)
+                    det_review.append(("숫자조사", len(net_num_review)))
                 if net_dup:
                     merged.extend(net_dup)
                     det_review.append(("조사중복", len(net_dup)))

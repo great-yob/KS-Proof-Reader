@@ -240,6 +240,217 @@ def find_batchim_josa(text: str) -> list:
     return out
 
 
+# ── 숫자 뒤 받침 호응 조사 — '1를'→'1을'(사용자 피드백 2026-11-19) ─────────────────────
+#   아라비아 숫자는 한글 음절이 아니라 find_batchim_josa가 볼 수 없다(한글 2자 미만 어절 제외 · 앞
+#   형태소 SN은 체언이 아님 · 받침은 한글 음절에서만 읽음). kiwi는 '1를'을 1/SN+를/JKO로 바르게 읽지만
+#   읽음('일')을 모르므로, 여기서 숫자를 **한자어로 읽은 끝 음절**로 받침을 정한다.
+#   실측(2026-11-19): 합성 18건에서 결정론 0/18 · AI 13/18(2을·9을·1는·3가·2과는 AI도 미탐).
+#   실원고 20편의 괄호 없는 숫자+조사 604곳 중 한자어 읽기와 어긋난 9곳은 진짜 오류 1곳('…%으로')뿐이고,
+#   나머지는 영어 읽기('Level 3는'·'Veo 3를' = 쓰리) · 분수('2/3를' = 3분의 2) · 규격 번호('D7566를')였다
+#   — 아래 문맥 가드가 그 8곳을 모두 건너뛴다.
+#   사용자 결정(2026-11-19): 일반 문맥은 high · 앞말이 외래어라 영어 읽기와 받침이 갈리면 low 검수.
+#   ⚠ 괄호 뒤 조사('(표 2)을'·'(2024)는')는 다루지 않는다 — 괄호 앞 체언 호응·번호 라벨은 find_paren_josa의
+#     기존 결정(번호 라벨은 저자 표기 존중)이 맡는다. 정규식이 ')' 뒤를 아예 잡지 않는다.
+_NUM_JOSA_RE = re.compile(
+    r"(?<![\d.,])(\d[\d,]*(?:\.\d+)?)([%％]?)(으로|로|은|는|이|가|을|를|과|와)(?![가-힣])")
+_SINO_DIGIT = "영일이삼사오육칠팔구"
+_SINO_ZERO_TAIL = {1: "십", 2: "백", 3: "천"}           # 끝 0의 개수(1~3) → 끝 음절
+_SINO_GROUP = {1: "만", 2: "억", 3: "조", 4: "경"}       # 끝 0이 4개 이상 → 네 자리 묶음 단위
+_EN_DIGIT = ("제로", "원", "투", "쓰리", "포", "파이브", "식스", "세븐", "에잇", "나인")
+_EN_TEEN = {10: "텐", 11: "일레븐", 12: "트웰브"}         # 13~19는 '…틴'
+# 숫자 묶음 안의 구분 기호 — 'Level 2･3는'·'GPT-4를'·'3-4를'에서 문맥을 묶음 **앞**에서 읽기 위해 건너뛴다.
+_NUM_GROUP_SEP = "·･ㆍ~∼-–/:"
+# 묶음에 이 기호가 있으면 읽음이 달라진다 — 분수 '2/3'(3분의 2)·비율·시각. 건너뛴다.
+_NUM_SKIP_SEP = "/:"
+_CLOSERS = ")]}\"'’”」』》〉>"
+
+
+def _sino_tail(num: str):
+    """숫자 표기의 한자어 읽음 끝 음절. 판정 불가면 None.
+
+    '1'→일 · '20'→십 · '1,000'→천 · '300000'→만(삼십만) · '3.5'→오(삼 점 오) · '0'→영.
+    """
+    n = num.replace(",", "")
+    if "." in n:
+        frac = n.split(".", 1)[1]
+        return _SINO_DIGIT[int(frac[-1])] if frac.isdigit() else None
+    if not n.isdigit():
+        return None
+    s = n.lstrip("0")
+    if not s:
+        return "영"
+    k = len(s) - len(s.rstrip("0"))
+    if k == 0:
+        return _SINO_DIGIT[int(s[-1])]
+    if k < 4:
+        return _SINO_ZERO_TAIL[k]
+    return _SINO_GROUP.get(k // 4)
+
+
+def _english_tails(num: str) -> set:
+    """숫자를 영어로 읽을 때의 끝 음절 후보 — 수 읽기('thirteen'→틴)와 한 자리씩 읽기('쓰리').
+    판정 불가면 빈 집합."""
+    n = num.replace(",", "")
+    if "." in n:
+        frac = n.split(".", 1)[1]
+        return {_EN_DIGIT[int(frac[-1])]} if frac.isdigit() else set()
+    if not n.isdigit():
+        return set()
+    out = {_EN_DIGIT[int(n[-1])]}                  # 한 자리씩('D7566' = 세븐 파이브 식스 식스)
+    v = int(n)
+    r = v % 100
+    if v == 0:
+        out.add("제로")
+    elif 10 <= r <= 12:
+        out.add(_EN_TEEN[r])
+    elif 13 <= r <= 19:
+        out.add("틴")
+    elif r % 10:
+        out.add(_EN_DIGIT[r % 10])
+    elif r:
+        out.add("티")                              # 트웬티·서티…
+    elif v % 1000:
+        out.add("헌드레드")
+    elif v % 1_000_000:
+        out.add("사우전드")
+    else:
+        out.add("밀리언" if v % 1_000_000_000 else "빌리언")
+    return out
+
+
+def _is_latin(ch: str) -> bool:
+    return bool(ch) and ch.isascii() and ch.isalpha()
+
+
+def _num_context(text: str, s: int):
+    """숫자 시작 위치 s의 문맥 → (종류, 앞말, 묶음 시작).
+
+    종류: 'skip'(분수·비율·시각 · 라틴에 바로 붙은 식별자 name2·A4) · 'latin'(GPT-4 · Level 3) ·
+          'attached'(한글에 붙음 — 표1·시즌3) · 'word'(띄어 쓴 한글 낱말 뒤) · 'plain'(그 밖).
+    앞말: attached/word일 때 그 한글 낱말(외래어 판정용).
+    """
+    g = s
+    while g > 0 and (text[g - 1].isdigit() or text[g - 1] in _NUM_GROUP_SEP or text[g - 1] in ".,"):
+        g -= 1
+    if any(ch in _NUM_SKIP_SEP for ch in text[g:s]):
+        return "skip", "", g
+    pre = text[g - 1] if g > 0 else ""
+    if _is_latin(pre):
+        # 라틴 글자에 **바로 붙은** 숫자('name2'·'A4'·'S24')는 식별자다 — 숫자를 어떻게 읽는지도, 조사가
+        #   무엇에 붙는지도 모른다(2026-11-19 Phase E: 익명화 자리표시자 'name2이'(사람 이름 자리)에 발화).
+        #   '-'·공백으로 떨어진 'GPT-4'·'Windows 7'만 라틴 문맥으로 본다.
+        return ("skip" if g == s else "latin"), "", g
+    if "가" <= pre <= "힣":
+        r = g
+        while r > 0 and "가" <= text[r - 1] <= "힣":
+            r -= 1
+        return "attached", text[r:g], g
+    if pre == " ":
+        b = g - 1
+        while b > 0 and not text[b - 1].isspace():
+            b -= 1
+        prev = text[b:g - 1].rstrip(_CLOSERS)
+        if prev and _is_latin(prev[-1]):
+            return "latin", "", g
+        r = len(prev)
+        while r > 0 and "가" <= prev[r - 1] <= "힣":
+            r -= 1
+        return "word", prev[r:], g
+    return "plain", "", g
+
+
+def _default_loanword_fn(word: str) -> bool:
+    try:
+        import nikl_dict
+        return nikl_dict.is_loanword_headword(word)
+    except Exception:
+        return False
+
+
+def find_number_josa(text: str, loanword_fn=None, covered_fn=None) -> list:
+    """아라비아 숫자 뒤 조사를 숫자의 **한자어 읽음**에 호응시킨 후보('1를'→'1을' · '3로'→'3으로').
+
+    loanword_fn(word) → 앞말이 외래어 표제어인가(기본: nikl_dict). covered_fn(josa_pos) → 그 조사
+    자리를 다른 카드(AI)가 이미 다루는가 — True면 그 자리는 이 규칙의 몫이 아니다.
+
+    신뢰도:
+      · high — 일반 문맥. 라틴 낱말 뒤('GPT-4을')는 영어 읽기와 받침이 **같을 때만**(아니면 건너뜀).
+      · low  — 앞말이 외래어 표제어('시즌 3를')이고 영어 읽기('쓰리')와 받침이 갈릴 때(사용자 결정).
+    건너뜀: 분수·비율·시각('2/3를') · 한글에 붙은 '가·과·로'(종로3가·제3과 — 낱말 끝음절일 수 있다) ·
+            라틴 글자에 바로 붙은 식별자('name2이'·'A4을' — 읽음도 조사의 짝도 불확실).
+
+    ★앵커: 카드는 원문을 본문에서 **부분 문자열로** 찾아 등장을 만든다(review_panel). 그래서 숫자+조사만
+      앵커로 쓰면 같은 원고의 건너뛴 자리('Veo 3를')·조사가 아닌 자리('2이상')·AI가 다룬 자리까지
+      바뀐다. 앵커의 **모든** 부분 문자열 등장이 같은 교정·같은 신뢰도의 발화 자리일 때만 쓰고, 아니면
+      붙은 앞말 → 앞 어절까지 넓힌다. 끝내 유일하지 않으면 내지 않는다.
+
+    반환: [(original, corrected, confidence, 한자어 읽음 끝('천'·'퍼센트'), 받침이 갈리는 영어 읽기
+          ('쓰리' — 갈리지 않으면 '')), …] (등장 순, 중복 제거).
+    """
+    if not text:
+        return []
+    is_loan = loanword_fn or _default_loanword_fn
+    fires = []          # (숫자 시작, 조사 끝, 조사, 교정 조사, 신뢰도, 한자어 끝, 영어 끝)
+    recs = {}           # 조사 끝 위치 → (조사, 교정 조사, 신뢰도)
+    for m in _NUM_JOSA_RE.finditer(text):
+        num, pct, josa = m.group(1), m.group(2), m.group(3)
+        sino = "트" if pct else _sino_tail(num)          # 퍼센트·프로 — 받침 없음
+        if sino is None:
+            continue
+        want = _paren_josa_form(sino, josa)
+        if want is None or want == josa:
+            continue
+        ctx, prev, _g = _num_context(text, m.start(1))
+        if ctx == "skip":
+            continue
+        if ctx == "attached" and josa in ("가", "과", "로"):
+            continue
+        en = {"트"} if pct else _english_tails(num)
+        agree = bool(en) and all(_paren_josa_form(t[-1], josa) == want for t in en)
+        conf = "high"
+        if ctx == "latin":
+            if not agree:
+                continue
+        elif ctx in ("word", "attached") and not agree and prev and is_loan(prev):
+            conf = "low"
+        if covered_fn is not None and covered_fn(m.start(3)):
+            continue
+        # 사유 표시용 — 한자어 끝 음절('퍼센트')과, low일 때 받침이 갈리는 영어 읽기('쓰리').
+        disp = "퍼센트" if pct else sino
+        en_off = "/".join(sorted(t for t in en if _paren_josa_form(t[-1], josa) != want))
+        fires.append((m.start(1), m.end(3), josa, want, conf, disp, en_off))
+        recs[m.end(3)] = (josa, want, conf)
+
+    out, done, emitted = [], set(), set()
+    for s, e, josa, want, conf, disp, en_off in fires:
+        if e in done:
+            continue
+        starts = [s]
+        a = s
+        while a > 0 and not text[a - 1].isspace():
+            a -= 1
+        if a < s:
+            starts.append(a)
+        if a > 1 and text[a - 1] == " " and not text[a - 2].isspace():
+            b = a - 1
+            while b > 0 and not text[b - 1].isspace():
+                b -= 1
+            starts.append(b)
+        for st in starts:
+            anchor = text[st:e]
+            ends, i = [], text.find(anchor)
+            while i >= 0:
+                ends.append(i + len(anchor))
+                i = text.find(anchor, i + 1)
+            if all(recs.get(q) == (josa, want, conf) for q in ends):
+                if anchor not in emitted:
+                    emitted.add(anchor)
+                    out.append((anchor, anchor[:-len(josa)] + want, conf, disp, en_off))
+                done.update(ends)
+                break
+    return out
+
+
 # 단독 토큰으로 떨어져 나온 '고아 조사' — 앞 체언과 붙여 써야 한다('수요 를'→'수요를').
 #   ⚠ 일반 조사 JOIN(공백 제거)은 거짓양성이 커서 보류된 영역이다([[validation-delta-and-spacing
 #   -backstop]] ⑩). 그래서 **단독 단어로는 절대 쓰이지 않는 조사만** 다룬다 —
