@@ -10,7 +10,7 @@ version.py — 앱 버전 단일 출처(Single Source of Truth)
   두 채널을 가르고(core/updater.py), 태그의 버전과 APP_VERSION을 비교해 갱신 여부를 판단한다.
 """
 
-APP_VERSION = "1.9.8"
+APP_VERSION = "1.9.9"
 
 # ── 데이터 버전 (앱 버전과 **독립적으로** 올라간다) ──────────────────────
 # 사전 데이터(stdict.db + kiwipiepy 모델) 스냅샷을 가리킨다. 형식 YYYY.MM.
@@ -21,7 +21,7 @@ APP_VERSION = "1.9.8"
 # ⚠ 이 값은 '이 빌드가 패키징한 데이터'를 뜻한다. 실제 **로드된** 데이터 버전은
 #   stdict.db의 meta.data_version이 정답이며 `nikl_dict.data_version()`으로 읽는다.
 #   UI·업데이터는 DB 쪽을 우선한다(파일이 어긋나면 즉시 드러나도록).
-DATA_VERSION = "2026.09"
+DATA_VERSION = "2026.11"
 
 # GitHub 릴리스 저장소 — 자동 업데이트 확인 대상(KS-Works-Utility와 동일 계정 규약).
 #   ⚠ 업데이터의 폴링 URL이므로 제품 표시명(KS-AI Editor)에 맞춰 바꾸지 말 것(CLAUDE.md).
