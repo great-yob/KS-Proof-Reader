@@ -719,6 +719,10 @@ class GeminiChecker:
             transient = False
             forced_fallback = False
             rpm_wait = 0.0          # 분당 한도 429가 알려 준 대기(초) — 백오프에 반영
+            # 이번 시도에서 분당 한도로 **건너뛴** 모델이 있는가. 있으면 뒤 후보가 성공해도 그 모델로
+            #   고정하지 않는다 — 실행의 첫 호출(아직 고정 전)에서 1순위가 분당 429를 맞으면 예전엔
+            #   백업이 성공하는 순간 실행 끝까지 백업으로 고정됐다(2026-11-19 감사, 아래 분당 분기 주석).
+            rpm_passed = False
             last_idx = len(models_to_try) - 1
             for idx, model_id in enumerate(models_to_try):
                 try:
@@ -727,8 +731,9 @@ class GeminiChecker:
                         contents = use_prompt,
                         config   = config,
                     )
-                    # 성공 → 이후 호출 시 동일 모델 고정
-                    if not self._model_locked:
+                    # 성공 → 이후 호출 시 동일 모델 고정. 단 분당 한도로 앞 후보를 건너뛰고 얻은
+                    #   성공이면 고정하지 않는다(rpm_passed) — 다음 청크는 원래 모델부터 다시 묻는다.
+                    if not self._model_locked and not rpm_passed:
                         self._model_id = model_id
                         self._model_locked = True
                         if logger and model_id != _MODEL_CANDIDATES[0]:
@@ -788,6 +793,9 @@ class GeminiChecker:
                             # ⚠ 고정을 풀지 않는다 — 풀면 이번에 성공한 백업 모델로 **재고정**돼
                             #   1분 뒤 풀릴 1순위로 다시는 돌아오지 않는다(백업이 3.5-flash면
                             #   일일 20회짜리로 실행 내내 돈다). 다음 청크는 1순위부터 다시 묻는다.
+                            #   ⚠ 아직 고정 전(실행의 첫 호출)이면 '풀지 않기'만으로는 모자라다 —
+                            #     백업이 성공하는 순간 첫 고정이 일어난다. 그래서 rpm_passed로 막는다.
+                            rpm_passed = True
                             if logger:
                                 logger(f"  [AI] '{model_id}' 분당 한도 — "
                                        f"다음 모델 '{models_to_try[idx + 1]}'로 전환")
@@ -800,8 +808,10 @@ class GeminiChecker:
                     #   과부하라 5·15초 백오프로는 안 풀린다. 과거엔 여기서 곧장 break해
                     #   1순위가 죽으면 멀쩡한 나머지 후보를 한 번도 안 써보고 청크를 통째로
                     #   버렸다(실측 2026-08-04: 3.5-flash-lite만 503 6/6, 나머지 3종 정상).
-                    #   한도 소진(_quota_blocked)과 달리 **영구 차단하지 않는다** — 일시적이라
-                    #   다음 청크에서 1순위가 회복돼 있을 수 있다.
+                    #   한도 소진(_quota_blocked)과 달리 **차단하지 않는다**(다음 실행은 새 엔진이라
+                    #   1순위부터 시작한다). 다만 고정을 풀고 성공한 백업으로 **재고정**하므로 그 실행의
+                    #   남은 호출은 백업 모델로 돈다 — 한 문서 안에서 모델이 섞이지 않게 하는 의도된
+                    #   동작이다(2026-11-19 감사: 3.5-lite 503 약 11.5%라 여러 청크 문서는 흔히 백업으로 끝난다).
                     if transient and idx < last_idx:
                         self._model_locked = False   # 잠금 해제 → 성공한 모델로 재고정
                         if logger:
