@@ -1960,6 +1960,57 @@ def _is_destandardizing_variant(c, exists_fn) -> bool:
         return False
 
 
+def _norm_reversal(c, norm_batch_fn):
+    """c가 원문의 규범형을 규범표기 사전(norm_map)의 **비표준형으로 되돌린** AI 교정이면 (비표준, 규범).
+
+    '확인결괏값'→'확인 결과값'(2026-11-19 코퍼스 — 사전 갱신으로 AI 입력이 바뀌며 나온 high 카드).
+    _is_destandardizing_variant는 단일 어절·'교정형 미등재'만 보는데, 이 카드는 띄어쓰기가 섞였고
+    '결과값'은 우리말샘에 비표준 표제어로 **등재돼** 있어 두 조건을 다 비켜 갔다. 판정은 사전의
+    방향 정보 하나로 한다: 교정문에 새로 생긴 말(원문에 없던 한글 조각)이 norm_map의 비표준 키이고
+    그 규범형이 원문에 있으면 표준→비표준 반전이다. 조회는 교정문에만 있는 한글 런의 조각에 한정.
+    """
+    if getattr(c, "source", None) not in ("ai_typo", "ai_polish"):
+        return None
+    o, cr = c.original or "", c.corrected or ""
+    if not o or o == cr:
+        return None
+    cands = set()
+    for run in re.findall(r"[가-힣]{2,}", cr):
+        if run in o:
+            continue
+        for i in range(len(run) - 1):
+            for j in range(i + 2, len(run) + 1):
+                if run[i:j] not in o:
+                    cands.add(run[i:j])
+    if not cands:
+        return None
+    try:
+        found = norm_batch_fn(cands) or {}
+    except Exception:
+        return None
+    for k in sorted(found, key=len, reverse=True):
+        n = found[k]
+        if n and n != k and n in o:
+            return k, n
+    return None
+
+
+def drop_norm_reversal(corrections: list, norm_batch_fn, logger=None) -> list:
+    """원문의 규범형을 norm_map의 비표준형으로 되돌린 AI 교정을 제외한다('결괏값'→'결과값').
+
+    norm_batch_fn(set) → {비표준: 규범} — nikl_dict.batch_lookup_norm(norm_map 없으면 {} → 무발동).
+    """
+    out, dropped = [], 0
+    for c in corrections:
+        if _norm_reversal(c, norm_batch_fn):
+            dropped += 1
+            continue
+        out.append(c)
+    if logger and dropped:
+        logger(f"  → 규범형을 비표준형으로 되돌린 AI 교정 {dropped}건 제외 (규범표기 사전 역방향)")
+    return out
+
+
 def drop_destandardizing_variant(corrections: list, exists_fn, logger=None):
     """등재 표준형을 미등재 근접변이형으로 되돌리는 AI 교정을 **제외(드롭)** 한다.
 

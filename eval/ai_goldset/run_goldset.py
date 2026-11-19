@@ -589,6 +589,26 @@ def phase_a_doc_dict():
             fails += 1
             print(f"  ✗ FAIL [부호 안 조사] {o!r}→{c!r} 기대={want!r} 실제={got!r}")
 
+    # drop_norm_reversal: AI가 원문의 규범형을 norm_map의 비표준형으로 되돌린 교정 → 제외
+    #   (★2026-11-19 코퍼스: '확인결괏값'→'확인 결과값' high — 띄어쓰기가 섞이고 '결과값'이 우리말샘에
+    #   등재돼 반표준화 가드를 비켜 갔다). 정방향(비표준→규범)·띄어쓰기만은 유지.
+    _nm = {"결과값": "결괏값", "컨텐츠": "콘텐츠"}
+    _nm_fn = lambda s: {k: _nm[k] for k in s if k in _nm}       # noqa: E731
+    nr_cases = [
+        ("확인결괏값", "확인 결과값", True),        # ★보고 — 규범형→비표준형(띄어쓰기 섞임)
+        ("콘텐츠를 만든다", "컨텐츠를 만든다", True),  # 규범형→비표준형
+        ("컨텐츠를 만든다", "콘텐츠를 만든다", False),  # 정방향 — 유지
+        ("확인결괏값", "확인 결괏값", False),        # 띄어쓰기만 — 유지
+        ("결과값", "결괏값", False),                 # 정방향 — 유지
+    ]
+    for o, c, expect_drop in nr_cases:
+        cor = Correction(original=o, corrected=c, reason="r", source="ai_typo",
+                         color=HL_TYPO, confidence="high")
+        dropped = not ai_guards.drop_norm_reversal([cor], _nm_fn)
+        if dropped != expect_drop:
+            fails += 1
+            print(f"  ✗ FAIL [규범 역방향] {o!r}→{c!r} 기대제외={expect_drop} 실제={dropped}")
+
     # ── 조판부호(각주) 절단 조각 앞 덧붙임 드롭 ────────────────────────────────
     #   HWP 추출은 각주 텍스트를 본문 문장 한가운데 실어 오고 경계 개행 때문에 한 문장이
     #   쪼개진다. AI는 '을 적용해…' 조각을 주어 없는 문장으로 보고 앞 조각 끝('TLS 1.3')을

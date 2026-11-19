@@ -665,6 +665,10 @@ class ProofreadingWorker(QThread):
                 #   원인이 is_known_form(실제=NNG+값=NNG 복합어)이라 그걸 우회해야 발동한다.
                 merged = ai_guards.drop_destandardizing_variant(
                     merged, lambda w: _nd_demote.lookup_word(w)["exists"], logger=log)
+                # 규범형 → norm_map 비표준형 반전 차단 — '확인결괏값'→'확인 결과값'(2026-11-19). 위 가드는
+                #   단일 어절·교정형 미등재만 봐서, 띄어쓰기가 섞이거나 비표준형이 우리말샘에 등재된 경우를 놓친다.
+                merged = ai_guards.drop_norm_reversal(
+                    merged, _nd_demote.batch_lookup_norm, logger=log)
             except Exception as e:
                 log(f"  [순화] 외래어 순화 제외 스킵: {e}")
 
